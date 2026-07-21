@@ -37,6 +37,16 @@ m68k-disasm <binary-file> [options]
 - `-c`, `--cpu`: Target CPU limit for decoding (`68000`, `68010`, `68020`, `68030`, `68040`, `68060`). Default is `68060`.
 - `-out`, `--output`: Path to write the disassembly output (defaults to standard output).
 
+### Amiga Hunk executables
+
+If the input file starts with the `HUNK_HEADER` magic (`0x000003F3`),
+`m68k-disasm` loads it as a classic AmigaOS executable instead of raw
+binary data: hunks are relocated and flattened automatically (no `--org`
+needed — `--address` becomes the load base instead, defaulting to `0`),
+and any `HUNK_SYMBOL` names recovered from the file are shown in place of
+auto-generated `label<N>` names at branch/jump targets and other
+referenced addresses.
+
 ### Symbol File Format
 
 The custom symbol file should map absolute addresses to symbol names, one per line. Blank lines and lines starting with `#` or `;` are ignored.
@@ -92,6 +102,7 @@ m68k-asm hello.s -f srecord -o hello.srec     # Motorola S-Record
 m68k-asm hello.s -f intel-hex -o hello.hex    # Intel Hex
 m68k-asm hello.s -f elf -o hello.o            # ELF32 (EM_68K, ET_REL)
 m68k-asm hello.s -f ieee695 -o hello.ieee     # IEEE-695
+m68k-asm hello.s -f hunk-exe -o hello         # Amiga Hunk executable (LoadSeg()-able)
 ```
 
 ### Options
@@ -100,7 +111,7 @@ m68k-asm hello.s -f ieee695 -o hello.ieee     # IEEE-695
 - `-o`, `--output`: Path to output binary file (required).
 - `-c`, `--cpu`: Target CPU model (`68000`, `68010`, `68020`, `68030`, `68040`, `68060`). Default is `68060`.
 - `--origin <addr>` — default origin if the source has no `ORG` (hex with `$` or `0x` prefix, or decimal).
-- `-f`, `--format`: Output format (`binary`, `srecord`, `intel-hex`, `elf`, `ieee695`). Default is `binary`.
+- `-f`, `--format`: Output format (`binary`, `srecord`, `intel-hex`, `elf`, `ieee695`, `hunk-exe`). Default is `binary`.
 - `-l`/`--listing <file>` — write an address/bytes/source listing.
 - `--sym <file>` — export the resolved symbol table.
 - `--map <file>` — export a memory map (address ranges per instruction).
@@ -108,11 +119,17 @@ m68k-asm hello.s -f ieee695 -o hello.ieee     # IEEE-695
 `m68k-asm -f elf` output has been checked against `readelf -a` for
 structural validity. `m68k-asm -f ieee695` output has been checked against
 a self-built GNU binutils `ieee` BFD reader (`objdump -b ieee -m m68k`) —
-see `crates/m68k-asm/src/ieee695.rs`'s module docs for details.
+see `crates/m68k-asm/src/ieee695.rs`'s module docs for details. `m68k-asm -f
+hunk-exe` output has been checked against a real AmigaOS-target `objdump`
+(`m68k-amigaos-objdump -t -D`, format `amiga`) and round-trips through this
+project's own Hunk reader (`m68k_core::amiga_hunk`, also used by
+`m68k-disasm` to load Amiga executables directly).
 
-Both `-f elf` and `-f ieee695` emit one section per non-empty `SECTION` in
-the source. The assembler resolves all symbols to absolute addresses during
-assembly and does not emit relocation entries.
+`-f elf`, `-f ieee695`, and `-f hunk-exe` emit one section/hunk per
+non-empty `SECTION` in the source. The assembler resolves all symbols to
+absolute addresses during assembly and does not emit relocation entries —
+`hunk-exe` output is a directly loadable executable, not a relinkable
+object file.
 
 ### Supported Directives
 

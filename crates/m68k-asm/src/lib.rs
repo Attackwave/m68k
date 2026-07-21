@@ -45,6 +45,7 @@
 //! - [`ieee695`] — IEEE-695 object output (verified against GNU binutils BFD
 //!   reader; see that module's docs for details).
 
+pub mod amiga_hunk_writer;
 pub mod assembler;
 pub mod directives;
 pub mod ea_encode;

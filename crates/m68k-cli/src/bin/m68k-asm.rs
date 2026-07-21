@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
+use m68k_asm::amiga_hunk_writer::generate_hunk_exe;
 use m68k_asm::assembler::Assembler;
 use m68k_asm::ieee695::generate_ieee695_sections;
 use m68k_asm::output::{OutputFormat, generate_elf_sections, generate_intel_hex, generate_srecord};
@@ -54,6 +55,7 @@ enum OutputFormatArg {
     IntelHex,
     Elf,
     Ieee695,
+    HunkExe,
 }
 
 impl From<OutputFormatArg> for OutputFormat {
@@ -64,6 +66,10 @@ impl From<OutputFormatArg> for OutputFormat {
             OutputFormatArg::IntelHex => OutputFormat::IntelHex,
             OutputFormatArg::Elf => OutputFormat::Elf,
             OutputFormatArg::Ieee695 => OutputFormat::Ieee695,
+            // HunkExe has no OutputFormat counterpart — it's written directly
+            // via amiga_hunk_writer::generate_hunk_exe, bypassing OutputFormat
+            // entirely (same as Elf/Ieee695 already do in `run()`'s match).
+            OutputFormatArg::HunkExe => OutputFormat::Elf,
         }
     }
 }
@@ -125,6 +131,9 @@ fn run(args: Args) -> Result<(), String> {
             }
             OutputFormatArg::Ieee695 => {
                 p.set_extension("ieee");
+            }
+            OutputFormatArg::HunkExe => {
+                p.set_extension("");
             }
         }
         p
@@ -189,6 +198,18 @@ fn run(args: Args) -> Result<(), String> {
                 "Assembled {} instructions, {} bytes -> {}",
                 asm.code.len(),
                 ieee.len(),
+                output_path.display()
+            );
+            return write_auxiliary_outputs(&asm, &args, &input_name);
+        }
+        OutputFormatArg::HunkExe => {
+            let hunk = generate_hunk_exe(&asm.sections, &asm.symbols);
+            fs::write(&output_path, &hunk)
+                .map_err(|e| format!("cannot write '{}': {}", output_path.display(), e))?;
+            eprintln!(
+                "Assembled {} instructions, {} bytes -> {}",
+                asm.code.len(),
+                hunk.len(),
                 output_path.display()
             );
             return write_auxiliary_outputs(&asm, &args, &input_name);
