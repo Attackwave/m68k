@@ -869,6 +869,104 @@ fn parse_operands(
 
             Ok((mnemonic.into(), operands, target_addr))
         }
+        ParserType::PflushFamily040 => {
+            let opmode = (op >> 3) & 0x3;
+            let reg = (op & 0x7) as u8;
+            let mnemonic = match opmode {
+                0b00 => "pflushn",
+                0b01 => "pflush",
+                0b10 => "pflushan",
+                0b11 => "pflusha",
+                _ => unreachable!("2-bit field"),
+            };
+            if opmode <= 0b01 {
+                operands.push(DecodedOperand::from_ea(EAOperand::AddrIndirect(reg)));
+            }
+            Ok((mnemonic.into(), operands, target_addr))
+        }
+        ParserType::Pmove => {
+            let ext = stream.read_word()?;
+            let group_prefix = (ext >> 13) & 0x7;
+
+            match group_prefix {
+                0b001 => {
+                    // PFLUSHA (mode 001, no EA/FC/mask) or PFLUSH FC,MASK,<ea>
+                    // (mode 110). Verified against real `vasm -m68030`
+                    // output for `pflusha` (F000 2400) and
+                    // `pflush #2,#3,(a0)` (F010 3872).
+                    let mode = (ext >> 10) & 0x7;
+                    if mode == 0b001 {
+                        Ok(("pflusha".into(), operands, target_addr))
+                    } else {
+                        let ea_mode = ((op >> 3) & 0x7) as u8;
+                        let ea_reg = (op & 0x7) as u8;
+                        let ea = decode_ea(ea_mode, ea_reg, "l", stream, inst_pc, cpu)?;
+                        let mask = (ext >> 5) & 0x7;
+                        let fc = ext & 0x1F;
+                        operands.push(DecodedOperand::special(format!("#{}", fc & 0x7)));
+                        operands.push(DecodedOperand::special(format!("#{}", mask)));
+                        operands.push(DecodedOperand::from_ea(ea));
+                        Ok(("pflush".into(), operands, target_addr))
+                    }
+                }
+                0b100 => {
+                    // PTESTR/PTESTW FC,<ea>,#level[,An]. Verified against
+                    // real `vasm -m68030` output for `ptestr #2,(a0),#3`
+                    // (F010 8E12), `ptestw #2,(a0),#3` (F010 8C12), and
+                    // `ptestr #2,(a0),#3,a1` (F010 8F32).
+                    let level = (ext >> 10) & 0x7;
+                    let rw = (ext >> 9) & 1;
+                    let a_bit = (ext >> 8) & 1;
+                    let an = ((ext >> 5) & 0x7) as u8;
+                    let fc = ext & 0x1F;
+                    let mnemonic = if rw == 1 { "ptestr" } else { "ptestw" };
+
+                    let ea_mode = ((op >> 3) & 0x7) as u8;
+                    let ea_reg = (op & 0x7) as u8;
+                    let ea = decode_ea(ea_mode, ea_reg, "l", stream, inst_pc, cpu)?;
+
+                    operands.push(DecodedOperand::special(format!("#{}", fc & 0x7)));
+                    operands.push(DecodedOperand::from_ea(ea));
+                    operands.push(DecodedOperand::special(format!("#{}", level)));
+                    if a_bit == 1 {
+                        operands.push(DecodedOperand::from_ea(EAOperand::AddrReg(an)));
+                    }
+                    Ok((mnemonic.into(), operands, target_addr))
+                }
+                0b000 | 0b010 | 0b011 => {
+                    // PMOVE <ea>,MRn / PMOVE MRn,<ea>. Verified against
+                    // real `vasm -m68030` output for `pmove tc,(a0)`
+                    // (F010 4200) and `pmove (a0),tc` (F010 4000).
+                    let mmu_field = (ext >> 10) & 0x3F;
+                    let reg_name = match (group_prefix, (mmu_field & 0x7)) {
+                        (0b010, 0b000) => "tc",
+                        (0b010, 0b010) => "srp",
+                        (0b010, 0b011) => "crp",
+                        (0b000, 0b010) => "tt0",
+                        (0b000, 0b011) => "tt1",
+                        (0b011, _) => "mmusr",
+                        _ => return Err("unknown PMOVE MMU register group".into()),
+                    };
+                    let rw = (ext >> 9) & 1;
+
+                    let ea_mode = ((op >> 3) & 0x7) as u8;
+                    let ea_reg = (op & 0x7) as u8;
+                    let ea = decode_ea(ea_mode, ea_reg, "l", stream, inst_pc, cpu)?;
+
+                    if rw == 0 {
+                        // memory-to-register
+                        operands.push(DecodedOperand::from_ea(ea));
+                        operands.push(DecodedOperand::special(reg_name));
+                    } else {
+                        // register-to-memory
+                        operands.push(DecodedOperand::special(reg_name));
+                        operands.push(DecodedOperand::from_ea(ea));
+                    }
+                    Ok(("pmove".into(), operands, target_addr))
+                }
+                _ => Err("unknown MMU extension word group prefix".into()),
+            }
+        }
     }
 }
 

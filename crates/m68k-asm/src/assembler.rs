@@ -2284,8 +2284,105 @@ impl Assembler {
         // Encode using the existing encoder (expects uppercase mnemonic)
         let mnemonic_upper = mnemonic.to_uppercase();
 
-        // Handle 3-operand instructions (CAS, PACK, UNPK)
+        // Handle 3-operand instructions (CAS, PACK, UNPK, PFLUSH, PTESTR/PTESTW)
         let words = match mnemonic_upper.as_str() {
+            "PFLUSH" => {
+                if operand_texts.len() != 3 {
+                    return Err(AsmError::with_line(
+                        "PFLUSH takes exactly 3 operands: #fc,#mask,<ea>".to_string(),
+                        line.line_no,
+                    ));
+                }
+                let fc = match parse_operand_text(&operand_texts[0], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+                {
+                    Operand::Immediate(v) => v,
+                    _ => {
+                        return Err(AsmError::with_line(
+                            "PFLUSH's first operand (#fc) must be immediate".to_string(),
+                            line.line_no,
+                        ));
+                    }
+                };
+                let mask = match parse_operand_text(&operand_texts[1], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+                {
+                    Operand::Immediate(v) => v,
+                    _ => {
+                        return Err(AsmError::with_line(
+                            "PFLUSH's second operand (#mask) must be immediate".to_string(),
+                            line.line_no,
+                        ));
+                    }
+                };
+                let ea = parse_operand_text(&operand_texts[2], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
+                crate::enc_mmu::enc_pflush(fc, mask, &ea, pc + 2, &self.cpu)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+            }
+            "PTESTR" | "PTESTW" => {
+                if operand_texts.len() != 3 && operand_texts.len() != 4 {
+                    return Err(AsmError::with_line(
+                        format!(
+                            "{} takes 3 or 4 operands: FC,<ea>,#level[,An]",
+                            mnemonic_upper
+                        ),
+                        line.line_no,
+                    ));
+                }
+                let fc = match parse_operand_text(&operand_texts[0], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+                {
+                    Operand::Immediate(v) => v,
+                    _ => {
+                        return Err(AsmError::with_line(
+                            format!("{}'s first operand (FC) must be immediate", mnemonic_upper),
+                            line.line_no,
+                        ));
+                    }
+                };
+                let ea = parse_operand_text(&operand_texts[1], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
+                let level = match parse_operand_text(&operand_texts[2], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+                {
+                    Operand::Immediate(v) => v,
+                    _ => {
+                        return Err(AsmError::with_line(
+                            format!(
+                                "{}'s third operand (#level) must be immediate",
+                                mnemonic_upper
+                            ),
+                            line.line_no,
+                        ));
+                    }
+                };
+                let an = if operand_texts.len() == 4 {
+                    match parse_operand_text(&operand_texts[3], &self.symbols, pc)
+                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+                    {
+                        Operand::AddrReg(n) => Some(n),
+                        _ => {
+                            return Err(AsmError::with_line(
+                                format!("{}'s fourth operand must be An", mnemonic_upper),
+                                line.line_no,
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                crate::enc_mmu::enc_ptest(
+                    fc,
+                    &ea,
+                    level,
+                    an,
+                    mnemonic_upper == "PTESTR",
+                    pc + 2,
+                    &self.cpu,
+                )
+                .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+            }
             "CAS" => {
                 let sz = size.unwrap_or("w");
                 let dc = parse_operand_text(&operand_texts[0], &self.symbols, pc)
@@ -4144,26 +4241,31 @@ mymexc MACRO
 
     #[test]
     fn test_source_pmove_tc() {
-        let bytes = assemble_source_with_cpu("    PMOVE TC,(A0)\n", "68030");
+        // TC is the destination (memory-to-register, R/W=0). Verified
+        // against real `vasm -m68030` output: F010 4000.
+        let bytes = assemble_source_with_cpu("    PMOVE (A0),TC\n", "68030");
         assert_eq!(bytes, vec![0xF0, 0x10, 0x40, 0x00]);
     }
 
     #[test]
-    fn test_source_ptest() {
-        let bytes = assemble_source_with_cpu("    PTEST #3,(A0)\n", "68030");
-        assert_eq!(bytes, vec![0xF0, 0x50, 0x0C, 0x00]);
+    fn test_source_ptestr() {
+        // Verified against real `vasm -m68030` output: F010 8E12.
+        let bytes = assemble_source_with_cpu("    PTESTR #2,(A0),#3\n", "68030");
+        assert_eq!(bytes, vec![0xF0, 0x10, 0x8E, 0x12]);
     }
 
     #[test]
     fn test_source_pflusha() {
+        // Verified against real `vasm -m68030` output: F000 2400.
         let bytes = assemble_source_with_cpu("    PFLUSHA\n", "68030");
-        assert_eq!(bytes, vec![0xF0, 0x10]);
+        assert_eq!(bytes, vec![0xF0, 0x00, 0x24, 0x00]);
     }
 
     #[test]
     fn test_source_pflushn() {
-        let bytes = assemble_source_with_cpu("    PFLUSHN (A0)\n", "68030");
-        assert_eq!(bytes, vec![0xF5, 0x18]);
+        // Verified against real `vasm -m68040` output: F500.
+        let bytes = assemble_source_with_cpu("    PFLUSHN (A0)\n", "68040");
+        assert_eq!(bytes, vec![0xF5, 0x00]);
     }
 
     #[test]

@@ -68,6 +68,8 @@ pub enum ParserType {
     Bkpt,
     Movep,
     Bitfield,
+    Pmove,
+    PflushFamily040,
 }
 
 use crate::ea_categories::ea::*;
@@ -727,6 +729,37 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: 0,
             cpu: "68020",
             parser: ParserType::Bitfield,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // PMOVE/PFLUSH/PFLUSHA/PTESTR/PTESTW (68030+ MMU): all share
+            // the 0xF000-0xF03F opword range (EA mode/register in bits
+            // 5-0); the actual instruction and its operands depend on the
+            // extension word's group-prefix field (bits 15-13), which the
+            // Pmmu parser reads and dispatches on. Placeholder mnemonic,
+            // like the Bitfield entry above.
+            mask: 0xFFC0,
+            value: 0xF000,
+            mnemonic: "PMMU",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68030",
+            parser: ParserType::Pmove,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // 68040 PFLUSH family: PFLUSHN(An)/PFLUSH(An)/PFLUSHAN/PFLUSHA,
+            // sharing base 0xF500 with a 2-bit opmode at bits 4-3 (00/01/
+            // 10/11) and register at bits 2-0. Verified against real
+            // `vasm -m68040` output (F500/F508/F510/F518). Placeholder
+            // mnemonic; PflushFamily040 always overrides it.
+            mask: 0xFFE0,
+            value: 0xF500,
+            mnemonic: "PFLUSH",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68040",
+            parser: ParserType::PflushFamily040,
             fixed_size: None,
         },
         OpcodePattern {

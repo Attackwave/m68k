@@ -26,15 +26,22 @@ fn check_cpu(cpu: &str, min: &str) -> Result<(), AsmError> {
     }
 }
 
-/// MMU register code for PMOVE, by control register name.
+/// MMU register code for PMOVE, by control register name: the 6-bit
+/// combination of the extension word's 3-bit group prefix (bits 15-13) and
+/// 3-bit P-Register field (bits 12-10), as a single `bits15-10` value.
+///
+/// Verified against the M68000 Family Programmer's Reference Manual
+/// (section 6, PMOVE instruction formats): SRP/CRP/TC share prefix `010`;
+/// TT0/TT1 share prefix `000`; MMUSR has no P-Register field and uses the
+/// fixed prefix `011` (P-Register bits left at 0).
 fn pmove_reg_code(name: &str) -> Option<u16> {
     Some(match name.to_uppercase().as_str() {
-        "TC" => 0,
-        "TT0" => 2,
-        "TT1" => 3,
-        "SRP" => 4,
-        "CRP" => 5,
-        "MMUSR" => 6,
+        "TC" => 0b010_000,
+        "TT0" => 0b000_010,
+        "TT1" => 0b000_011,
+        "SRP" => 0b010_010,
+        "CRP" => 0b010_011,
+        "MMUSR" => 0b011_000,
         _ => return None,
     })
 }
@@ -46,14 +53,19 @@ fn pmove_reg_code(name: &str) -> Option<u16> {
 fn pmove_reg_code_from_operand(op: &Operand) -> Option<u16> {
     match op {
         Operand::Special(name) => pmove_reg_code(name),
-        Operand::Immediate(0x003) => Some(0), // TC
-        Operand::Immediate(0x807) => Some(4), // SRP
-        Operand::Immediate(0x805) => Some(6), // MMUSR
+        Operand::Immediate(0x003) => pmove_reg_code("TC"),
+        Operand::Immediate(0x807) => pmove_reg_code("SRP"),
+        Operand::Immediate(0x805) => pmove_reg_code("MMUSR"),
         _ => None,
     }
 }
 
 /// Encode `PMOVE <ea>,MMUreg` or `PMOVE MMUreg,<ea>` (68030+).
+///
+/// Extension word layout (verified against the M68000 PRM): bits 15-10 =
+/// group prefix + P-Register (see [`pmove_reg_code`]), bit 9 = R/W
+/// (0 = memory-to-register, 1 = register-to-memory), bit 8 = FD, bits 7-0
+/// unused/zero.
 pub fn enc_pmove(
     ea_op: &Operand,
     reg_op: &Operand,
@@ -65,29 +77,62 @@ pub fn enc_pmove(
     let mmu_code = pmove_reg_code_from_operand(reg_op)
         .ok_or_else(|| AsmError::new("unknown MMU register for PMOVE"))?;
     let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL, cpu)?;
-    let direction: u16 = if direction_ea_to_reg { 0 } else { 1 };
-    let ext = (direction << 14) | (mmu_code << 10);
+    let rw: u16 = if direction_ea_to_reg { 0 } else { 1 };
+    let ext = (mmu_code << 10) | (rw << 9);
     let mut words = vec![0xF000 | ((mode as u16) << 3) | (reg as u16), ext];
     words.extend(ext_words);
     Ok(words)
 }
 
-/// Encode `PTEST #level,<ea>` (68030+).
+/// Encode `PTESTR FC,<ea>,#level[,An]` / `PTESTW FC,<ea>,#level[,An]` (68030+).
+///
+/// Extension word layout (verified against the M68000 PRM and real
+/// `vasm -m68030` output for `ptestr #2,(a0),#3`, `ptestw #2,(a0),#3`, and
+/// `ptestr #2,(a0),#3,a1`): bits 15-13 = `100` (fixed group prefix), bits
+/// 12-10 = level, bit 9 = R/W (0 = write/PTESTW, 1 = read/PTESTR), bit 8 =
+/// A (1 if an address register is given), bits 7-5 = that register (0 if
+/// none), bits 4-0 = FC field (`10XXX` for an immediate function code).
+///
+/// The previous version of this function implemented a different,
+/// nonstandard single-operand-adjacent shape (`PTEST #level,<ea>`, opword
+/// base `0xF040`) that matched neither this instruction's real syntax nor
+/// its real encoding — replaced outright rather than patched.
 pub fn enc_ptest(
-    level: i64,
+    fc: i64,
     ea_op: &Operand,
+    level: i64,
+    an: Option<u8>,
+    read: bool,
     ext_pc: u32,
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
     let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL, cpu)?;
-    let ext = ((level as u16) & 0x7) << 10;
-    let mut words = vec![0xF040 | ((mode as u16) << 3) | (reg as u16), ext];
+    let fc_field = 0b10_000 | ((fc as u16) & 0x7);
+    let rw: u16 = if read { 1 } else { 0 };
+    let (a_bit, an_field) = match an {
+        Some(n) => (1u16, n as u16),
+        None => (0u16, 0u16),
+    };
+    let ext = (0b100 << 13)
+        | (((level as u16) & 0x7) << 10)
+        | (rw << 9)
+        | (a_bit << 8)
+        | (an_field << 5)
+        | fc_field;
+    let mut words = vec![0xF000 | ((mode as u16) << 3) | (reg as u16), ext];
     words.extend(ext_words);
     Ok(words)
 }
 
-/// Encode `PFLUSH #fc,#mask,<ea>` (68030).
+/// Encode `PFLUSH #fc,#mask,<ea>` (68030): flush by function code and
+/// effective address (mode `110`).
+///
+/// Extension word layout (verified against the M68000 PRM): bits 15-13 =
+/// `001` (fixed group prefix), bits 12-10 = mode (`110` here, since an EA is
+/// always supplied), bits 9-8 = 0, bits 7-5 = mask, bits 4-0 = FC field. The
+/// FC field itself is 5 bits: `10XXX` for an immediate function code (`fc`'s
+/// low 3 bits), matching the immediate-FC form of the assembler syntax.
 pub fn enc_pflush(
     fc: i64,
     mask: i64,
@@ -97,29 +142,43 @@ pub fn enc_pflush(
 ) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
     let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL, cpu)?;
-    let ext = (((mask as u16) & 0x7) << 5) | ((fc as u16) & 0x7);
+    let fc_field = 0b10_000 | ((fc as u16) & 0x7);
+    let ext = (0b001 << 13) | (0b110 << 10) | (((mask as u16) & 0x7) << 5) | fc_field;
     let mut words = vec![0xF010 | ((mode as u16) << 3) | (reg as u16), ext];
     words.extend(ext_words);
     Ok(words)
 }
 
-/// Encode PFLUSHA (68030).
+/// Encode PFLUSHA (68030): flush all ATC entries (mode `001`, no EA/FC/mask).
+///
+/// Verified against real `vasm -m68030` output: `F000 2400`. The previous
+/// single-word `0xF010` was wrong on two counts — PFLUSHA needs the
+/// extension word (mode `001` at bits 12-10, group prefix `001` at bits
+/// 15-13), and `0xF010` isn't even a valid opword for it (`0x10` is the EA
+/// mode/register field's contribution for a `(An)`-style operand, which
+/// PFLUSHA doesn't take).
 pub fn enc_pflusha(cpu: &str) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
-    Ok(vec![0xF010])
+    Ok(vec![0xF000, 0b001_001 << 10])
 }
 
-/// Encode PFLUSHAN (68040).
+/// Encode PFLUSHAN (68040): flush all except global entries.
+///
+/// Verified against real `vasm -m68040` output: `F510`. The 68040 PFLUSH
+/// family shares base `0xF500` with a 2-bit opmode at bits 4-3 (`00`
+/// PFLUSHN, `01` PFLUSH, `10` PFLUSHAN, `11` PFLUSHA) and register at bits
+/// 2-0 — the previous `0xF018` didn't match any of these opmodes.
 pub fn enc_pflushan(cpu: &str) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68040")?;
-    Ok(vec![0xF018])
+    Ok(vec![0xF500 | (0b10 << 3)])
 }
 
-/// Encode the single-An/(An)-operand MMU instructions: PTESTW, PTESTR, PFLUSHN, PLPAW, PLPAR.
+/// Encode the single-An/(An)-operand MMU instructions: PFLUSHN, PLPAW, PLPAR.
 ///
-/// Bugfix vs. the Python reference: PTESTW/PTESTR are single-operand instructions there too
-/// (base opcodes 0xF548/0xF568), but a copy-paste bug in the base_map routes them through the
-/// two-operand `_encode_ptest` encoder, making `ptestw (a0)` fail with a wrong-arity error.
+/// PFLUSHN's base (0xF500, verified against real `vasm -m68040` output) is
+/// part of the 68040 PFLUSH opmode family — see `enc_pflushan`'s docs.
+/// PLPAW/PLPAR's bases (0xF588/0xF5C8) are unverified against any real
+/// assembler or the PRM; treat them with caution.
 pub fn enc_mmu_single_reg(base: u16, reg_op: &Operand, cpu: &str) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
     let reg = match reg_op {
@@ -226,68 +285,101 @@ mod tests {
     //   prestore (a0)+    -> f0d8
 
     #[test]
-    fn test_pmove_reg_to_ea_matches_python() {
+    fn test_pmove_reg_to_ea() {
+        // PMOVE TC,(A0) -- TC is the source (register-to-memory, R/W=1).
+        // Verified against M68000 PRM: TC=0b010000<<10 | R/W(1)<<9 = 0x4200.
         let dst = Operand::AddrRegIndirect(0);
         let tc = Operand::Immediate(0x003);
         let words = enc_pmove(&dst, &tc, false, 0, "68030").unwrap();
+        assert_eq!(words, vec![0xF010, 0x4200]);
+    }
+
+    #[test]
+    fn test_pmove_ea_to_reg() {
+        // PMOVE (A0),TC -- TC is the destination (memory-to-register, R/W=0).
+        // Verified against M68000 PRM: TC=0b010000<<10 | R/W(0)<<9 = 0x4000.
+        let src = Operand::AddrRegIndirect(0);
+        let tc = Operand::Immediate(0x003);
+        let words = enc_pmove(&src, &tc, true, 0, "68030").unwrap();
         assert_eq!(words, vec![0xF010, 0x4000]);
     }
 
     #[test]
-    fn test_pmove_ea_to_reg_matches_python() {
-        let src = Operand::AddrRegIndirect(0);
-        let tc = Operand::Immediate(0x003);
-        let words = enc_pmove(&src, &tc, true, 0, "68030").unwrap();
-        assert_eq!(words, vec![0xF010, 0x0000]);
-    }
-
-    #[test]
-    fn test_pmove_srp_matches_python() {
+    fn test_pmove_srp() {
+        // PMOVE SRP,(A0) -- verified against M68000 PRM: SRP=0b010010<<10 |
+        // R/W(1, register-to-memory)<<9 = 0x4A00.
         let dst = Operand::AddrRegIndirect(0);
         let srp = Operand::Immediate(0x807);
         let words = enc_pmove(&dst, &srp, false, 0, "68030").unwrap();
-        assert_eq!(words, vec![0xF010, 0x5000]);
+        assert_eq!(words, vec![0xF010, 0x4A00]);
     }
 
     #[test]
     fn test_pmove_tt0_via_special_operand() {
-        // TT0 doesn't exist in the MOVEC namespace, so it arrives as Operand::Special.
-        // mmu_code=2, direction=1 (reg->ea) -> ext = (1<<14)|(2<<10) = 0x4800
+        // TT0 doesn't exist in the MOVEC namespace, so it arrives as
+        // Operand::Special. Verified against M68000 PRM: TT0's group
+        // prefix+P-register is 0b000010, R/W=1 (register-to-memory) ->
+        // ext = (0b000010<<10)|(1<<9) = 0x0A00.
         let dst = Operand::AddrRegIndirect(0);
         let tt0 = Operand::Special("TT0".to_string());
         let words = enc_pmove(&dst, &tt0, false, 0, "68030").unwrap();
-        assert_eq!(words, vec![0xF010, 0x4800]);
+        assert_eq!(words, vec![0xF010, 0x0A00]);
     }
 
     #[test]
-    fn test_ptest_matches_python() {
+    fn test_ptestr_matches_vasm() {
+        // PTESTR #2,(A0),#3 -- verified against real `vasm -m68030` output:
+        // F010 8E12.
         let dst = Operand::AddrRegIndirect(0);
-        let words = enc_ptest(3, &dst, 0, "68030").unwrap();
-        assert_eq!(words, vec![0xF050, 0x0C00]);
+        let words = enc_ptest(2, &dst, 3, None, true, 0, "68030").unwrap();
+        assert_eq!(words, vec![0xF010, 0x8E12]);
     }
 
     #[test]
-    fn test_pflush_matches_python() {
+    fn test_ptestw_matches_vasm() {
+        // PTESTW #2,(A0),#3 -- verified against real `vasm -m68030` output:
+        // F010 8C12.
+        let dst = Operand::AddrRegIndirect(0);
+        let words = enc_ptest(2, &dst, 3, None, false, 0, "68030").unwrap();
+        assert_eq!(words, vec![0xF010, 0x8C12]);
+    }
+
+    #[test]
+    fn test_ptestr_with_an_matches_vasm() {
+        // PTESTR #2,(A0),#3,A1 -- verified against real `vasm -m68030`
+        // output: F010 8F32.
+        let dst = Operand::AddrRegIndirect(0);
+        let words = enc_ptest(2, &dst, 3, Some(1), true, 0, "68030").unwrap();
+        assert_eq!(words, vec![0xF010, 0x8F32]);
+    }
+
+    #[test]
+    fn test_pflush_matches_vasm() {
+        // PFLUSH #2,#3,(A0) -- verified against real `vasm -m68030`
+        // output: F010 3872.
         let dst = Operand::AddrRegIndirect(0);
         let words = enc_pflush(2, 3, &dst, 0, "68030").unwrap();
-        assert_eq!(words, vec![0xF010, 0x0062]);
+        assert_eq!(words, vec![0xF010, 0x3872]);
     }
 
     #[test]
-    fn test_pflusha_matches_python() {
-        assert_eq!(enc_pflusha("68030").unwrap(), vec![0xF010]);
+    fn test_pflusha_matches_vasm() {
+        // PFLUSHA -- verified against real `vasm -m68030` output: F000 2400.
+        assert_eq!(enc_pflusha("68030").unwrap(), vec![0xF000, 0x2400]);
     }
 
     #[test]
-    fn test_pflushan_matches_python() {
-        assert_eq!(enc_pflushan("68040").unwrap(), vec![0xF018]);
+    fn test_pflushan_matches_vasm() {
+        // PFLUSHAN -- verified against real `vasm -m68040` output: F510.
+        assert_eq!(enc_pflushan("68040").unwrap(), vec![0xF510]);
     }
 
     #[test]
-    fn test_pflushn_matches_python() {
+    fn test_pflushn_matches_vasm() {
+        // PFLUSHN (A0) -- verified against real `vasm -m68040` output: F500.
         let dst = Operand::AddrRegIndirect(0);
-        let words = enc_mmu_single_reg(0xF518, &dst, "68030").unwrap();
-        assert_eq!(words, vec![0xF518]);
+        let words = enc_mmu_single_reg(0xF500, &dst, "68030").unwrap();
+        assert_eq!(words, vec![0xF500]);
     }
 
     #[test]
@@ -302,22 +394,6 @@ mod tests {
         let dst = Operand::AddrRegIndirect(0);
         let words = enc_mmu_single_reg(0xF5C8, &dst, "68030").unwrap();
         assert_eq!(words, vec![0xF5C8]);
-    }
-
-    #[test]
-    fn test_ptestw_bugfix_single_operand() {
-        // Bugfix vs. Python: `ptestw (a0)` fails there because of a base_map copy-paste bug
-        // that routes it through the two-operand _encode_ptest. It's a plain single-reg op.
-        let dst = Operand::AddrRegIndirect(0);
-        let words = enc_mmu_single_reg(0xF548, &dst, "68030").unwrap();
-        assert_eq!(words, vec![0xF548]);
-    }
-
-    #[test]
-    fn test_ptestr_bugfix_single_operand() {
-        let dst = Operand::AddrRegIndirect(0);
-        let words = enc_mmu_single_reg(0xF568, &dst, "68030").unwrap();
-        assert_eq!(words, vec![0xF568]);
     }
 
     #[test]
@@ -391,7 +467,7 @@ mod tests {
         let a0 = Operand::AddrRegIndirect(0);
         let tc = Operand::Immediate(0x003);
         assert!(enc_pmove(&a0, &tc, false, 0, "68020").is_err());
-        assert!(enc_ptest(0, &a0, 0, "68020").is_err());
+        assert!(enc_ptest(0, &a0, 0, None, true, 0, "68020").is_err());
     }
 
     #[test]

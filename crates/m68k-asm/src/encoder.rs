@@ -994,25 +994,22 @@ pub fn encode_instruction(
             )),
         },
 
-        // PTEST #level,<ea> (68030+)
-        "PTEST" => match (src, dst) {
-            (Some(Operand::Immediate(level)), Some(ea_op)) => enc_ptest(*level, ea_op, pc + 2, cpu),
-            _ => Err(AsmError::new("PTEST requires #level,<ea>")),
-        },
+        // PTESTR/PTESTW FC,<ea>,#level[,An] (68030+) require 3-4 operands
+        // and are handled in Assembler::encode_instruction_line, like
+        // PFLUSH/CAS/PACK/UNPK/CAS2 — encode_instruction only carries two.
+        "PTESTR" | "PTESTW" => Err(AsmError::new(
+            "PTESTR/PTESTW require 3-4 operands (FC,<ea>,#level[,An]); use the assembler's line-level dispatch",
+        )),
 
         "PFLUSHA" => enc_pflusha(cpu),
         "PFLUSHAN" => enc_pflushan(cpu),
 
-        "PTESTW" => match src.or(dst) {
-            Some(d) => enc_mmu_single_reg(0xF548, d, cpu),
-            _ => Err(AsmError::new("PTESTW requires An or (An)")),
-        },
-        "PTESTR" => match src.or(dst) {
-            Some(d) => enc_mmu_single_reg(0xF568, d, cpu),
-            _ => Err(AsmError::new("PTESTR requires An or (An)")),
-        },
+        // PFLUSHN base verified against real `vasm -m68040` output for
+        // `pflushn (a0)` -> F500 (opmode 00 in the 68040 PFLUSH family's
+        // bits 4-3, register in bits 2-0). The previous 0xF518 didn't match
+        // any of that family's four opmodes.
         "PFLUSHN" => match src.or(dst) {
-            Some(d) => enc_mmu_single_reg(0xF518, d, cpu),
+            Some(d) => enc_mmu_single_reg(0xF500, d, cpu),
             _ => Err(AsmError::new("PFLUSHN requires An or (An)")),
         },
         "PLPAW" => match src.or(dst) {
