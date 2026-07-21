@@ -112,23 +112,6 @@ fn fpu_cc(cond: &str) -> Option<u16> {
     })
 }
 
-/// Encode a 68040 cache line operation (CINVL/CINVP/CPUSHL/CPUSHP): takes `#1,An` textually,
-/// but the reference encoding is fully static once family/op_type are known.
-fn cache_line_op(
-    family: u16,
-    op_type: u16,
-    src: Option<&Operand>,
-    dst: Option<&Operand>,
-    cpu: &str,
-) -> Result<Vec<u16>, AsmError> {
-    match (src, dst) {
-        (Some(Operand::Immediate(_)), Some(Operand::AddrReg(_))) => {
-            enc_cache_line_op(family, op_type, cpu)
-        }
-        _ => Err(AsmError::new("cache op requires #level,An")),
-    }
-}
-
 /// Result of encoding a single instruction.
 pub struct EncodedInstruction {
     pub words: Vec<u16>,
@@ -1027,29 +1010,35 @@ pub fn encode_instruction(
             _ => Err(AsmError::new("LPSTOP requires an immediate operand")),
         },
 
-        // Cache line ops (68040): CINVL/CINVP/CPUSHL/CPUSHP take #1,An but the encoding is
-        // fully static once family/op_type are known, so the operands are accepted but unused
-        // beyond validating arity (matches the Python reference).
-        "CINVL" => cache_line_op(1, 0, src, dst, cpu),
-        "CINVP" => cache_line_op(1, 1, src, dst, cpu),
-        "CPUSHL" => cache_line_op(3, 0, src, dst, cpu),
-        "CPUSHP" => cache_line_op(3, 1, src, dst, cpu),
+        // Cache line ops (68040): CINVL/CINVP/CPUSHL/CPUSHP <cache>,(An),
+        // where <cache> is #1 (DC), #2 (IC), or #3 (BC) — matches the
+        // 2-bit scope field in the real encoding (verified against vasm).
+        "CINVL" => match (src, dst) {
+            (Some(Operand::Immediate(cache)), Some(a)) => enc_cache_line_op(false, *cache, a, cpu),
+            _ => Err(AsmError::new("CINVL requires #cache,(An)")),
+        },
+        "CINVP" => match (src, dst) {
+            (Some(Operand::Immediate(cache)), Some(a)) => enc_cache_page_op(false, *cache, a, cpu),
+            _ => Err(AsmError::new("CINVP requires #cache,(An)")),
+        },
+        "CPUSHL" => match (src, dst) {
+            (Some(Operand::Immediate(cache)), Some(a)) => enc_cache_line_op(true, *cache, a, cpu),
+            _ => Err(AsmError::new("CPUSHL requires #cache,(An)")),
+        },
+        "CPUSHP" => match (src, dst) {
+            (Some(Operand::Immediate(cache)), Some(a)) => enc_cache_page_op(true, *cache, a, cpu),
+            _ => Err(AsmError::new("CPUSHP requires #cache,(An)")),
+        },
 
-        "CINVA" => match src {
-            Some(a) => enc_cinva(a, cpu),
-            _ => Err(AsmError::new("CINVA requires An")),
+        // CINVA/CPUSHA <cache> (no address register — verified against
+        // vasm: `cinva bc`/`cinva ic`/`cinva dc` take only a cache scope).
+        "CINVA" => match src.or(dst) {
+            Some(Operand::Immediate(cache)) => enc_cinva(*cache, cpu),
+            _ => Err(AsmError::new("CINVA requires #cache")),
         },
-        "CPUSHA" => match src {
-            Some(a) => enc_cpusha(a, cpu),
-            _ => Err(AsmError::new("CPUSHA requires An")),
-        },
-        "CPUSH" => match (src, dst) {
-            (Some(Operand::Immediate(level)), Some(a)) => enc_cpush(*level, a, cpu),
-            _ => Err(AsmError::new("CPUSH requires #level,An")),
-        },
-        "CINV" => match (src, dst) {
-            (Some(Operand::Immediate(level)), Some(a)) => enc_cinv(*level, a, cpu),
-            _ => Err(AsmError::new("CINV requires #level,An")),
+        "CPUSHA" => match src.or(dst) {
+            Some(Operand::Immediate(cache)) => enc_cpusha(*cache, cpu),
+            _ => Err(AsmError::new("CPUSHA requires #cache")),
         },
 
         // PSAVE / PRESTORE (68030+)

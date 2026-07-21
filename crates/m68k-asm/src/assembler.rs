@@ -4276,8 +4276,10 @@ mymexc MACRO
 
     #[test]
     fn test_source_cinva() {
-        let bytes = assemble_source_with_cpu("    CINVA A0\n", "68040");
-        assert_eq!(bytes, vec![0xF4, 0x20]);
+        // CINVA #3 (BC, both caches) -- verified against real
+        // `vasm -m68040` output for `cinva bc`: F4D8.
+        let bytes = assemble_source_with_cpu("    CINVA #3\n", "68040");
+        assert_eq!(bytes, vec![0xF4, 0xD8]);
     }
 
     #[test]

@@ -195,48 +195,69 @@ pub fn enc_lpstop(val: i64, cpu: &str) -> Result<Vec<u16>, AsmError> {
     Ok(vec![0xF800, 0x01C0, (val as u16)])
 }
 
-/// Encode a cache line operation (CINVL/CINVP/CPUSHL/CPUSHP): 68040 only, opcode is fully
-/// static (no register/level fields survive in the reference encoding for these forms).
-pub fn enc_cache_line_op(family: u16, op_type: u16, cpu: &str) -> Result<Vec<u16>, AsmError> {
+/// Encode a 68040 cache-invalidate/push instruction: `CINVL/P/A` or
+/// `CPUSHL/P/A`.
+///
+/// Layout (verified against real `vasm -m68040` output for all eight
+/// scope×unit combinations, e.g. `cinvl dc,(a0)`=F448, `cinvp dc,(a0)`
+/// =F450, `cinva dc`=F458, `cpushl dc,(a0)`=F468): opword =
+/// `0xF400 | (scope<<6) | (push<<5) | (unit<<3) | reg`, where scope is 2
+/// bits (`01`=DC, `10`=IC, `11`=BC, matching the conventional `#1`/`#2`/
+/// `#3` cache-select immediate), `push` is 0 for invalidate / 1 for push,
+/// `unit` is 2 bits (`01`=Line, `10`=Page, `11`=All), and `reg` (bits 2-0)
+/// only applies to the Line/Page forms (0 for the All forms, which take no
+/// address register).
+///
+/// The previous version of this function ignored the cache-select
+/// immediate and the address register entirely (CINVL/CINVP/CPUSHL/CPUSHP),
+/// and CINVA/CPUSHA used an unrelated fixed opcode (`0xF420|reg`/
+/// `0xF4A0|reg`) that didn't match any field in the real instruction —
+/// replaced outright rather than patched.
+fn enc_cache_op(push: bool, unit: u16, cache: i64, reg: u16, cpu: &str) -> Result<u16, AsmError> {
     check_cpu(cpu, "68040")?;
-    let opword = 0xF400 | (family << 5) | (op_type << 4);
-    Ok(vec![opword])
+    let scope = (cache as u16) & 0x3;
+    let push_bit: u16 = if push { 1 } else { 0 };
+    Ok(0xF400 | (scope << 6) | (push_bit << 5) | (unit << 3) | reg)
+}
+
+/// Encode `CINVL/CPUSHL <cache>,(An)`: invalidate/push a single cache line.
+pub fn enc_cache_line_op(
+    push: bool,
+    cache: i64,
+    an: &Operand,
+    cpu: &str,
+) -> Result<Vec<u16>, AsmError> {
+    let reg = match an {
+        Operand::AddrReg(n) => *n as u16,
+        Operand::AddrRegIndirect(n) => *n as u16,
+        _ => return Err(AsmError::new("cache op requires <cache>,(An)")),
+    };
+    Ok(vec![enc_cache_op(push, 0b01, cache, reg, cpu)?])
+}
+
+/// Encode `CINVP/CPUSHP <cache>,(An)`: invalidate/push a cache page.
+pub fn enc_cache_page_op(
+    push: bool,
+    cache: i64,
+    an: &Operand,
+    cpu: &str,
+) -> Result<Vec<u16>, AsmError> {
+    let reg = match an {
+        Operand::AddrReg(n) => *n as u16,
+        Operand::AddrRegIndirect(n) => *n as u16,
+        _ => return Err(AsmError::new("cache op requires <cache>,(An)")),
+    };
+    Ok(vec![enc_cache_op(push, 0b10, cache, reg, cpu)?])
 }
 
 /// Encode CINVA (68040): invalidate all cache lines in the given cache.
-pub fn enc_cinva(an: &Operand, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    check_cpu(cpu, "68040")?;
-    match an {
-        Operand::AddrReg(n) => Ok(vec![0xF420 | (*n as u16)]),
-        _ => Err(AsmError::new("cinva operand must be An")),
-    }
+pub fn enc_cinva(cache: i64, cpu: &str) -> Result<Vec<u16>, AsmError> {
+    Ok(vec![enc_cache_op(false, 0b11, cache, 0, cpu)?])
 }
 
 /// Encode CPUSHA (68040): push all cache lines in the given cache.
-pub fn enc_cpusha(an: &Operand, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    check_cpu(cpu, "68040")?;
-    match an {
-        Operand::AddrReg(n) => Ok(vec![0xF4A0 | (*n as u16)]),
-        _ => Err(AsmError::new("cpusha operand must be An")),
-    }
-}
-
-/// Encode CPUSH #level,An (68040).
-pub fn enc_cpush(level: i64, an: &Operand, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    check_cpu(cpu, "68040")?;
-    match an {
-        Operand::AddrReg(n) => Ok(vec![0xF4A8 | (((level as u16) & 0x3) << 3) | (*n as u16)]),
-        _ => Err(AsmError::new("cpush second operand must be An")),
-    }
-}
-
-/// Encode CINV #level,An (68040).
-pub fn enc_cinv(level: i64, an: &Operand, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    check_cpu(cpu, "68040")?;
-    match an {
-        Operand::AddrReg(n) => Ok(vec![0xF428 | (((level as u16) & 0x3) << 3) | (*n as u16)]),
-        _ => Err(AsmError::new("cinv second operand must be An")),
-    }
+pub fn enc_cpusha(cache: i64, cpu: &str) -> Result<Vec<u16>, AsmError> {
+    Ok(vec![enc_cache_op(true, 0b11, cache, 0, cpu)?])
 }
 
 /// Encode `PSAVE <ea>` (68030): save MMU internal state.
@@ -402,52 +423,46 @@ mod tests {
         assert_eq!(words, vec![0xF800, 0x01C0, 0x2700]);
     }
 
+    // Cache-line op tests below are all verified against real
+    // `vasm -m68040` output for `<cinvl|cinvp|cpushl|cpushp> <bc|ic|dc>,(a0)`
+    // and `<cinva|cpusha> <bc|ic|dc>`. Cache scope: #1=DC, #2=IC, #3=BC.
+
     #[test]
-    fn test_cinvl_matches_python() {
-        let words = enc_cache_line_op(1, 0, "68040").unwrap();
-        assert_eq!(words, vec![0xF420]);
+    fn test_cinvl_dc_matches_vasm() {
+        let a0 = Operand::AddrRegIndirect(0);
+        let words = enc_cache_line_op(false, 1, &a0, "68040").unwrap();
+        assert_eq!(words, vec![0xF448]);
     }
 
     #[test]
-    fn test_cinvp_matches_python() {
-        let words = enc_cache_line_op(1, 1, "68040").unwrap();
-        assert_eq!(words, vec![0xF430]);
+    fn test_cinvp_dc_matches_vasm() {
+        let a0 = Operand::AddrRegIndirect(0);
+        let words = enc_cache_page_op(false, 1, &a0, "68040").unwrap();
+        assert_eq!(words, vec![0xF450]);
     }
 
     #[test]
-    fn test_cpushl_matches_python() {
-        let words = enc_cache_line_op(3, 0, "68040").unwrap();
-        assert_eq!(words, vec![0xF460]);
+    fn test_cpushl_dc_matches_vasm() {
+        let a0 = Operand::AddrRegIndirect(0);
+        let words = enc_cache_line_op(true, 1, &a0, "68040").unwrap();
+        assert_eq!(words, vec![0xF468]);
     }
 
     #[test]
-    fn test_cpushp_matches_python() {
-        let words = enc_cache_line_op(3, 1, "68040").unwrap();
+    fn test_cpushp_dc_matches_vasm() {
+        let a0 = Operand::AddrRegIndirect(0);
+        let words = enc_cache_page_op(true, 1, &a0, "68040").unwrap();
         assert_eq!(words, vec![0xF470]);
     }
 
     #[test]
-    fn test_cinva_matches_python() {
-        let a0 = Operand::AddrReg(0);
-        assert_eq!(enc_cinva(&a0, "68040").unwrap(), vec![0xF420]);
+    fn test_cinva_bc_matches_vasm() {
+        assert_eq!(enc_cinva(3, "68040").unwrap(), vec![0xF4D8]);
     }
 
     #[test]
-    fn test_cpusha_matches_python() {
-        let a0 = Operand::AddrReg(0);
-        assert_eq!(enc_cpusha(&a0, "68040").unwrap(), vec![0xF4A0]);
-    }
-
-    #[test]
-    fn test_cpush_matches_python() {
-        let a0 = Operand::AddrReg(0);
-        assert_eq!(enc_cpush(2, &a0, "68040").unwrap(), vec![0xF4B8]);
-    }
-
-    #[test]
-    fn test_cinv_matches_python() {
-        let a0 = Operand::AddrReg(0);
-        assert_eq!(enc_cinv(2, &a0, "68040").unwrap(), vec![0xF438]);
+    fn test_cpusha_bc_matches_vasm() {
+        assert_eq!(enc_cpusha(3, "68040").unwrap(), vec![0xF4F8]);
     }
 
     #[test]
@@ -477,8 +492,8 @@ mod tests {
 
     #[test]
     fn test_cache_ops_require_68040() {
-        let a0 = Operand::AddrReg(0);
-        assert!(enc_cinva(&a0, "68030").is_err());
-        assert!(enc_cache_line_op(1, 0, "68030").is_err());
+        let a0 = Operand::AddrRegIndirect(0);
+        assert!(enc_cinva(3, "68030").is_err());
+        assert!(enc_cache_line_op(false, 1, &a0, "68030").is_err());
     }
 }

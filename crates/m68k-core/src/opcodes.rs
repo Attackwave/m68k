@@ -70,6 +70,7 @@ pub enum ParserType {
     Bitfield,
     Pmove,
     PflushFamily040,
+    CacheOp040,
 }
 
 use crate::ea_categories::ea::*;
@@ -760,6 +761,23 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: 0,
             cpu: "68040",
             parser: ParserType::PflushFamily040,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // 68040 cache invalidate/push family: CINVL/CINVP/CINVA/
+            // CPUSHL/CPUSHP/CPUSHA, sharing base 0xF400 with a 2-bit scope
+            // (bits 7-6: 01=DC,10=IC,11=BC), push flag (bit 5), 2-bit unit
+            // (bits 4-3: 01=Line,10=Page,11=All), and register (bits 2-0,
+            // only meaningful for the Line/Page forms). Verified against
+            // real `vasm -m68040` output for all eight scope/unit
+            // combinations. Placeholder mnemonic; CacheOp040 overrides it.
+            mask: 0xFC00,
+            value: 0xF400,
+            mnemonic: "CACHE",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68040",
+            parser: ParserType::CacheOp040,
             fixed_size: None,
         },
         OpcodePattern {

@@ -967,6 +967,28 @@ fn parse_operands(
                 _ => Err("unknown MMU extension word group prefix".into()),
             }
         }
+        ParserType::CacheOp040 => {
+            let scope = (op >> 6) & 0x3;
+            let push = (op >> 5) & 1;
+            let unit = (op >> 3) & 0x3;
+            let reg = (op & 0x7) as u8;
+
+            let mnemonic = match (push, unit) {
+                (0, 0b01) => "cinvl",
+                (0, 0b10) => "cinvp",
+                (0, 0b11) => "cinva",
+                (1, 0b01) => "cpushl",
+                (1, 0b10) => "cpushp",
+                (1, 0b11) => "cpusha",
+                _ => return Err("unknown cache operation unit field".into()),
+            };
+
+            operands.push(DecodedOperand::special(format!("#{}", scope)));
+            if unit != 0b11 {
+                operands.push(DecodedOperand::from_ea(EAOperand::AddrIndirect(reg)));
+            }
+            Ok((mnemonic.into(), operands, target_addr))
+        }
     }
 }
 
