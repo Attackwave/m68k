@@ -232,7 +232,7 @@ fn parse_operands(
             let dst = EAOperand::DataReg(dst_reg);
             operands.push(DecodedOperand::from_ea(src));
             operands.push(DecodedOperand::from_ea(dst));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::RegEa => {
             let size_code = ((op >> 6) & 0x3) as u8;
@@ -247,7 +247,7 @@ fn parse_operands(
             let dst = decode_ea(dst_mode, dst_reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(src));
             operands.push(DecodedOperand::from_ea(dst));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Adda => {
             let size_code = ((op >> 8) & 0x1) as u8;
@@ -427,7 +427,7 @@ fn parse_operands(
             Ok((name, operands, target_addr))
         }
         ParserType::Exg => {
-            let mode = ((op >> 3) & 0x7) as u8;
+            let mode = ((op >> 3) & 0x1F) as u8;
             let regx = ((op >> 9) & 0x7) as u8;
             let regy = (op & 0x7) as u8;
             match mode {
@@ -448,11 +448,10 @@ fn parse_operands(
             Ok((name, operands, target_addr))
         }
         ParserType::Ext => {
-            let ext_word = (op & 0x40) as u8;
-            let _size = if ext_word != 0 { "l" } else { "w" };
+            let size = if (op & 0x40) != 0 { "l" } else { "w" };
             let dst_reg = (op & 0x7) as u8;
             operands.push(DecodedOperand::from_ea(EAOperand::DataReg(dst_reg)));
-            Ok((name, operands, target_addr))
+            Ok((format!("ext.{}", size), operands, target_addr))
         }
         ParserType::Link => {
             let reg = (op & 0x7) as u8;
@@ -710,12 +709,12 @@ fn parse_operands(
             if size_code >= 3 {
                 return Err("invalid size code".into());
             }
-            let _size = ["b", "w", "l"][size_code as usize];
+            let size = ["b", "w", "l"][size_code as usize];
             let src_reg = (op & 0x7) as u8;
             let dst_reg = ((op >> 9) & 0x7) as u8;
             operands.push(DecodedOperand::from_ea(EAOperand::PostInc(src_reg)));
             operands.push(DecodedOperand::from_ea(EAOperand::PostInc(dst_reg)));
-            Ok((name, operands, target_addr))
+            Ok((format!("cmpm.{}", size), operands, target_addr))
         }
         ParserType::Cmp => {
             let size_code = ((op >> 6) & 0x3) as u8;
