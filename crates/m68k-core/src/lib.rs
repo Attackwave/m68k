@@ -11,6 +11,7 @@
 //! `m68k-disasm` rather than directly.
 
 pub mod addressing;
+pub mod amiga_hunk;
 pub mod ea_categories;
 pub mod errors;
 pub mod expr;

@@ -324,7 +324,7 @@ fn parse_operands(
                 (ext_pc as i32 + disp as i32) as u32
             };
             target_addr = Some(target);
-            operands.push(DecodedOperand::special(format!("${:08x}", target)));
+            operands.push(DecodedOperand::from_ea(EAOperand::AbsoluteLong(target)));
             Ok((cc_name.into(), operands, target_addr))
         }
         ParserType::Dbcc => {
@@ -340,7 +340,7 @@ fn parse_operands(
             let target = (ext_pc as i32 + disp) as u32;
             target_addr = Some(target);
             operands.push(DecodedOperand::from_ea(EAOperand::DataReg(reg)));
-            operands.push(DecodedOperand::special(format!("${:08x}", target)));
+            operands.push(DecodedOperand::from_ea(EAOperand::AbsoluteLong(target)));
             Ok((cc_name.into(), operands, target_addr))
         }
         ParserType::Scc => {

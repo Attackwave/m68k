@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::Parser;
+use m68k_core::amiga_hunk::read_hunk_executable;
 use m68k_disasm::disassembler::Disassembler;
 
 #[derive(Parser, Debug)]
@@ -12,7 +13,9 @@ struct Args {
     /// Input binary file to disassemble
     input: PathBuf,
 
-    /// Start address (hex, e.g. $1000 or 0x1000)
+    /// Start address (hex, e.g. $1000 or 0x1000). For Amiga Hunk
+    /// executables this is the load base the first hunk is placed at,
+    /// rather than a required manual guess.
     #[arg(short, long, default_value = "0")]
     address: String,
 
@@ -47,7 +50,24 @@ fn run(args: Args) -> Result<(), String> {
         return Err("empty input file".to_string());
     }
 
-    let mut disasm = Disassembler::new(data, start_addr);
+    // Amiga Hunk executables (HUNK_HEADER magic 0x000003F3) get their
+    // hunks loaded, relocated, and flattened into one image; everything
+    // else is treated as a raw binary at the given start address.
+    let (image, base_addr, known_labels) = if data.len() >= 4 && data[0..4] == [0, 0, 0x03, 0xf3] {
+        let exe = read_hunk_executable(&data, start_addr)
+            .map_err(|e| format!("cannot read '{}': {}", args.input.display(), e))?;
+        let labels = exe
+            .all_symbols()
+            .into_iter()
+            .map(|(name, addr)| (addr, name))
+            .collect();
+        (exe.image, exe.load_base, labels)
+    } else {
+        (data, start_addr, Vec::new())
+    };
+
+    let mut disasm = Disassembler::new(image, base_addr);
+    disasm.add_known_labels(known_labels);
     disasm.set_cpu(&args.cpu);
 
     for line in disasm.disassemble() {

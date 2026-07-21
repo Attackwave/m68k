@@ -28,6 +28,7 @@ pub struct Disassembler {
     origin: u32,
     cpu: String,
     labels: HashMap<u32, String>,
+    known_labels: HashMap<u32, String>,
 }
 
 impl Disassembler {
@@ -37,11 +38,21 @@ impl Disassembler {
             origin,
             cpu: "68000".to_string(),
             labels: HashMap::new(),
+            known_labels: HashMap::new(),
         }
     }
 
     pub fn set_cpu(&mut self, cpu: &str) {
         self.cpu = cpu.to_string();
+    }
+
+    /// Seed the label table with known names (e.g. symbols recovered from
+    /// an executable's symbol table) before [`Disassembler::disassemble`]
+    /// runs. These take priority over auto-generated `label<N>` names at
+    /// the same address, and are shown even if pass 1 finds no branch/jump
+    /// referencing that address.
+    pub fn add_known_labels<I: IntoIterator<Item = (u32, String)>>(&mut self, labels: I) {
+        self.known_labels.extend(labels);
     }
 
     /// Discovered labels after [`Disassembler::disassemble`] has run: maps
@@ -79,7 +90,7 @@ impl Disassembler {
         let mut label_idx = 0usize;
         targets.sort();
         targets.dedup();
-        self.labels.clear();
+        self.labels.clone_from(&self.known_labels);
         for addr in targets {
             if let std::collections::hash_map::Entry::Vacant(e) = self.labels.entry(addr) {
                 e.insert(format!("label{}", label_idx));
@@ -156,7 +167,7 @@ mod tests {
         let lines = disasm.disassemble();
 
         assert_eq!(disasm.labels().get(&0x2004), Some(&"label0".to_string()));
-        assert!(lines[0].text.contains("00002004"));
+        assert!(lines[0].text.contains("label0"));
     }
 
     #[test]
@@ -191,5 +202,19 @@ mod tests {
         assert!(lines[0].text.starts_with("dc.w"));
         assert_eq!(lines[1].address, 2);
         assert_eq!(lines[1].text.trim(), "rts");
+    }
+
+    #[test]
+    fn test_known_labels_take_priority_over_generated_names() {
+        // BRA.S +2 (to the RTS below), then RTS — same target as
+        // test_disassemble_discovers_branch_label, but the target address
+        // is pre-seeded with a known symbol name.
+        let bytes = vec![0x60, 0x02, 0x4E, 0x75];
+        let mut disasm = Disassembler::new(bytes, 0x2000);
+        disasm.add_known_labels([(0x2004, "myFunc".to_string())]);
+        let lines = disasm.disassemble();
+
+        assert_eq!(disasm.labels().get(&0x2004), Some(&"myFunc".to_string()));
+        assert!(lines[0].text.contains("myFunc"));
     }
 }
