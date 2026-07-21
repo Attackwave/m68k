@@ -1,0 +1,27 @@
+[package]
+name = "m68k-cli"
+description = "CLI binaries for m68k assembler/disassembler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "m68k-asm"
+path = "src/bin/m68k-asm.rs"
+
+[[bin]]
+name = "m68k-disasm"
+path = "src/bin/m68k-disasm.rs"
+
+[[bin]]
+name = "m68k-floppy"
+path = "src/bin/m68k-floppy.rs"
+
+[dependencies]
+clap.workspace = true
+m68k-core = { path = "../m68k-core" }
+m68k-asm = { path = "../m68k-asm" }
+m68k-disasm = { path = "../m68k-disasm" }
+m68k-floppy = { path = "../m68k-floppy" }

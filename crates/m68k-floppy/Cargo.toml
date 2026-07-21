@@ -1,0 +1,12 @@
+[package]
+name = "m68k-floppy"
+description = "Amiga floppy disk support (ADF, UAE, IPF, MFM)"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+m68k-core = { path = "../m68k-core" }
+thiserror.workspace = true

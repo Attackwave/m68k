@@ -1,0 +1,28 @@
+[workspace]
+members = [
+    "crates/m68k-core",
+    "crates/m68k-asm",
+    "crates/m68k-disasm",
+    "crates/m68k-floppy",
+    "crates/m68k-cli",
+]
+resolver = "2"
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+authors = ["Attackwave"]
+description = "Motorola 68000 (m68k) family assembler and disassembler"
+license = "MIT"
+repository = "https://github.com/Attackwave/m68k"
+
+[workspace.dependencies]
+thiserror = "2.0"
+bitflags = "2.6"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+[profile.release]
+lto = true
+codegen-units = 1

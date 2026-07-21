@@ -1,0 +1,16 @@
+[package]
+name = "m68k-disasm"
+description = "Motorola 68000 disassembler with 2-pass label discovery"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+m68k-core = { path = "../m68k-core" }
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+hex = "0.4"

@@ -1,0 +1,15 @@
+[package]
+name = "m68k-core"
+description = "Core types and utilities for the m68k assembler/disassembler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+bitflags.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

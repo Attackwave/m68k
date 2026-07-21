@@ -1,0 +1,16 @@
+[package]
+name = "m68k-asm"
+description = "Two-pass Motorola 68000 assembler"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+m68k-core = { path = "../m68k-core" }
+
+[dev-dependencies]
+m68k-disasm = { path = "../m68k-disasm" }
+serde_json.workspace = true
+thiserror.workspace = true

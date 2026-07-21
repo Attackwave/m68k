@@ -1,0 +1,748 @@
+{
+  "encoder_tests": [
+    {
+      "name": "NOP",
+      "input": "NOP",
+      "cpu": "68000",
+      "expected_hex": "4e71"
+    },
+    {
+      "name": "ADD_B_D0_D1",
+      "input": "ADD.B D0,D1",
+      "cpu": "68000",
+      "expected_hex": "d200"
+    },
+    {
+      "name": "ADD_W_D0_D1",
+      "input": "ADD.W D0,D1",
+      "cpu": "68000",
+      "expected_hex": "d240"
+    },
+    {
+      "name": "ADD_L_D0_D1",
+      "input": "ADD.L D0,D1",
+      "cpu": "68000",
+      "expected_hex": "d280"
+    },
+    {
+      "name": "MOVE_B_D0_D1",
+      "input": "MOVE.B D0,D1",
+      "cpu": "68000",
+      "expected_hex": "1200"
+    },
+    {
+      "name": "MOVE_W_D0_D1",
+      "input": "MOVE.W D0,D1",
+      "cpu": "68000",
+      "expected_hex": "3200"
+    },
+    {
+      "name": "MOVE_L_D0_D1",
+      "input": "MOVE.L D0,D1",
+      "cpu": "68000",
+      "expected_hex": "2200"
+    },
+    {
+      "name": "MOVE_L_0x12345678_D0",
+      "input": "MOVE.L #$12345678,D0",
+      "cpu": "68000",
+      "expected_hex": "203c12345678"
+    },
+    {
+      "name": "MOVE_W_0x1234_D0",
+      "input": "MOVE.W #$1234,D0",
+      "cpu": "68000",
+      "expected_hex": "303c1234"
+    },
+    {
+      "name": "MOVE_B_42_D0",
+      "input": "MOVE.B #42,D0",
+      "cpu": "68000",
+      "expected_hex": "103c002a"
+    },
+    {
+      "name": "MOVEQ_0_D0",
+      "input": "MOVEQ #0,D0",
+      "cpu": "68000",
+      "expected_hex": "7000"
+    },
+    {
+      "name": "MOVEQ_1_D0",
+      "input": "MOVEQ #1,D0",
+      "cpu": "68000",
+      "expected_hex": "7001"
+    },
+    {
+      "name": "MOVEQ__1_D0",
+      "input": "MOVEQ #-1,D0",
+      "cpu": "68000",
+      "expected_hex": "70ff"
+    },
+    {
+      "name": "RTS",
+      "input": "RTS",
+      "cpu": "68000",
+      "expected_hex": "4e75"
+    },
+    {
+      "name": "JMP_A0",
+      "input": "JMP (A0)",
+      "cpu": "68000",
+      "expected_hex": "4ed0"
+    },
+    {
+      "name": "JSR_A0",
+      "input": "JSR (A0)",
+      "cpu": "68000",
+      "expected_hex": "4e90"
+    },
+    {
+      "name": "BRA_S_label",
+      "input": "BRA.S label",
+      "cpu": "68000",
+      "expected_hex": "60fe"
+    },
+    {
+      "name": "DBRA_D0_label",
+      "input": "DBRA D0,label",
+      "cpu": "68000",
+      "expected_hex": "51c8fffe"
+    },
+    {
+      "name": "MOVE_L_A0+_D0",
+      "input": "MOVE.L (A0)+,D0",
+      "cpu": "68000",
+      "expected_hex": "2018"
+    },
+    {
+      "name": "MOVE_L__A0_D0",
+      "input": "MOVE.L -(A0),D0",
+      "cpu": "68000",
+      "expected_hex": "2020"
+    },
+    {
+      "name": "MOVEM_L_D0_D7/A0_A7__SP",
+      "input": "MOVEM.L D0-D7/A0-A7,-(SP)",
+      "cpu": "68000",
+      "expected_hex": "48e7ffff"
+    },
+    {
+      "name": "MOVEM_L_A0+_D0_D7",
+      "input": "MOVEM.L (A0)+,D0-D7",
+      "cpu": "68000",
+      "expected_hex": "4cd800ff"
+    },
+    {
+      "name": "TST_L_D0",
+      "input": "TST.L D0",
+      "cpu": "68000",
+      "expected_hex": "4a80"
+    },
+    {
+      "name": "CLR_L_D0",
+      "input": "CLR.L D0",
+      "cpu": "68000",
+      "expected_hex": "4280"
+    },
+    {
+      "name": "NOT_L_D0",
+      "input": "NOT.L D0",
+      "cpu": "68000",
+      "expected_hex": "4680"
+    },
+    {
+      "name": "NEG_L_D0",
+      "input": "NEG.L D0",
+      "cpu": "68000",
+      "expected_hex": "4480"
+    },
+    {
+      "name": "SUBQ_L_1_D0",
+      "input": "SUBQ.L #1,D0",
+      "cpu": "68000",
+      "expected_hex": "5380"
+    },
+    {
+      "name": "ADDQ_L_1_D0",
+      "input": "ADDQ.L #1,D0",
+      "cpu": "68000",
+      "expected_hex": "5280"
+    },
+    {
+      "name": "LSL_L_1_D0",
+      "input": "LSL.L #1,D0",
+      "cpu": "68000",
+      "expected_hex": "e388"
+    },
+    {
+      "name": "LSR_W_2_D1",
+      "input": "LSR.W #2,D1",
+      "cpu": "68000",
+      "expected_hex": "e449"
+    },
+    {
+      "name": "ROL_L_3_D0",
+      "input": "ROL.L #3,D0",
+      "cpu": "68000",
+      "expected_hex": "e798"
+    },
+    {
+      "name": "ROR_B_1_D0",
+      "input": "ROR.B #1,D0",
+      "cpu": "68000",
+      "expected_hex": "e218"
+    },
+    {
+      "name": "AND_B_D0_D1",
+      "input": "AND.B D0,D1",
+      "cpu": "68000",
+      "expected_hex": "c200"
+    },
+    {
+      "name": "OR_W_D0_D1",
+      "input": "OR.W D0,D1",
+      "cpu": "68000",
+      "expected_hex": "8240"
+    },
+    {
+      "name": "EOR_L_D0_D1",
+      "input": "EOR.L D0,D1",
+      "cpu": "68000",
+      "expected_hex": "b181"
+    },
+    {
+      "name": "ANDI_B_0xF0_D0",
+      "input": "ANDI.B #$F0,D0",
+      "cpu": "68000",
+      "expected_hex": "020000f0"
+    },
+    {
+      "name": "ORI_W_0x00FF_D1",
+      "input": "ORI.W #$00FF,D1",
+      "cpu": "68000",
+      "expected_hex": "004100ff"
+    },
+    {
+      "name": "EORI_L_0xFFFFFFFF_D0",
+      "input": "EORI.L #$FFFFFFFF,D0",
+      "cpu": "68000",
+      "expected_hex": "0a80ffffffff"
+    },
+    {
+      "name": "CMPI_L_42_D0",
+      "input": "CMPI.L #42,D0",
+      "cpu": "68000",
+      "expected_hex": "0c800000002a"
+    },
+    {
+      "name": "LEA_0x1000A0_A0",
+      "input": "LEA $1000(A0),A0",
+      "cpu": "68000",
+      "expected_hex": "41e81000"
+    },
+    {
+      "name": "PEA_A0",
+      "input": "PEA (A0)",
+      "cpu": "68000",
+      "expected_hex": "4850"
+    },
+    {
+      "name": "SWAP_D0",
+      "input": "SWAP D0",
+      "cpu": "68000",
+      "expected_hex": "4840"
+    },
+    {
+      "name": "EXT_L_D0",
+      "input": "EXT.L D0",
+      "cpu": "68000",
+      "expected_hex": "48c0"
+    },
+    {
+      "name": "EXT_W_D0",
+      "input": "EXT.W D0",
+      "cpu": "68000",
+      "expected_hex": "4880"
+    },
+    {
+      "name": "LINK_A6__4",
+      "input": "LINK A6,#-4",
+      "cpu": "68000",
+      "expected_hex": "4e56fffc"
+    },
+    {
+      "name": "UNLK_A6",
+      "input": "UNLK A6",
+      "cpu": "68000",
+      "expected_hex": "4e5e"
+    },
+    {
+      "name": "TRAP_14",
+      "input": "TRAP #14",
+      "cpu": "68000",
+      "expected_hex": "4e4e"
+    },
+    {
+      "name": "TRAPV",
+      "input": "TRAPV",
+      "cpu": "68000",
+      "expected_hex": "4e76"
+    },
+    {
+      "name": "MOVE_W_SR_D0",
+      "input": "MOVE.W SR,D0",
+      "cpu": "68000",
+      "expected_hex": "40c0"
+    },
+    {
+      "name": "MOVE_W_D0_CCR",
+      "input": "MOVE.W D0,CCR",
+      "cpu": "68000",
+      "expected_hex": "44c0"
+    },
+    {
+      "name": "MOVE_W_D0_SR",
+      "input": "MOVE.W D0,SR",
+      "cpu": "68000",
+      "expected_hex": "46c0"
+    },
+    {
+      "name": "NBCD_D0",
+      "input": "NBCD D0",
+      "cpu": "68000",
+      "expected_hex": "4800"
+    },
+    {
+      "name": "TAS_D0",
+      "input": "TAS D0",
+      "cpu": "68000",
+      "expected_hex": "4ac0"
+    },
+    {
+      "name": "BTST_D0_D1",
+      "input": "BTST D0,D1",
+      "cpu": "68000",
+      "expected_hex": "0101"
+    },
+    {
+      "name": "BSET_D0_D1",
+      "input": "BSET D0,D1",
+      "cpu": "68000",
+      "expected_hex": "01c1"
+    },
+    {
+      "name": "BCLR_D0_D1",
+      "input": "BCLR D0,D1",
+      "cpu": "68000",
+      "expected_hex": "0181"
+    },
+    {
+      "name": "BCHG_D0_D1",
+      "input": "BCHG D0,D1",
+      "cpu": "68000",
+      "expected_hex": "0141"
+    },
+    {
+      "name": "MOVEC_L_D0_CACR",
+      "input": "MOVEC.L D0,CACR",
+      "cpu": "68020",
+      "expected_hex": "4e7b0002"
+    },
+    {
+      "name": "MOVEC_L_VBR_D0",
+      "input": "MOVEC.L VBR,D0",
+      "cpu": "68020",
+      "expected_hex": "4e7a0801"
+    },
+    {
+      "name": "BFTST_A0{0:8}",
+      "input": "BFTST (A0){#0:#8}",
+      "cpu": "68020",
+      "expected_hex": "e8d00008"
+    },
+    {
+      "name": "BFCLR_A0{0:8}",
+      "input": "BFCLR (A0){#0:#8}",
+      "cpu": "68020",
+      "expected_hex": "ecd00008"
+    },
+    {
+      "name": "BFSET_A0{0:8}",
+      "input": "BFSET (A0){#0:#8}",
+      "cpu": "68020",
+      "expected_hex": "eed00008"
+    },
+    {
+      "name": "BFFFO_D0{0:8}_D1",
+      "input": "BFFFO D0{#0:#8},D1",
+      "cpu": "68020",
+      "expected_hex": "edc01008"
+    },
+    {
+      "name": "BFINS_D0_A0{0:8}",
+      "input": "BFINS D0,(A0){#0:#8}",
+      "cpu": "68020",
+      "expected_hex": "efd00008"
+    },
+    {
+      "name": "FMOVE_L_D0_FP0",
+      "input": "FMOVE.L D0,FP0",
+      "cpu": "68040",
+      "expected_hex": "f2004000"
+    },
+    {
+      "name": "FMOVE_FP0_FP1",
+      "input": "FMOVE FP0,FP1",
+      "cpu": "68040",
+      "expected_hex": "f2000080"
+    },
+    {
+      "name": "FADD_FP0_FP1",
+      "input": "FADD FP0,FP1",
+      "cpu": "68040",
+      "expected_hex": "f20000a2"
+    },
+    {
+      "name": "FMUL_FP0_FP1",
+      "input": "FMUL FP0,FP1",
+      "cpu": "68040",
+      "expected_hex": "f20000a3"
+    },
+    {
+      "name": "FSIN_FP0",
+      "input": "FSIN FP0",
+      "cpu": "68040",
+      "expected_hex": "f200000e"
+    },
+    {
+      "name": "FCMP_X_FP0_FP1",
+      "input": "FCMP.X FP0,FP1",
+      "cpu": "68040",
+      "expected_hex": "f20000b8"
+    },
+    {
+      "name": "FTST_X_FP0",
+      "input": "FTST.X FP0",
+      "cpu": "68040",
+      "expected_hex": "f200003a"
+    }
+  ],
+  "decoder_tests": [
+    {
+      "name": "decode_4e71",
+      "input_hex": "4e71",
+      "expected": "nop",
+      "cpu": "68000"
+    },
+    {
+      "name": "decode_4e75",
+      "input_hex": "4e75",
+      "expected": "rts",
+      "cpu": "68000"
+    },
+    {
+      "name": "decode_4e74",
+      "input_hex": "4e74000c",
+      "expected": "rtd     #$000c",
+      "cpu": "68010"
+    },
+    {
+      "name": "decode_4e77",
+      "input_hex": "4e77",
+      "expected": "rtr",
+      "cpu": "68000"
+    },
+    {
+      "name": "decode_4e76",
+      "input_hex": "4e76",
+      "expected": "trapv",
+      "cpu": "68000"
+    },
+    {
+      "name": "decode_4e70",
+      "input_hex": "4e70",
+      "expected": "reset",
+      "cpu": "68000"
+    },
+    {
+      "name": "decode_0000",
+      "input_hex": "0000",
+      "expected": "dc.w     $0000",
+      "cpu": "68000"
+    }
+  ],
+  "float_tests": [
+    {
+      "name": "float_1.0_single",
+      "input": "1.0",
+      "format": "single",
+      "expected_hex": "3f800000"
+    },
+    {
+      "name": "float_-1.0_single",
+      "input": "-1.0",
+      "format": "single",
+      "expected_hex": "bf800000"
+    },
+    {
+      "name": "float_0.0_single",
+      "input": "0.0",
+      "format": "single",
+      "expected_hex": "00000000"
+    },
+    {
+      "name": "float_3.14159_single",
+      "input": "3.14159",
+      "format": "single",
+      "expected_hex": "40490fd0"
+    },
+    {
+      "name": "float_1.0_double",
+      "input": "1.0",
+      "format": "double",
+      "expected_hex": "3ff0000000000000"
+    },
+    {
+      "name": "float_-1.0_double",
+      "input": "-1.0",
+      "format": "double",
+      "expected_hex": "bff0000000000000"
+    },
+    {
+      "name": "float_0.0_double",
+      "input": "0.0",
+      "format": "double",
+      "expected_hex": "0000000000000000"
+    },
+    {
+      "name": "float_3.14159265358979_double",
+      "input": "3.14159265358979",
+      "format": "double",
+      "expected_hex": "400921fb54442d11"
+    },
+    {
+      "name": "float_1.0_extended",
+      "input": "1.0",
+      "format": "extended",
+      "expected_hex": "3fff00008000000000000000"
+    },
+    {
+      "name": "float_-1.0_extended",
+      "input": "-1.0",
+      "format": "extended",
+      "expected_hex": "bfff00008000000000000000"
+    },
+    {
+      "name": "float_0.0_extended",
+      "input": "0.0",
+      "format": "extended",
+      "expected_hex": "000000000000000000000000"
+    },
+    {
+      "name": "float_3.141592653589793238_extended",
+      "input": "3.141592653589793238",
+      "format": "extended",
+      "expected_hex": "40000000c90fdaa22168c232"
+    },
+    {
+      "name": "float_1.5_extended",
+      "input": "1.5",
+      "format": "extended",
+      "expected_hex": "3fff0000c000000000000000"
+    },
+    {
+      "name": "float_-1.5_extended",
+      "input": "-1.5",
+      "format": "extended",
+      "expected_hex": "bfff0000c000000000000000"
+    },
+    {
+      "name": "float_100.0_extended",
+      "input": "100.0",
+      "format": "extended",
+      "expected_hex": "40050000c800000000000000"
+    },
+    {
+      "name": "float_0.5_extended",
+      "input": "0.5",
+      "format": "extended",
+      "expected_hex": "3ffe00008000000000000000"
+    },
+    {
+      "name": "float_1e-10_extended",
+      "input": "1e-10",
+      "format": "extended",
+      "expected_hex": "3fdd0000dbe6fecebdedd5be"
+    },
+    {
+      "name": "float_1e10_extended",
+      "input": "1e10",
+      "format": "extended",
+      "expected_hex": "402000009502f90000000000"
+    }
+  ],
+  "expression_tests": [
+    {
+      "name": "expr_42",
+      "input": "42",
+      "expected_value": 42
+    },
+    {
+      "name": "expr_0xFF",
+      "input": "$FF",
+      "expected_value": 255
+    },
+    {
+      "name": "expr_0x1000",
+      "input": "$1000",
+      "expected_value": 4096
+    },
+    {
+      "name": "expr_0xDEAD",
+      "input": "0xDEAD",
+      "expected_value": 57005
+    },
+    {
+      "name": "expr_0b1010",
+      "input": "%1010",
+      "expected_value": 10
+    },
+    {
+      "name": "expr_'A'",
+      "input": "'A'",
+      "expected_value": 65
+    },
+    {
+      "name": "expr_2_+_2",
+      "input": "2 + 2",
+      "expected_value": 4
+    },
+    {
+      "name": "expr_10_neg_3",
+      "input": "10 - 3",
+      "expected_value": 7
+    },
+    {
+      "name": "expr_3_*_4",
+      "input": "3 * 4",
+      "expected_value": 12
+    },
+    {
+      "name": "expr_20_/_4",
+      "input": "20 / 4",
+      "expected_value": 5
+    },
+    {
+      "name": "expr_1_<<_8",
+      "input": "1 << 8",
+      "expected_value": 256
+    },
+    {
+      "name": "expr_256_>>_4",
+      "input": "256 >> 4",
+      "expected_value": 16
+    },
+    {
+      "name": "expr_0xFF_AND_0x0F",
+      "input": "0xFF & 0x0F",
+      "expected_value": 15
+    },
+    {
+      "name": "expr_0xF0_OR_0x0F",
+      "input": "0xF0 | 0x0F",
+      "expected_value": 255
+    },
+    {
+      "name": "expr_0xFF_XOR_0xF0",
+      "input": "0xFF ^ 0xF0",
+      "expected_value": 15
+    },
+    {
+      "name": "expr_NOT0",
+      "input": "~0",
+      "expected_value": -1
+    },
+    {
+      "name": "expr_neg42",
+      "input": "-42",
+      "expected_value": -42
+    },
+    {
+      "name": "expr_2_+_3_*_4",
+      "input": "(2 + 3) * 4",
+      "expected_value": 20
+    },
+    {
+      "name": "expr_1_+_2_*_3",
+      "input": "1 + 2 * 3",
+      "expected_value": 7
+    },
+    {
+      "name": "expr_0x1000_+_0x100",
+      "input": "$1000 + $100",
+      "expected_value": 4352
+    }
+  ],
+  "token_tests": [
+    {
+      "name": "token_'NOP'",
+      "input": "NOP",
+      "expected_tokens": [
+        "IDENT:NOP"
+      ]
+    },
+    {
+      "name": "token_'MOVE.L_D0,D1'",
+      "input": "MOVE.L D0,D1",
+      "expected_tokens": [
+        "IDENT:MOVE",
+        "PUNCT:.",
+        "IDENT:L",
+        "IDENT:D0",
+        "PUNCT:,",
+        "IDENT:D1"
+      ]
+    },
+    {
+      "name": "token_'$FF'",
+      "input": "$FF",
+      "expected_tokens": [
+        "NUM:$FF"
+      ]
+    },
+    {
+      "name": "token_'42'",
+      "input": "42",
+      "expected_tokens": [
+        "NUM:42"
+      ]
+    },
+    {
+      "name": "token_'%1010'",
+      "input": "%1010",
+      "expected_tokens": [
+        "BIN:%1010"
+      ]
+    },
+    {
+      "name": "token_\"'A'\"",
+      "input": "'A'",
+      "expected_tokens": [
+        "CHAR:'A'"
+      ]
+    },
+    {
+      "name": "token_'move.l_#$1234,d0'",
+      "input": "move.l #$1234,d0",
+      "expected_tokens": [
+        "IDENT:move",
+        "PUNCT:.",
+        "IDENT:l",
+        "PUNCT:#",
+        "NUM:$1234",
+        "PUNCT:,",
+        "IDENT:d0"
+      ]
+    }
+  ]
+}
