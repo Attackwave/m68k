@@ -735,7 +735,7 @@ fn parse_parens_disp_pc_index(text: &str) -> Option<(u8, i8, u8, bool)> {
                     && let Some(reg_num) = reg.reg_num()
                 {
                     let disp = evaluate_simple_number(disp_str).unwrap_or(0);
-                    let disp_i8 = ((disp as i32) & 0xFF) as i8;
+                    let disp_i8 = (disp & 0xFF) as i8;
                     return Some((reg_num, disp_i8, scale, is_long));
                 }
             }
@@ -764,7 +764,7 @@ fn parse_parens_disp_reg_index(text: &str) -> Option<(u8, u8, i8, u8, bool)> {
                     && let Some(xn) = reg.reg_num()
                 {
                     let disp = evaluate_simple_number(disp_str).unwrap_or(0);
-                    let disp_i8 = ((disp as i32) & 0xFF) as i8;
+                    let disp_i8 = (disp & 0xFF) as i8;
                     return Some((an, xn, disp_i8, scale, is_long));
                 }
             }
@@ -2468,11 +2468,9 @@ impl Assembler {
     /// Encode BRA with size hint.
     fn encode_bra(&self, disp: i32, size_hint: BranchSize) -> Result<Vec<u16>, AsmError> {
         match size_hint {
-            BranchSize::Short | BranchSize::Any => {
-                if (-128..=127).contains(&disp) {
-                    let op = 0x6000 | ((disp & 0xFF) as u16);
-                    return Ok(vec![op]);
-                }
+            BranchSize::Short | BranchSize::Any if (-128..=127).contains(&disp) => {
+                let op = 0x6000 | ((disp & 0xFF) as u16);
+                return Ok(vec![op]);
             }
             _ => {}
         }
@@ -2500,11 +2498,9 @@ impl Assembler {
     /// Encode BSR with size hint.
     fn encode_bsr(&self, disp: i32, size_hint: BranchSize) -> Result<Vec<u16>, AsmError> {
         match size_hint {
-            BranchSize::Short | BranchSize::Any => {
-                if (-128..=127).contains(&disp) {
-                    let op = 0x6100 | ((disp & 0xFF) as u16);
-                    return Ok(vec![op]);
-                }
+            BranchSize::Short | BranchSize::Any if (-128..=127).contains(&disp) => {
+                let op = 0x6100 | ((disp & 0xFF) as u16);
+                return Ok(vec![op]);
             }
             _ => {}
         }
