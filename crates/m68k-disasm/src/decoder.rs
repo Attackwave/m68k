@@ -92,35 +92,20 @@ pub fn decode_next(
     let op = stream.read_word()?;
 
     let patterns = opcode_patterns();
-    let mut matched: Option<&m68k_core::opcodes::OpcodePattern> = None;
+    let limit_level = cpu_level(cpu_limit);
     for pat in patterns {
-        if (op & pat.mask) == pat.value {
-            let pat_level = cpu_level(pat.cpu);
-            let limit_level = cpu_level(cpu_limit);
-            if pat_level <= limit_level {
-                matched = Some(pat);
-                break;
-            }
+        if (op & pat.mask) != pat.value {
+            continue;
         }
-    }
-
-    let Some(pat) = matched else {
+        if cpu_level(pat.cpu) > limit_level {
+            continue;
+        }
         stream.seek(start_offset + 2);
-        let raw = stream.data[start_offset..stream.offset].to_vec();
-        return Ok((
-            inst_pc,
-            DecodeResult::DataWord(DataWordInstruction {
-                address: inst_pc,
-                raw_bytes: raw,
-                val: op,
-            }),
-        ));
-    };
-
-    match parse_operands(op, pat, stream, inst_pc, cpu_limit) {
-        Ok((mnemonic, operands, target_addr)) => {
+        if let Ok((mnemonic, operands, target_addr)) =
+            parse_operands(op, pat, stream, inst_pc, cpu_limit)
+        {
             let raw = stream.data[start_offset..stream.offset].to_vec();
-            Ok((
+            return Ok((
                 inst_pc,
                 DecodeResult::Instruction(DecodedInstruction {
                     address: inst_pc,
@@ -129,21 +114,20 @@ pub fn decode_next(
                     operands,
                     target_address: target_addr,
                 }),
-            ))
-        }
-        Err(_) => {
-            stream.seek(start_offset + 2);
-            let raw = stream.data[start_offset..start_offset + 2].to_vec();
-            Ok((
-                inst_pc,
-                DecodeResult::DataWord(DataWordInstruction {
-                    address: inst_pc,
-                    raw_bytes: raw,
-                    val: op,
-                }),
-            ))
+            ));
         }
     }
+
+    stream.seek(start_offset + 2);
+    let raw = stream.data[start_offset..stream.offset].to_vec();
+    Ok((
+        inst_pc,
+        DecodeResult::DataWord(DataWordInstruction {
+            address: inst_pc,
+            raw_bytes: raw,
+            val: op,
+        }),
+    ))
 }
 
 fn parse_operands(
@@ -161,11 +145,13 @@ fn parse_operands(
     match parser {
         ParserType::None => Ok((name, operands, target_addr)),
         ParserType::Move => {
-            let size_code = ((op >> 6) & 0x3) as u8;
-            if size_code >= 3 {
-                return Err("invalid size code".into());
-            }
-            let size = ["b", "w", "l"][size_code as usize];
+            let size_code = ((op >> 12) & 0x3) as u8;
+            let size = match size_code {
+                1 => "b",
+                3 => "w",
+                2 => "l",
+                _ => return Err("invalid size code".into()),
+            };
             let src_mode = ((op >> 3) & 0x7) as u8;
             let src_reg = (op & 0x7) as u8;
             let dst_mode = ((op >> 6) & 0x7) as u8;
@@ -177,8 +163,8 @@ fn parse_operands(
             Ok((format!("move.{}", size), operands, target_addr))
         }
         ParserType::Movea => {
-            let size_code = ((op >> 6) & 0x3) as u8;
-            let size = if size_code == 1 { "w" } else { "l" };
+            let size_code = ((op >> 12) & 0x3) as u8;
+            let size = if size_code == 3 { "w" } else { "l" };
             let src_mode = ((op >> 3) & 0x7) as u8;
             let src_reg = (op & 0x7) as u8;
             let dst_reg = ((op >> 9) & 0x7) as u8;
@@ -200,6 +186,7 @@ fn parse_operands(
             Ok(("moveq".into(), operands, target_addr))
         }
         ParserType::MovemRm => {
+            let size = if ((op >> 6) & 1) == 1 { "l" } else { "w" };
             let mode = ((op >> 3) & 0x7) as u8;
             let _reg = (op & 0x7) as u8;
             let mask = stream.read_word()?;
@@ -216,20 +203,21 @@ fn parse_operands(
                 mask
             };
             let regs = format_movem_list(display_mask);
-            let ea = decode_ea(mode, _reg, "w", stream, inst_pc, cpu)?;
+            let ea = decode_ea(mode, _reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::special(regs));
             operands.push(DecodedOperand::from_ea(ea));
-            Ok(("movem.l".into(), operands, target_addr))
+            Ok((format!("movem.{}", size), operands, target_addr))
         }
         ParserType::MovemMr => {
+            let size = if ((op >> 6) & 1) == 1 { "l" } else { "w" };
             let mode = ((op >> 3) & 0x7) as u8;
             let _reg = (op & 0x7) as u8;
             let mask = stream.read_word()?;
             let regs = format_movem_list(mask);
-            let ea = decode_ea(mode, _reg, "w", stream, inst_pc, cpu)?;
+            let ea = decode_ea(mode, _reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(ea));
             operands.push(DecodedOperand::special(regs));
-            Ok(("movem.l".into(), operands, target_addr))
+            Ok((format!("movem.{}", size), operands, target_addr))
         }
         ParserType::EaReg => {
             let size_code = ((op >> 6) & 0x3) as u8;
@@ -262,8 +250,8 @@ fn parse_operands(
             Ok((name, operands, target_addr))
         }
         ParserType::Adda => {
-            let size_code = ((op >> 6) & 0x3) as u8;
-            let size = if size_code == 1 { "w" } else { "l" };
+            let size_code = ((op >> 8) & 0x1) as u8;
+            let size = if size_code == 0 { "w" } else { "l" };
             let src_mode = ((op >> 3) & 0x7) as u8;
             let src_reg = (op & 0x7) as u8;
             let dst_reg = ((op >> 9) & 0x7) as u8;
@@ -692,8 +680,8 @@ fn parse_operands(
             Ok((name, operands, target_addr))
         }
         ParserType::Cmpa => {
-            let size_code = ((op >> 6) & 0x3) as u8;
-            let size = if size_code == 1 { "w" } else { "l" };
+            let size_code = ((op >> 8) & 0x1) as u8;
+            let size = if size_code == 0 { "w" } else { "l" };
             let src_mode = ((op >> 3) & 0x7) as u8;
             let src_reg = (op & 0x7) as u8;
             let dst_reg = ((op >> 9) & 0x7) as u8;
@@ -824,32 +812,6 @@ fn parse_operands(
             operands.push(DecodedOperand::from_ea(EAOperand::DataReg(reg)));
             operands.push(DecodedOperand::from_ea(EAOperand::AddrDisp(addr_reg, disp)));
             Ok((name, operands, target_addr))
-        }
-        ParserType::Bsr | ParserType::Bcc => {
-            let cc = ((op >> 8) & 0xF) as usize;
-            let cc_name = if parser == ParserType::Bsr {
-                "bsr"
-            } else if cc == 0 {
-                "bra"
-            } else {
-                &format!("b{}", CONDITION_CODES[cc])
-            };
-            let disp = (op & 0xFF) as i8;
-            let target = if disp == 0 {
-                let ext_pc = stream.current_pc();
-                let d16 = sign_extend_16(stream.read_word()?);
-                (ext_pc as i32 + d16) as u32
-            } else if disp == -1 {
-                let ext_pc = stream.current_pc();
-                let d32 = stream.read_long()? as i32;
-                (ext_pc as i32 + d32) as u32
-            } else {
-                let ext_pc = stream.current_pc();
-                (ext_pc as i32 + disp as i32) as u32
-            };
-            target_addr = Some(target);
-            operands.push(DecodedOperand::special(format!("${:08x}", target)));
-            Ok((cc_name.into(), operands, target_addr))
         }
     }
 }
