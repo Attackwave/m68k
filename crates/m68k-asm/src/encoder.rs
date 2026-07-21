@@ -1145,7 +1145,9 @@ mod tests {
     }
 
     #[test]
-    fn test_bfextu_matches_python_reference() {
+    fn test_bfextu_matches_vasm_reference() {
+        // Verified against real `vasm -m68020` output for
+        // `bfextu d1{d2:d3},d4`.
         let bf = Operand::Bitfield(
             Box::new(Operand::DataReg(1)),
             Box::new(BitfieldSpec::DataReg(2)),
@@ -1153,7 +1155,7 @@ mod tests {
         );
         let dst = Operand::DataReg(4);
         let words = encode_instruction("BFEXTU", None, Some(&bf), Some(&dst), 0, "68020").unwrap();
-        assert_eq!(words_to_bytes(&words), "e9c1e818");
+        assert_eq!(words_to_bytes(&words), "e9c148a3");
     }
 
     #[test]
@@ -1191,7 +1193,9 @@ mod tests {
     }
 
     #[test]
-    fn test_bfffo_matches_python_reference() {
+    fn test_bfffo_matches_vasm_reference() {
+        // Verified against real `vasm -m68020` output for
+        // `bfffo d2{8:d5},d3`.
         let bf = Operand::Bitfield(
             Box::new(Operand::DataReg(2)),
             Box::new(BitfieldSpec::Immediate(8)),
@@ -1199,18 +1203,19 @@ mod tests {
         );
         let dst = Operand::DataReg(3);
         let words = encode_instruction("BFFFO", None, Some(&bf), Some(&dst), 0, "68020").unwrap();
-        assert_eq!(words_to_bytes(&words), "edc23a28");
+        assert_eq!(words_to_bytes(&words), "edc23225");
     }
 
     #[test]
-    fn test_bfchg_matches_python_reference() {
+    fn test_bfchg_matches_vasm_reference() {
+        // Verified against real `vasm -m68020` output for `bfchg d1{d2:16}`.
         let bf = Operand::Bitfield(
             Box::new(Operand::DataReg(1)),
             Box::new(BitfieldSpec::DataReg(2)),
             Box::new(BitfieldSpec::Immediate(16)),
         );
         let words = encode_instruction("BFCHG", None, Some(&bf), None, 0, "68020").unwrap();
-        assert_eq!(words_to_bytes(&words), "eac1a010");
+        assert_eq!(words_to_bytes(&words), "eac10890");
     }
 
     #[test]

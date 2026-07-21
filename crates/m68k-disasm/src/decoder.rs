@@ -812,6 +812,63 @@ fn parse_operands(
             operands.push(DecodedOperand::from_ea(EAOperand::AddrDisp(addr_reg, disp)));
             Ok((name, operands, target_addr))
         }
+        ParserType::Bitfield => {
+            // The bitfield extension word precedes any EA extension words
+            // (e.g. an absolute address or displacement) — verified against
+            // real `vasm -m68020` output, and matches how the assembler's
+            // encoder orders them (opword, ext, then EA extension words).
+            let ext = stream.read_word()?;
+            let ea_mode = ((op >> 3) & 0x7) as u8;
+            let ea_reg = (op & 0x7) as u8;
+            let ea = decode_ea(ea_mode, ea_reg, "b", stream, inst_pc, cpu)?;
+
+            let sub = (op >> 8) & 0x7;
+            let (mnemonic, has_dst_reg, dst_reg_is_source) = match sub {
+                0 => ("bftst", false, false),
+                1 => ("bfextu", true, false),
+                2 => ("bfchg", false, false),
+                3 => ("bfexts", true, false),
+                4 => ("bfclr", false, false),
+                5 => ("bfffo", true, false),
+                6 => ("bfset", false, false),
+                7 => ("bfins", true, true),
+                _ => unreachable!("3-bit field"),
+            };
+
+            let offset_str = if (ext & 0x0800) != 0 {
+                format!("d{}", (ext >> 6) & 0x7)
+            } else {
+                format!("{}", (ext >> 6) & 0x1F)
+            };
+            let width_str = if (ext & 0x0020) != 0 {
+                format!("d{}", ext & 0x7)
+            } else {
+                let w = ext & 0x1F;
+                format!("{}", if w == 0 { 32 } else { w })
+            };
+            let empty_labels = HashMap::new();
+            let bitfield_operand = format!(
+                "{}{{{}:{}}}",
+                ea.format(&empty_labels),
+                offset_str,
+                width_str
+            );
+
+            if has_dst_reg {
+                let reg = ((ext >> 12) & 0x7) as u8;
+                if dst_reg_is_source {
+                    operands.push(DecodedOperand::from_ea(EAOperand::DataReg(reg)));
+                    operands.push(DecodedOperand::special(bitfield_operand));
+                } else {
+                    operands.push(DecodedOperand::special(bitfield_operand));
+                    operands.push(DecodedOperand::from_ea(EAOperand::DataReg(reg)));
+                }
+            } else {
+                operands.push(DecodedOperand::special(bitfield_operand));
+            }
+
+            Ok((mnemonic.into(), operands, target_addr))
+        }
     }
 }
 

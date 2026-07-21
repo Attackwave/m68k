@@ -67,6 +67,7 @@ pub enum ParserType {
     Rtd,
     Bkpt,
     Movep,
+    Bitfield,
 }
 
 use crate::ea_categories::ea::*;
@@ -711,6 +712,21 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: 0,
             cpu: "68000",
             parser: ParserType::Movep,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // BFTST/BFEXTU/BFCHG/BFEXTS/BFCLR/BFFFO/BFSET/BFINS: the
+            // instruction name and destination-register operand depend on
+            // the extension word's subtype field (bits 10-8), not on the
+            // opcode word itself, so the mnemonic below is a placeholder
+            // the Bitfield parser always overrides.
+            mask: 0xF8C0,
+            value: 0xE8C0,
+            mnemonic: "BF",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::Bitfield,
             fixed_size: None,
         },
         OpcodePattern {

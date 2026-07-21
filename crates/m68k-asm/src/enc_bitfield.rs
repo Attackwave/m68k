@@ -26,12 +26,21 @@ fn is_read_only(mnemonic: &str) -> bool {
     matches!(mnemonic, "BFTST" | "BFEXTU" | "BFEXTS" | "BFFFO")
 }
 
+/// Build the bitfield extension word's offset/width fields.
+///
+/// Layout (verified against real `vasm -m68020` output for
+/// `BFEXTU D1{D2:D3},D4` -> ext word `0x48A3`): bit 11 = offset-is-register
+/// flag, bits 10-6 = offset (register number or 5-bit immediate), bit 5 =
+/// width-is-register flag, bits 4-0 = width (register number or immediate,
+/// 0 meaning 32). Bits 14-12 (the destination register, when present) are
+/// set separately by the caller — they don't overlap with this function's
+/// bits, unlike the previous (incorrect) bit-15/bit-11 layout.
 fn bitfield_ext(offset: &BitfieldSpec, width: &BitfieldSpec) -> u16 {
     let mut ext = 0u16;
     match offset {
         BitfieldSpec::DataReg(n) => {
-            ext |= 0x8000;
-            ext |= ((*n & 0x7) as u16) << 12;
+            ext |= 0x0800;
+            ext |= ((*n & 0x7) as u16) << 6;
         }
         BitfieldSpec::Immediate(v) => {
             ext |= (((*v as i32) & 0x1F) as u16) << 6;
@@ -39,8 +48,8 @@ fn bitfield_ext(offset: &BitfieldSpec, width: &BitfieldSpec) -> u16 {
     }
     match width {
         BitfieldSpec::DataReg(n) => {
-            ext |= 0x0800;
-            ext |= ((*n & 0x7) as u16) << 3;
+            ext |= 0x0020;
+            ext |= (*n & 0x7) as u16;
         }
         BitfieldSpec::Immediate(v) => {
             let w = ((*v as i32) % 32) & 0x1F;
@@ -89,8 +98,7 @@ pub fn enc_bitfield(
 
     let mut ext = bitfield_ext(offset, width);
     if let Some(rn) = reg {
-        let shift = if mnemonic == "BFINS" { 9 } else { 12 };
-        ext |= ((rn & 0x7) as u16) << shift;
+        ext |= ((rn & 0x7) as u16) << 12;
     }
 
     let opword = 0xE000
@@ -158,31 +166,33 @@ mod tests {
 
     #[test]
     fn test_bfextu_dn_offset_width_with_dest_reg() {
-        // BFEXTU D1{D2:D3},D4
+        // BFEXTU D1{D2:D3},D4 -- verified against real `vasm -m68020`
+        // output: opword 0xE9C1, ext word 0x48A3.
         let bf = Operand::Bitfield(
             Box::new(Operand::DataReg(1)),
             Box::new(BitfieldSpec::DataReg(2)),
             Box::new(BitfieldSpec::DataReg(3)),
         );
         let words = enc_bitfield("BFEXTU", &bf, Some(4), 0, "68020").unwrap();
-        // subtype 1 -> opword = 0xE000|0x800|0x80|0x40|(1<<8)|(0<<3)|1
-        assert_eq!(words[0], 0xE000 | 0x800 | 0x80 | 0x40 | (1 << 8) | 1);
-        // ext = 0x8000 | (2<<12) | 0x0800 | (3<<3) | (4<<12)
-        let expected_ext = 0x8000 | (2u16 << 12) | 0x0800 | (3u16 << 3) | (4u16 << 12);
-        assert_eq!(words[1], expected_ext);
+        assert_eq!(words[0], 0xE9C1);
+        assert_eq!(words[1], 0x48A3);
     }
 
     #[test]
-    fn test_bfins_dest_reg_shift_is_9() {
-        // BFINS D0,D1{4:8} -> reg field encodes at bit 9, not 12
+    fn test_bfins_dest_reg_uses_bits_14_12() {
+        // BFINS D0,D1{4:8} -- verified against real `vasm -m68020` output:
+        // opword 0xEFC1, ext word 0x0108. Destination register always
+        // encodes at bits 14-12 of the extension word, regardless of
+        // mnemonic (D0 here happens to be 0, so this also checks offset(4)
+        // and width(8) land correctly without a dest-register bit set).
         let bf = Operand::Bitfield(
             Box::new(Operand::DataReg(1)),
             Box::new(BitfieldSpec::Immediate(4)),
             Box::new(BitfieldSpec::Immediate(8)),
         );
         let words = enc_bitfield("BFINS", &bf, Some(0), 0, "68020").unwrap();
-        assert_eq!(words[0], 0xE000 | 0x800 | 0x80 | 0x40 | (7 << 8) | 1);
-        assert_eq!(words[1], (4 << 6) | 8);
+        assert_eq!(words[0], 0xEFC1);
+        assert_eq!(words[1], 0x0108);
     }
 
     #[test]
