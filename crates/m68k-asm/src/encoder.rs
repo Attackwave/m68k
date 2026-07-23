@@ -1295,15 +1295,17 @@ mod tests {
 
     #[test]
     fn test_encode_trapcc_eq() {
+        // vasm: trapeq -> 0x57FC
         let words = encode_instruction("TRAPEQ", None, None, None, 0, "68020").unwrap();
-        assert_eq!(words, vec![0x57FA]);
+        assert_eq!(words, vec![0x57FC]);
     }
 
     #[test]
     fn test_encode_trapcc_ne_word() {
+        // vasm: trapne.w #$1234 -> 0x56FA, 0x1234
         let src = Operand::Immediate(0x1234);
         let words = encode_instruction("TRAPNE", Some("w"), Some(&src), None, 0, "68020").unwrap();
-        assert_eq!(words, vec![0x56FB, 0x1234]);
+        assert_eq!(words, vec![0x56FA, 0x1234]);
     }
 
     #[test]

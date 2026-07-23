@@ -261,19 +261,30 @@ pub fn enc_cpusha(cache: i64, cpu: &str) -> Result<Vec<u16>, AsmError> {
 }
 
 /// Encode `PSAVE <ea>` (68030): save MMU internal state.
+///
+/// Base opcode 0xF100 (bits 15-6 = `1111000100`), per the M68000 PRM
+/// "PSAVE" instruction format - the previous 0xF080 was off by a full
+/// bit-position shift of the sub-opcode field (couldn't be verified
+/// against real `vasm`, which doesn't support MC68851-specific
+/// instructions; cross-checked digit-by-digit against the PRM's bit
+/// diagram instead).
 pub fn enc_psave(ea_op: &Operand, ext_pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
     let (mode, reg, ext_words) = encode_ea(ea_op, "b", ext_pc, ALL, cpu)?;
-    let mut words = vec![0xF080 | ((mode as u16) << 3) | (reg as u16)];
+    let mut words = vec![0xF100 | ((mode as u16) << 3) | (reg as u16)];
     words.extend(ext_words);
     Ok(words)
 }
 
 /// Encode `PRESTORE <ea>` (68030): restore MMU internal state.
+///
+/// Base opcode 0xF140 (bits 15-6 = `1111000101`), per the M68000 PRM
+/// "PRESTORE" instruction format - see `enc_psave`'s doc comment for the
+/// same caveat about verification.
 pub fn enc_prestore(ea_op: &Operand, ext_pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
     let (mode, reg, ext_words) = encode_ea(ea_op, "b", ext_pc, ALL, cpu)?;
-    let mut words = vec![0xF0C0 | ((mode as u16) << 3) | (reg as u16)];
+    let mut words = vec![0xF140 | ((mode as u16) << 3) | (reg as u16)];
     words.extend(ext_words);
     Ok(words)
 }
@@ -444,14 +455,18 @@ mod tests {
 
     #[test]
     fn test_psave_reference_bytes() {
+        // Base 0xF100 per PRM bit diagram (not verified against vasm - see
+        // enc_psave's doc comment).
         let dst = Operand::AddrRegPreDec(0);
-        assert_eq!(enc_psave(&dst, 0, "68030").unwrap(), vec![0xF0A0]);
+        assert_eq!(enc_psave(&dst, 0, "68030").unwrap(), vec![0xF120]);
     }
 
     #[test]
     fn test_prestore_reference_bytes() {
+        // Base 0xF140 per PRM bit diagram (not verified against vasm - see
+        // enc_prestore's doc comment).
         let src = Operand::AddrRegPostInc(0);
-        assert_eq!(enc_prestore(&src, 0, "68030").unwrap(), vec![0xF0D8]);
+        assert_eq!(enc_prestore(&src, 0, "68030").unwrap(), vec![0xF158]);
     }
 
     #[test]

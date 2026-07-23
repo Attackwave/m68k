@@ -242,8 +242,12 @@ fn encode_full_ea(
     let base_suppress = mi.base_reg.is_none();
     let index_suppress = mi.index_reg.is_none();
 
+    // PRM BD SIZE field: 00=reserved, 01=null displacement, 10=word, 11=long -
+    // "no base displacement" is encoded as 01, not 00 (which is reserved and
+    // never emitted). Verified against real `vasm -m68020` output for `([a0])`
+    // -> ext 0x0151 (bd_code=1).
     let bd_code: u16 = match mi.base_disp {
-        None => 0,
+        None => 1,
         Some(bd) if (-32768..=32767).contains(&bd) => 2,
         Some(_) => 3,
     };
@@ -262,10 +266,14 @@ fn encode_full_ea(
         2 => 1,
         _ => 2,
     };
+    // PRM Table 2-2: I/IS 1-3 (with IS=0) is Indirect Preindexed, I/IS 5-7 is
+    // Indirect Postindexed - the struct's own doc comment (operands.rs) already
+    // documents this correctly; this encoder previously had it backwards, the
+    // same inversion as the decoder's `is_postindexed` in addressing.rs.
     let i_i_s: u16 = if mi.is_postindexed {
-        1 + iis_offset
-    } else {
         5 + iis_offset
+    } else {
+        1 + iis_offset
     };
 
     let (idx_areg, idx_num, idx_long) = match mi.index_reg {
@@ -384,16 +392,17 @@ mod tests {
 
     #[test]
     fn test_encode_memory_indirect_simple() {
-        // ([A0]) -> mode=6 reg=0, ext = full-format flag only, bs=0, is=1(suppress index), i_i_s=5
+        // ([A0]) -> vasm: move.l ([a0]),d2 -> 0151 (mode=6 reg=0, bs=0, is=1
+        // suppress index, bd_code=1, i_i_s=1 preindexed)
         let op = Operand::MemoryIndirect(Box::new(base_mi()));
         let (mode, reg, ext) = encode_ea(&op, "l", 0, 0xFFFF, "68020").unwrap();
         assert_eq!((mode, reg), (6, 0));
-        assert_eq!(ext, vec![0x0145]);
+        assert_eq!(ext, vec![0x0151]);
     }
 
     #[test]
     fn test_encode_memory_indirect_with_bd_and_index_preindexed() {
-        // ([$10,A0,D1.W*2],$20)
+        // ([$10,A0,D1.W*2],$20) -- vasm: move.l ([$10,a0,d1.w*2],$20),d2 -> 1322 0010 0020
         let mi = MemoryIndirectOperand {
             base_reg: Some(0),
             base_is_pc: false,
@@ -407,12 +416,12 @@ mod tests {
         let op = Operand::MemoryIndirect(Box::new(mi));
         let (mode, reg, ext) = encode_ea(&op, "l", 0, 0xFFFF, "68020").unwrap();
         assert_eq!((mode, reg), (6, 0));
-        assert_eq!(ext, vec![0x1326, 0x0010, 0x0020]);
+        assert_eq!(ext, vec![0x1322, 0x0010, 0x0020]);
     }
 
     #[test]
     fn test_encode_memory_indirect_postindexed() {
-        // ([$10,A0],D1.W*2,$20)
+        // ([$10,A0],D1.W*2,$20) -- vasm: move.l ([$10,a0],d1.w*2,$20),d2 -> 1326 0010 0020
         let mi = MemoryIndirectOperand {
             base_reg: Some(0),
             base_is_pc: false,
@@ -426,7 +435,7 @@ mod tests {
         let op = Operand::MemoryIndirect(Box::new(mi));
         let (mode, reg, ext) = encode_ea(&op, "l", 0, 0xFFFF, "68020").unwrap();
         assert_eq!((mode, reg), (6, 0));
-        assert_eq!(ext, vec![0x1322, 0x0010, 0x0020]);
+        assert_eq!(ext, vec![0x1326, 0x0010, 0x0020]);
     }
 
     #[test]

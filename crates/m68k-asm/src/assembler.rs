@@ -2578,12 +2578,14 @@ impl Assembler {
             return Ok(vec![op, (disp & 0xFFFF) as u16]);
         }
 
-        // 68020+ long displacement
+        // 68020+ long displacement: low byte 0xFF marks the 32-bit form
+        // (0x00 marks the 16-bit form above), immediately followed by the
+        // 32-bit displacement - no extra padding word. Verified against
+        // real `vasm -m68020` output for `bra.l far`.
         if self.cpu != "68000" {
-            let op = 0x6000;
+            let op = 0x60FF;
             return Ok(vec![
                 op,
-                0,
                 ((disp >> 16) & 0xFFFF) as u16,
                 (disp & 0xFFFF) as u16,
             ]);
@@ -2607,11 +2609,11 @@ impl Assembler {
             return Ok(vec![op, (disp & 0xFFFF) as u16]);
         }
 
+        // 68020+ long displacement: same 0xFF-low-byte marker as encode_bra above.
         if self.cpu != "68000" {
-            let op = 0x6100;
+            let op = 0x61FF;
             return Ok(vec![
                 op,
-                0,
                 ((disp >> 16) & 0xFFFF) as u16,
                 (disp & 0xFFFF) as u16,
             ]);
@@ -3431,6 +3433,29 @@ start:
         assert_eq!(branch_condition("beq").unwrap(), "eq");
         assert_eq!(branch_condition("bge").unwrap(), "ge");
         assert!(branch_condition("xxx").is_err());
+    }
+
+    #[test]
+    fn test_encode_bra_long_displacement_matches_vasm() {
+        // vasm -m68020 `bra.l` for a displacement outside the 16-bit range uses
+        // opword 0x60FF (low byte 0xFF marks the 32-bit form) immediately followed
+        // by the 32-bit displacement, with no padding word - regression test for a
+        // bug where this duplicated (and originally also broken) BRA/BSR encoder
+        // emitted 0x6000 plus a spurious extra zero word.
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68020");
+        let disp = 0x20000i32;
+        let words = asm.encode_bra(disp, BranchSize::Long).unwrap();
+        assert_eq!(words, vec![0x60FF, 0x0002, 0x0000]);
+    }
+
+    #[test]
+    fn test_encode_bsr_long_displacement_matches_vasm() {
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68020");
+        let disp = 0x20000i32;
+        let words = asm.encode_bsr(disp, BranchSize::Long).unwrap();
+        assert_eq!(words, vec![0x61FF, 0x0002, 0x0000]);
     }
 
     #[test]
@@ -4286,8 +4311,10 @@ mymexc MACRO
 
     #[test]
     fn test_source_psave() {
+        // Base 0xF100 per PRM bit diagram (not verified against vasm - see
+        // enc_psave's doc comment in enc_mmu.rs).
         let bytes = assemble_source_with_cpu("    PSAVE -(A0)\n", "68030");
-        assert_eq!(bytes, vec![0xF0, 0xA0]);
+        assert_eq!(bytes, vec![0xF1, 0x20]);
     }
 
     #[test]
@@ -4382,42 +4409,50 @@ mymexc MACRO
 
     #[test]
     fn test_source_memory_indirect_simple() {
+        // vasm: move.l ([a0]),d2 -> 2430 0151
         let bytes = assemble_source_with_cpu("    MOVE.L ([A0]),D2\n", "68020");
-        assert_eq!(bytes, vec![0x24, 0x30, 0x01, 0x45]);
+        assert_eq!(bytes, vec![0x24, 0x30, 0x01, 0x51]);
     }
 
     #[test]
     fn test_source_memory_indirect_with_bd() {
+        // vasm: move.l ([$10,a0]),d2 -> 2430 0161 0010
         let bytes = assemble_source_with_cpu("    MOVE.L ([$10,A0]),D2\n", "68020");
-        assert_eq!(bytes, vec![0x24, 0x30, 0x01, 0x65, 0x00, 0x10]);
+        assert_eq!(bytes, vec![0x24, 0x30, 0x01, 0x61, 0x00, 0x10]);
     }
 
     #[test]
     fn test_source_memory_indirect_long_bd() {
         // Base displacement outside 16-bit signed range forces bd_code=3 (long).
+        // vasm: move.l ([$100000,a0]),d2 -> 2430 0171 0010 0000
         let bytes = assemble_source_with_cpu("    MOVE.L ([$100000,A0]),D2\n", "68020");
-        assert_eq!(bytes, vec![0x24, 0x30, 0x01, 0x75, 0x00, 0x10, 0x00, 0x00]);
+        assert_eq!(bytes, vec![0x24, 0x30, 0x01, 0x71, 0x00, 0x10, 0x00, 0x00]);
     }
 
     #[test]
     fn test_source_memory_indirect_preindexed() {
         // Index inside the brackets: ([bd,An,Xn],od)
+        // vasm: move.l ([$10,a0,d1.w*2],$20),d2 -> 2430 1322 0010 0020
         let bytes = assemble_source_with_cpu("    MOVE.L ([$10,A0,D1.W*2],$20),D2\n", "68020");
-        assert_eq!(bytes, vec![0x24, 0x30, 0x13, 0x26, 0x00, 0x10, 0x00, 0x20]);
+        assert_eq!(bytes, vec![0x24, 0x30, 0x13, 0x22, 0x00, 0x10, 0x00, 0x20]);
     }
 
     #[test]
     fn test_source_memory_indirect_postindexed() {
         // Index outside the brackets: ([bd,An],Xn,od)
+        // vasm: move.l ([$10,a0],d1.w*2,$20),d2 -> 2430 1326 0010 0020
         let bytes = assemble_source_with_cpu("    MOVE.L ([$10,A0],D1.W*2,$20),D2\n", "68020");
-        assert_eq!(bytes, vec![0x24, 0x30, 0x13, 0x22, 0x00, 0x10, 0x00, 0x20]);
+        assert_eq!(bytes, vec![0x24, 0x30, 0x13, 0x26, 0x00, 0x10, 0x00, 0x20]);
     }
 
     #[test]
     fn test_source_memory_indirect_base_suppressed() {
-        // No An/PC in the brackets: base register suppressed, index-only.
+        // No An/PC in the brackets: base register suppressed, index-only
+        // (preindexed - the index is inside the brackets, so is_postindexed
+        // is false regardless of the trailing ",D2"). bd_code=1 (null
+        // displacement, not 0/reserved) since there's no base displacement.
         let bytes = assemble_source_with_cpu("    MOVE.L ([D1.W*2],D2),D3\n", "68020");
-        assert_eq!(bytes, vec![0x26, 0x30, 0x21, 0x85]);
+        assert_eq!(bytes, vec![0x26, 0x30, 0x21, 0x91]);
     }
 
     #[test]

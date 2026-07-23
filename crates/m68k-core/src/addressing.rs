@@ -397,14 +397,23 @@ pub fn decode_full_ea(
         } else {
             0
         };
+        // PRM: "The value of the PC is the address of the extension word" -
+        // the base displacement's byte length must be subtracted, plus the
+        // extension word itself (2 bytes), to land on the extension word's
+        // own address rather than the position right after it. Verified
+        // against real `vasm -m68020` output for `([target,pc],d1.w*2)`.
         pc_rel_target = stream
             .current_pc()
             .wrapping_sub(bd_len)
+            .wrapping_sub(2)
             .wrapping_add(bd as u32);
     }
 
     let is_indirect = i_i_s > 0;
-    let is_postindexed = matches!(i_i_s, 1..=3);
+    // PRM Table 2-2: I/IS 1-3 (with IS=0) is Indirect Preindexed, I/IS 5-7 is
+    // Indirect Postindexed - verified against real `vasm -m68020` output for
+    // `([$10,a0,d1.w*2],$20)` (preindexed syntax, ext word 0x1322).
+    let is_postindexed = matches!(i_i_s, 4..=7);
 
     let mut od: i32 = 0;
     let mut od_present = false;

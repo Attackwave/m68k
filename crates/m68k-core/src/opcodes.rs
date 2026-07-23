@@ -78,6 +78,7 @@ pub enum ParserType {
     FpuBcc,
     FpuSave,
     FpuRestore,
+    LinkLong,
 }
 
 use crate::ea_categories::ea::*;
@@ -105,7 +106,14 @@ impl OpcodePattern {
 pub fn opcode_patterns() -> &'static [OpcodePattern] {
     &[
         OpcodePattern {
-            mask: 0xF1C0,
+            // EXG opmode field is bits 7-3 (PRM: 01000=Dn,Dn, 01001=An,An,
+            // 10001=Dn,An) - the mask must cover all 5 opmode bits, not just
+            // bits 7-6, otherwise these three EXG forms collide with each
+            // other (and, with a mask this narrow, would also fall inside
+            // AND's wider 0xF100/0xC100 range). Verified against real
+            // `vasm -m68000` output: exg d0,d1 -> 0xC141, exg a0,a1 ->
+            // 0xC149, exg d2,a3 -> 0xC58B.
+            mask: 0xF1F8,
             value: 0xC140,
             mnemonic: "EXG",
             src_ea: DREG,
@@ -115,8 +123,8 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             fixed_size: None,
         },
         OpcodePattern {
-            mask: 0xF1C0,
-            value: 0xC180,
+            mask: 0xF1F8,
+            value: 0xC148,
             mnemonic: "EXG",
             src_ea: AREG,
             dst_ea: AREG,
@@ -125,7 +133,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             fixed_size: None,
         },
         OpcodePattern {
-            mask: 0xF1C0,
+            mask: 0xF1F8,
             value: 0xC188,
             mnemonic: "EXG",
             src_ea: DREG,
@@ -372,6 +380,24 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: 0,
             cpu: "68000",
             parser: ParserType::Branch,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // MOVEP Dn,(d16,An) / (d16,An),Dn: all four size/direction opmodes
+            // (4=word mem->reg, 5=long mem->reg, 6=word reg->mem, 7=long reg->mem,
+            // encoded in bits 7-6 with bit 8 fixed at 1) share this bit pattern.
+            // Must precede the BTST/BCHG/BCLR/BSET Dn,<ea> patterns below, whose
+            // wider 0xF1C0 mask would otherwise swallow every MOVEP opmode (bits
+            // 7-6 are exactly what distinguishes BTST/BCHG/BCLR/BSET from each
+            // other) - verified against real `vasm -m68020` output for all four
+            // MOVEP forms.
+            mask: 0xF138,
+            value: 0x0108,
+            mnemonic: "MOVEP",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68000",
+            parser: ParserType::Movep,
             fixed_size: None,
         },
         OpcodePattern {
@@ -715,16 +741,6 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             fixed_size: None,
         },
         OpcodePattern {
-            mask: 0xF1F8,
-            value: 0x0108,
-            mnemonic: "MOVEP",
-            src_ea: 0,
-            dst_ea: 0,
-            cpu: "68000",
-            parser: ParserType::Movep,
-            fixed_size: None,
-        },
-        OpcodePattern {
             // BFTST/BFEXTU/BFCHG/BFEXTS/BFCLR/BFFFO/BFSET/BFINS: the
             // instruction name and destination-register operand depend on
             // the extension word's subtype field (bits 10-8), not on the
@@ -1007,6 +1023,20 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             fixed_size: None,
         },
         OpcodePattern {
+            // LINK.L An,#disp32 (68020+): own base opcode 0x4808, unrelated to
+            // LINK.W's 0x4E50. Shares NBCD's 0x4800-0x483F range (An-direct mode
+            // is invalid for NBCD's alterable-memory EA, but NBCD's mask alone
+            // doesn't exclude it), so must precede NBCD here.
+            mask: 0xFFF8,
+            value: 0x4808,
+            mnemonic: "LINK",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::LinkLong,
+            fixed_size: None,
+        },
+        OpcodePattern {
             mask: 0xFFC0,
             value: 0x4800,
             mnemonic: "NBCD",
@@ -1104,6 +1134,20 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: DREG,
             cpu: "68000",
             parser: ParserType::Swap,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // BKPT #vector (68010+): shares PEA's 0xFFC0/0x4840 range (both
+            // sit inside the 0x4840-0x487F "Miscellaneous" block) and must
+            // precede it here, the same way SWAP above does - otherwise
+            // every BKPT opcode is swallowed by PEA's wider mask.
+            mask: 0xFFF8,
+            value: 0x4848,
+            mnemonic: "BKPT",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::Bkpt,
             fixed_size: None,
         },
         OpcodePattern {
@@ -1294,16 +1338,6 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: 0,
             cpu: "68000",
             parser: ParserType::Unlk,
-            fixed_size: None,
-        },
-        OpcodePattern {
-            mask: 0xFFF8,
-            value: 0x4848,
-            mnemonic: "BKPT",
-            src_ea: 0,
-            dst_ea: 0,
-            cpu: "68020",
-            parser: ParserType::Bkpt,
             fixed_size: None,
         },
     ]

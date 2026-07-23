@@ -465,6 +465,18 @@ fn parse_operands(
             )));
             Ok((name, operands, target_addr))
         }
+        ParserType::LinkLong => {
+            let reg = (op & 0x7) as u8;
+            let hi = stream.read_word()? as u32;
+            let lo = stream.read_word()? as u32;
+            let disp = (hi << 16) | lo;
+            operands.push(DecodedOperand::from_ea(EAOperand::AddrReg(reg)));
+            operands.push(DecodedOperand::from_ea(EAOperand::Immediate(
+                disp as u64,
+                "l".into(),
+            )));
+            Ok((format!("{}.l", name), operands, target_addr))
+        }
         ParserType::Unlk => {
             let reg = (op & 0x7) as u8;
             operands.push(DecodedOperand::from_ea(EAOperand::AddrReg(reg)));
@@ -797,7 +809,7 @@ fn parse_operands(
             Ok((name, operands, target_addr))
         }
         ParserType::Bkpt => {
-            let vec = (op & 0xF) as u8;
+            let vec = (op & 0x7) as u8;
             operands.push(DecodedOperand::from_ea(EAOperand::Immediate(
                 vec as u64,
                 "w".into(),
@@ -805,14 +817,25 @@ fn parse_operands(
             Ok((name, operands, target_addr))
         }
         ParserType::Movep => {
-            let size_code = ((op >> 6) & 0x3) as u8;
-            let _size = if size_code == 1 { "w" } else { "l" };
+            // Opmode field (bits 7-6): 00=word mem->reg, 01=long mem->reg,
+            // 10=word reg->mem, 11=long reg->mem (bit 7 = direction, bit 6 =
+            // size) - matches enc_movep's op_mode 4/5/6/7 encoding.
+            let opmode = (op >> 6) & 0x3;
+            let to_mem = opmode & 0x2 != 0;
+            let size = if opmode & 0x1 != 0 { "l" } else { "w" };
             let reg = ((op >> 9) & 0x7) as u8;
             let addr_reg = (op & 0x7) as u8;
             let disp = sign_extend_8(stream.read_word()? as u8);
-            operands.push(DecodedOperand::from_ea(EAOperand::DataReg(reg)));
-            operands.push(DecodedOperand::from_ea(EAOperand::AddrDisp(addr_reg, disp)));
-            Ok((name, operands, target_addr))
+            let dreg = DecodedOperand::from_ea(EAOperand::DataReg(reg));
+            let mem = DecodedOperand::from_ea(EAOperand::AddrDisp(addr_reg, disp));
+            if to_mem {
+                operands.push(dreg);
+                operands.push(mem);
+            } else {
+                operands.push(mem);
+                operands.push(dreg);
+            }
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Bitfield => {
             // The bitfield extension word precedes any EA extension words
@@ -1672,6 +1695,143 @@ mod tests {
         // On 68000, the F-line opcode has no matching pattern and falls back to a data word.
         let (_addr, result) = decode_next(&mut stream, "68000").unwrap();
         assert!(matches!(result, DecodeResult::DataWord(_)));
+    }
+
+    // MOVEP/BKPT decoder tests. Reference bytes verified against real `vasm -m68020`
+    // output. Regression tests for a pattern-ordering/masking bug: MOVEP's original
+    // mask only matched the mem->reg/.w opmode and was itself shadowed by BTST's
+    // wider mask; BKPT was shadowed by PEA.
+
+    #[test]
+    fn test_decode_movep_all_opmodes() {
+        // vasm: movep.w 4(a0),d0 / movep.l 4(a0),d0 / movep.w d0,4(a0) / movep.l d0,4(a0)
+        // -> 0108 0004 / 0148 0004 / 0188 0004 / 01c8 0004
+        let cases: [(u16, &str); 4] = [
+            (0x0108, "movep.w"),
+            (0x0148, "movep.l"),
+            (0x0188, "movep.w"),
+            (0x01C8, "movep.l"),
+        ];
+        for (op, expected_mnemonic) in cases {
+            let bytes = [(op >> 8) as u8, op as u8, 0x00, 0x04];
+            let inst = decode_one(&bytes, "68020");
+            assert_eq!(inst.mnemonic, expected_mnemonic);
+        }
+    }
+
+    #[test]
+    fn test_decode_movep_direction() {
+        // vasm: movep.w 4(a0),d0 -> mem-to-reg (Dn is the destination, i.e. second operand)
+        let inst = decode_one(&[0x01, 0x08, 0x00, 0x04], "68020");
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[0].format(&labels), "$4(a0)");
+        assert_eq!(inst.operands[1].format(&labels), "d0");
+
+        // vasm: movep.w d0,4(a0) -> reg-to-mem (Dn is the source, i.e. first operand)
+        let inst = decode_one(&[0x01, 0x88, 0x00, 0x04], "68020");
+        assert_eq!(inst.operands[0].format(&labels), "d0");
+        assert_eq!(inst.operands[1].format(&labels), "$4(a0)");
+    }
+
+    #[test]
+    fn test_decode_movep_does_not_shadow_btst_bchg_bclr_bset() {
+        // vasm: btst d0,d1 / bchg d0,d1 / bclr d0,d1 / bset d0,d1 -> 0101/0141/0181/01c1
+        let cases: [(u16, &str); 4] = [
+            (0x0101, "btst"),
+            (0x0141, "bchg"),
+            (0x0181, "bclr"),
+            (0x01C1, "bset"),
+        ];
+        for (op, expected_mnemonic) in cases {
+            let inst = decode_one(&[(op >> 8) as u8, op as u8], "68020");
+            assert_eq!(inst.mnemonic, expected_mnemonic);
+        }
+    }
+
+    #[test]
+    fn test_decode_bkpt() {
+        // vasm: bkpt #5 -> 484d
+        let inst = decode_one(&[0x48, 0x4D], "68020");
+        assert_eq!(inst.mnemonic, "bkpt");
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[0].format(&labels), "#$0005");
+    }
+
+    #[test]
+    fn test_decode_bkpt_does_not_shadow_pea() {
+        // vasm: pea (a0) -> 4850
+        let inst = decode_one(&[0x48, 0x50], "68020");
+        assert_eq!(inst.mnemonic, "pea");
+    }
+
+    #[test]
+    fn test_decode_link_l() {
+        // vasm: LINK.L A5,#$12345678 -> 480D 1234 5678
+        let inst = decode_one(&[0x48, 0x0D, 0x12, 0x34, 0x56, 0x78], "68020");
+        assert_eq!(inst.mnemonic, "link.l");
+    }
+
+    #[test]
+    fn test_decode_link_l_does_not_shadow_nbcd() {
+        // vasm: nbcd (a0) -> 4810
+        let inst = decode_one(&[0x48, 0x10], "68020");
+        assert_eq!(inst.mnemonic, "nbcd");
+    }
+
+    #[test]
+    fn test_decode_memory_indirect_preindexed_vs_postindexed() {
+        // vasm: move.l ([$10,a0,d1.w*2],$20),d2 -> 2430 1322 0010 0020 (preindexed)
+        //       move.l ([$10,a0],d1.w*2,$20),d2 -> 2430 1326 0010 0020 (postindexed)
+        // Regression test for a bug where the two forms were swapped.
+        let labels = HashMap::new();
+
+        let pre = decode_one(&[0x24, 0x30, 0x13, 0x22, 0x00, 0x10, 0x00, 0x20], "68020");
+        assert_eq!(pre.operands[0].format(&labels), "([$10,a0,d1.w*2],$20)");
+
+        let post = decode_one(&[0x24, 0x30, 0x13, 0x26, 0x00, 0x10, 0x00, 0x20], "68020");
+        assert_eq!(post.operands[0].format(&labels), "([$10,a0],d1.w*2,$20)");
+    }
+
+    #[test]
+    fn test_decode_memory_indirect_pc_relative_target_address() {
+        // vasm: move.l ([$1010,pc],d1.w*2),d2 (at pc=$1000) -> 243b 1325 000e
+        // Regression test for the PC-relative target being off by 2 (the base
+        // displacement length was subtracted but not the extension word's own
+        // 2 bytes, landing on the position after the ext word instead of at it).
+        let mut stream = InstructionStream::new(&[0x24, 0x3B, 0x13, 0x25, 0x00, 0x0E], 0x1000);
+        let (_addr, result) = decode_next(&mut stream, "68020").unwrap();
+        let inst = match result {
+            DecodeResult::Instruction(inst) => inst,
+            DecodeResult::DataWord(_) => panic!("expected instruction, got data word"),
+        };
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[0].format(&labels), "([$00001010,pc],d1.w*2)");
+    }
+
+    #[test]
+    fn test_decode_exg_all_three_forms() {
+        // vasm: exg d0,d1 -> 0xC141, exg a0,a1 -> 0xC149, exg d2,a3 -> 0xC58B.
+        // Regression test for the EXG patterns' mask being too narrow (0xF1C0,
+        // missing bit 3 of the 5-bit opmode field), which let the three EXG
+        // forms collide with each other and let AND's wider mask swallow them.
+        let dd = decode_one(&[0xC1, 0x41], "68000");
+        assert_eq!(dd.mnemonic, "exg");
+
+        let aa = decode_one(&[0xC1, 0x49], "68000");
+        assert_eq!(aa.mnemonic, "exg");
+
+        let da = decode_one(&[0xC5, 0x8B], "68000");
+        assert_eq!(da.mnemonic, "exg");
+    }
+
+    #[test]
+    fn test_decode_exg_does_not_shadow_and() {
+        // vasm: and.l d0,d1 -> c280, and.l d0,(a1) -> c191
+        let and1 = decode_one(&[0xC2, 0x80], "68000");
+        assert_eq!(and1.mnemonic, "and.l");
+
+        let and2 = decode_one(&[0xC1, 0x91], "68000");
+        assert_eq!(and2.mnemonic, "and.l");
     }
 
     #[test]

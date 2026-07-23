@@ -46,10 +46,13 @@ pub fn enc_bcc(cond: &str, target: i32, pc: u32) -> Result<Vec<u16>, AsmError> {
         let op = 0x6000 | ((cc as u16) << 8);
         Ok(vec![op, (disp & 0xFFFF) as u16])
     } else {
-        let op = 0x6000 | ((cc as u16) << 8);
+        // 68020+ long displacement: low byte 0xFF marks the 32-bit form (0x00
+        // marks the 16-bit form above), immediately followed by the 32-bit
+        // displacement - no extra padding word. Verified against real
+        // `vasm -m68020` output for `bra.l far`.
+        let op = 0x6000 | ((cc as u16) << 8) | 0xFF;
         Ok(vec![
             op,
-            0,
             ((disp >> 16) & 0xFFFF) as u16,
             (disp & 0xFFFF) as u16,
         ])
@@ -72,10 +75,10 @@ pub fn enc_bsr(target: i32, pc: u32) -> Result<Vec<u16>, AsmError> {
         let op = 0x6100;
         Ok(vec![op, (disp & 0xFFFF) as u16])
     } else {
-        let op = 0x6100;
+        // 68020+ long displacement: same 0xFF-low-byte marker as enc_bcc above.
+        let op = 0x6100 | 0xFF;
         Ok(vec![
             op,
-            0,
             ((disp >> 16) & 0xFFFF) as u16,
             (disp & 0xFFFF) as u16,
         ])
@@ -184,16 +187,23 @@ pub fn enc_pea(src: &Operand, pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> 
 /// LINK.W An,#disp (16-bit displacement, all CPUs)
 /// LINK.L An,#disp (32-bit displacement, 68020+)
 pub fn enc_link(reg: u8, displacement: i32, size: &str, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    let op = 0x4E50 | (reg as u16);
     match size {
-        "w" | "" => Ok(vec![op, (displacement & 0xFFFF) as u16]),
+        "w" | "" => {
+            let op = 0x4E50 | (reg as u16);
+            Ok(vec![op, (displacement & 0xFFFF) as u16])
+        }
         "l" => {
             if cpu == "68000" {
                 return Err(AsmError::new("LINK.L requires 68020 or later"));
             }
+            // LINK.L has its own base opcode (0x4808), unrelated to LINK.W's
+            // 0x4E50 - the 32-bit displacement follows immediately, with no
+            // padding word. Verified against real `vasm -m68020` output for
+            // `LINK.L A5,#$12345678` -> 480D 1234 5678.
+            let op = 0x4808 | (reg as u16);
             let hi = ((displacement >> 16) & 0xFFFF) as u16;
             let lo = (displacement & 0xFFFF) as u16;
-            Ok(vec![op, 0x0000, hi, lo])
+            Ok(vec![op, hi, lo])
         }
         _ => Err(AsmError::new("invalid size for LINK")),
     }
@@ -270,12 +280,16 @@ pub fn enc_exg_dd(reg1: u8, reg2: u8) -> Result<Vec<u16>, AsmError> {
 
 /// Encode EXG An,An instruction.
 pub fn enc_exg_aa(reg1: u8, reg2: u8) -> Result<Vec<u16>, AsmError> {
-    Ok(vec![0xC188 | ((reg1 as u16) << 9) | (reg2 as u16)])
+    // Opmode 01001, not 10001 - verified against real `vasm -m68000` output
+    // for `exg a0,a1` -> 0xC149.
+    Ok(vec![0xC148 | ((reg1 as u16) << 9) | (reg2 as u16)])
 }
 
 /// Encode EXG Dn,An instruction.
 pub fn enc_exg_da(dreg: u8, areg: u8) -> Result<Vec<u16>, AsmError> {
-    Ok(vec![0xC148 | ((dreg as u16) << 9) | (areg as u16)])
+    // Opmode 10001, not 01001 (that's AA's opmode) - verified against real
+    // `vasm -m68000` output for `exg d2,a3` -> 0xC58B.
+    Ok(vec![0xC188 | ((dreg as u16) << 9) | (areg as u16)])
 }
 
 /// Encode SBCD Dn,Dn instruction.
@@ -386,13 +400,16 @@ pub fn enc_trapcc(cond: &str, imm: Option<(i64, &str)>, cpu: &str) -> Result<Vec
     }
     let cc = cond_code(cond)?;
     let base = 0x50F8 | ((cc as u16) << 8);
+    // Mode field (bits 2-0): 010=word operand, 011=long operand, 100=no operand
+    // (PRM "TRAPcc" instruction format) - verified against real `vasm -m68020`
+    // output for `trapeq`/`trapne.w #$1234`/`trapmi.l #$12345678`.
     match imm {
-        None => Ok(vec![base | 2]),
-        Some((val, "w")) | Some((val, "")) => Ok(vec![base | 3, (val & 0xFFFF) as u16]),
+        None => Ok(vec![base | 4]),
+        Some((val, "w")) | Some((val, "")) => Ok(vec![base | 2, (val & 0xFFFF) as u16]),
         Some((val, "l")) => {
             let hi = ((val >> 16) & 0xFFFF) as u16;
             let lo = (val & 0xFFFF) as u16;
-            Ok(vec![base | 4, hi, lo])
+            Ok(vec![base | 3, hi, lo])
         }
         _ => Err(AsmError::new("invalid size for TRAPcc")),
     }
@@ -867,8 +884,11 @@ pub fn enc_move16(src: &Operand, dst: &Operand, _pc: u32, cpu: &str) -> Result<V
         dst_is_abs,
     ) {
         (true, true, _, _, _, _) => {
-            // (An)+,(Am)+
-            let ext = (dst_reg as u16) << 12;
+            // (An)+,(Am)+: extension word is `1 <Ay> 0000000000000` (PRM "MOVE16"
+            // postincrement format) - bit 15 is always set, not just the register
+            // field. Verified against real `vasm -m68040` output for
+            // `MOVE16 (A0)+,(A1)+` -> F620 9000.
+            let ext = 0x8000 | ((dst_reg as u16) << 12);
             Ok(vec![base | (src_reg as u16), ext])
         }
         (true, _, _, _, _, true) => {
@@ -945,6 +965,21 @@ mod tests {
     }
 
     #[test]
+    fn test_bra_long_displacement() {
+        // vasm: bra.l far (disp32=0x13886 in the corresponding assembler test) uses
+        // opword 0x60FF (low byte 0xFF marks the 32-bit form) followed directly by
+        // the 32-bit displacement, with no padding word.
+        let words = enc_bcc("t", 0x20000, 0x1002).unwrap();
+        assert_eq!(words, vec![0x60FF, 0x0001, 0xEFFE]);
+    }
+
+    #[test]
+    fn test_bsr_long_displacement() {
+        let words = enc_bsr(0x20000, 0x1002).unwrap();
+        assert_eq!(words, vec![0x61FF, 0x0001, 0xEFFE]);
+    }
+
+    #[test]
     fn test_dbra() {
         let words = enc_dbcc("f", 0, 0x100, 0x104).unwrap();
         assert_eq!(words, vec![0x51C8, 0xFFFC]);
@@ -1002,9 +1037,10 @@ mod tests {
 
     #[test]
     fn test_link_l() {
-        let words = enc_link(5, -16, "l", "68020").unwrap();
-        // A5, extension word $0000, disp -16 as 32-bit
-        assert_eq!(words, vec![0x4E55, 0x0000, 0xFFFF, 0xFFF0]);
+        // vasm: LINK.L A5,#$12345678 -> 480D 1234 5678 (own base opcode 0x4808,
+        // no padding word before the 32-bit displacement)
+        let words = enc_link(5, 0x12345678, "l", "68020").unwrap();
+        assert_eq!(words, vec![0x480D, 0x1234, 0x5678]);
     }
 
     #[test]
@@ -1062,25 +1098,50 @@ mod tests {
 
     #[test]
     fn test_trapcc_no_operand() {
+        // vasm: trapeq -> 0x57FC
         let words = enc_trapcc("eq", None, "68020").unwrap();
-        assert_eq!(words, vec![0x57FA]);
+        assert_eq!(words, vec![0x57FC]);
     }
 
     #[test]
     fn test_trapcc_word_imm() {
+        // vasm: trapne.w #$1234 -> 0x56FA, 0x1234
         let words = enc_trapcc("ne", Some((0x1234, "w")), "68020").unwrap();
-        assert_eq!(words, vec![0x56FB, 0x1234]);
+        assert_eq!(words, vec![0x56FA, 0x1234]);
     }
 
     #[test]
     fn test_trapcc_long_imm() {
+        // vasm: trapmi.l #$12345678 -> 0x5BFB, 0x1234, 0x5678
         let words = enc_trapcc("mi", Some((0x12345678, "l")), "68020").unwrap();
-        assert_eq!(words, vec![0x5BFC, 0x1234, 0x5678]);
+        assert_eq!(words, vec![0x5BFB, 0x1234, 0x5678]);
     }
 
     #[test]
     fn test_trapcc_68000_fails() {
         assert!(enc_trapcc("eq", None, "68000").is_err());
+    }
+
+    #[test]
+    fn test_exg_dd_matches_vasm() {
+        // vasm: exg d0,d1 -> 0xC141
+        let words = enc_exg_dd(0, 1).unwrap();
+        assert_eq!(words, vec![0xC141]);
+    }
+
+    #[test]
+    fn test_exg_aa_matches_vasm() {
+        // vasm: exg a0,a1 -> 0xC149
+        let words = enc_exg_aa(0, 1).unwrap();
+        assert_eq!(words, vec![0xC149]);
+    }
+
+    #[test]
+    fn test_exg_da_matches_vasm() {
+        // vasm: exg d2,a3 -> 0xC58B - regression test for AA/DA opmode swap
+        // (AA and DA previously shared the wrong base opcode).
+        let words = enc_exg_da(2, 3).unwrap();
+        assert_eq!(words, vec![0xC58B]);
     }
 
     #[test]
@@ -1191,6 +1252,7 @@ mod tests {
 
     #[test]
     fn test_move16_post_post() {
+        // vasm: MOVE16 (A0)+,(A1)+ -> F620 9000
         let words = enc_move16(
             &Operand::AddrRegPostInc(0),
             &Operand::AddrRegPostInc(1),
@@ -1198,6 +1260,6 @@ mod tests {
             "68040",
         )
         .unwrap();
-        assert_eq!(words, vec![0xF620, 0x1000]);
+        assert_eq!(words, vec![0xF620, 0x9000]);
     }
 }
