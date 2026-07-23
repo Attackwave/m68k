@@ -6,8 +6,7 @@ fn assemble(source: &str, cpu: &str, origin: u32) -> Result<Vec<u8>, String> {
     let mut asm = Assembler::new(origin);
     asm.set_cpu(cpu);
     // Golden vectors that reference `label` expect it to name the branch
-    // instruction's own address (branch-to-self), matching how the Python
-    // reference generates these vectors.
+    // instruction's own address (branch-to-self).
     let full = format!("    ORG ${:x}\nLABEL:\n{}", origin, source);
     asm.assemble_bytes(&full).map_err(|e| format!("{:?}", e))
 }

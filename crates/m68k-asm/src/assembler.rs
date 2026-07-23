@@ -963,8 +963,8 @@ fn parse_index_reg_size_scale(text: &str) -> Option<(String, String, u8)> {
 /// Extract index register name and scale from a combined string like "D0*2" or "A1.W*4" or "D3".
 /// Parse an index register spec like `d1.w`, `a0.l*4`, `d2*8`. Returns
 /// `(register_name, scale, is_long)`; `is_long` is `true` only for an
-/// explicit `.L` suffix (matching Python's `_parse_index`, where `.B` and a
-/// missing suffix both default to the word-size encoding).
+/// explicit `.L` suffix (`.B` and a missing suffix both default to the
+/// word-size encoding).
 fn parse_index_reg_and_scale(text: &str) -> (String, u8, bool) {
     let text = text.trim();
     // Split on '*' to get scale
@@ -3364,17 +3364,19 @@ start:
 
     #[test]
     fn test_source_fmovem_range_without_slash_bugfix() {
-        // fmovem fp0-fp3,-(a7): fails in the Python reference (a bug); Rust handles it.
+        // fmovem fp0-fp3,-(a7): a pure range without a '/' must parse as a register list.
+        // vasm: fmovem fp0-fp3,-(a7) -> f227e00f
         let bytes = assemble_fpu_source("    FMOVEM FP0-FP3,-(A7)\n");
-        assert_eq!(bytes, vec![0xF2, 0x27, 0xC0, 0x0F]);
+        assert_eq!(bytes, vec![0xF2, 0x27, 0xE0, 0x0F]);
     }
 
     #[test]
     fn test_source_fmovem_ctrl_list() {
-        // fmovem fpcr/fpsr,-(a0): fails in the Python reference (another bug - the "/" check
-        // misidentifies it as an FP data-register list before checking control registers).
+        // fmovem fpcr/fpsr,-(a0): the "/" check must not misidentify this as an FP
+        // data-register list before checking control registers.
+        // vasm: fmovem fpcr/fpsr,-(a0) -> f220b800
         let bytes = assemble_fpu_source("    FMOVEM FPCR/FPSR,-(A0)\n");
-        assert_eq!(bytes, vec![0xF2, 0x20, 0x98, 0x00]);
+        assert_eq!(bytes, vec![0xF2, 0x20, 0xB8, 0x00]);
     }
 
     #[test]
@@ -4308,8 +4310,8 @@ mymexc MACRO
 
     #[test]
     fn test_source_pack_predec_bugfix() {
-        // Bugfix vs. Python: `pack -(a0),-(a1),#adj` crashes there (reads a nonexistent
-        // `.reg` attribute on the parsed predecrement operand); Rust handles it correctly.
+        // `pack -(a0),-(a1),#adj` must resolve the register number from the
+        // parsed predecrement operand correctly.
         let bytes = assemble_source_with_cpu("    PACK -(A0),-(A1),#$0201\n", "68020");
         // type_bit=1, rx=dst.n=1, ry=src.n=0 -> 0x8140|(1<<3)|(1<<9)|0 = 0x8348
         assert_eq!(bytes, vec![0x83, 0x48, 0x02, 0x01]);
@@ -4375,8 +4377,8 @@ mymexc MACRO
     }
 
     // B2: 68020+ memory indirect / full format EA. Byte patterns cross-checked
-    // by round-tripping through `m68k_core::addressing::decode_ea` (see
-    // AGENTS.md/plan.md B2 notes), not just re-derived from the encoder itself.
+    // by round-tripping through `m68k_core::addressing::decode_ea`, not just
+    // re-derived from the encoder itself.
 
     #[test]
     fn test_source_memory_indirect_simple() {
@@ -4427,8 +4429,8 @@ mymexc MACRO
 
     #[test]
     fn test_source_memory_indirect_pc_relative_unsupported() {
-        // Matches the Python reference: PC-relative full-format EAs are not
-        // implemented on the assembler side (decoder-only feature).
+        // PC-relative full-format EAs are not implemented on the assembler
+        // side (decoder-only feature).
         let mut asm = Assembler::new(0);
         asm.set_cpu("68020");
         let err = asm
@@ -4438,9 +4440,7 @@ mymexc MACRO
     }
 
     // B4: MULS.L/MULU.L Dh:Dl (64-bit product), B3: DIVSL/DIVUL + DIVS.L/
-    // DIVU.L Dr:Dq (64-bit dividend, remainder form). Byte patterns
-    // cross-checked against the Python reference implementation
-    // (`m68k_asm/enc_math.py`) for identical source lines.
+    // DIVU.L Dr:Dq (64-bit dividend, remainder form).
 
     #[test]
     fn test_source_mulu_l_64bit() {
@@ -4536,8 +4536,7 @@ mymexc MACRO
 
     #[test]
     fn test_movem_sp_alias() {
-        // SP must be accepted as an alias for A7 (matches the Python
-        // reference's `sp` handling in operands.py).
+        // SP must be accepted as an alias for A7.
         let bytes = assemble_source_with_cpu("    MOVEM.L D0-D7/A0-A7,-(SP)\n", "68000");
         assert_eq!(bytes, vec![0x48, 0xE7, 0xFF, 0xFF]);
     }

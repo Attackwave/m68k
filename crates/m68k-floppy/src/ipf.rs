@@ -4,12 +4,10 @@
 //! proprietary capsimg library. MFM bitstream decoding inside TRCK chunks is
 //! handled by [`crate::mfm::MfmDecoder`].
 //!
-//! The proprietary-library-backed `capsimg` backend (Python's
-//! `caps_backend.py`, which loads `capsimg.{dll,so}` via ctypes) is
-//! intentionally not ported: it requires FFI bindings to a closed-source
-//! library that may not even be present in most environments (Python's own
-//! factory already falls back to this native parser when it isn't). See
-//! `plan.md`/B5 notes.
+//! A proprietary-library-backed `capsimg` backend is intentionally not
+//! implemented: it would require FFI bindings to a closed-source
+//! `capsimg.{dll,so}` library that may not even be present in most
+//! environments — this native parser serves as the fallback when it isn't.
 
 use std::collections::HashMap;
 use std::fs::File;

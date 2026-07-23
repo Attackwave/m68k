@@ -248,9 +248,9 @@ pub fn enc_divs(
 
 /// Encode DIVSL/DIVUL (32-bit quotient, `Dr:Dq` remainder form required —
 /// unlike DIVS.L/DIVU.L, `Dn` alone is not valid syntax for these mnemonics).
-/// Per the Python reference, these never set the ext-word's 64-bit-dividend
-/// bit (bit 10) — DIVSL/DIVUL always operate on a 32-bit dividend, just with
-/// the remainder captured in a separate register from the quotient.
+/// These never set the ext-word's 64-bit-dividend bit (bit 10) — DIVSL/DIVUL
+/// always operate on a 32-bit dividend, just with the remainder captured in
+/// a separate register from the quotient.
 pub fn enc_divsl_ul(
     src: &Operand,
     dst: &Operand,
@@ -431,9 +431,7 @@ mod tests {
     }
 
     // B4: MULS.L/MULU.L Dh:Dl (64-bit product) and B3: DIVSL/DIVUL/DIVS.L/
-    // DIVU.L Dr:Dq (64-bit dividend, remainder form). Byte patterns
-    // cross-checked against the Python reference (`enc_math.py`
-    // `_encode_mul_l`/`_encode_divsl_ul`) for D1,D3:D2 style operands.
+    // DIVU.L Dr:Dq (64-bit dividend, remainder form), for D1,D3:D2 style operands.
 
     #[test]
     fn test_mulu_l_64bit_dh_dl() {

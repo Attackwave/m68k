@@ -71,6 +71,13 @@ pub enum ParserType {
     Pmove,
     PflushFamily040,
     CacheOp040,
+    Fpu,
+    FpuScc,
+    FpuDbcc,
+    FpuTrapcc,
+    FpuBcc,
+    FpuSave,
+    FpuRestore,
 }
 
 use crate::ea_categories::ea::*;
@@ -778,6 +785,95 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: 0,
             cpu: "68040",
             parser: ParserType::CacheOp040,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // FDBcc Dn,label (68020/68881+): base 0xF248, register in bits 2-0. Must be
+            // listed before the FScc/FBcc-family entries below since 0xF248-0xF24F falls
+            // inside FScc's 0xF240/0xFFC0 range. Placeholder mnemonic; FpuDbcc overrides it.
+            mask: 0xFFF8,
+            value: 0xF248,
+            mnemonic: "FDBcc",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::FpuDbcc,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // FTRAPcc (68020/68881+): base 0xF278, mode in bits 2-0 (2=word operand,
+            // 3=long operand, 4=no operand). Must be listed before FScc for the same
+            // range-overlap reason as FDBcc above. Placeholder mnemonic; FpuTrapcc overrides it.
+            mask: 0xFFF8,
+            value: 0xF278,
+            mnemonic: "FTRAPcc",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::FpuTrapcc,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // FScc <ea> (68020/68881+): base 0xF240, EA mode/register in bits 5-0,
+            // condition in the extension word. Placeholder mnemonic; FpuScc overrides it.
+            mask: 0xFFC0,
+            value: 0xF240,
+            mnemonic: "FScc",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::FpuScc,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // FBcc (68020/68881+): base 0xF280, size bit 6 (0=word,1=long displacement),
+            // condition in bits 4-0. mask must leave bit 6 free so both size forms match
+            // this one pattern (verified against real `vasm` output for `fbeq.l`, which
+            // encodes as 0xF2C1, not 0xF281). Placeholder mnemonic; FpuBcc overrides it.
+            mask: 0xFF80,
+            value: 0xF280,
+            mnemonic: "FBcc",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::FpuBcc,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // FSAVE <ea> (68020/68881+): base 0xF300, EA mode/register in bits 5-0.
+            mask: 0xFFC0,
+            value: 0xF300,
+            mnemonic: "FSAVE",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::FpuSave,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // FRESTORE <ea> (68020/68881+): base 0xF340, EA mode/register in bits 5-0.
+            mask: 0xFFC0,
+            value: 0xF340,
+            mnemonic: "FRESTORE",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::FpuRestore,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // FPU cpGEN group (68020/68881+): FADD/FMOVE/FMOVECR/FSINCOS/FMOVEM/... all
+            // share base 0xF200, EA mode/register in bits 5-0; the actual instruction and
+            // its operands depend entirely on the extension word (bits 15-13 select the
+            // instruction group, bits 6-0 select the arithmetic opclass within cpGEN
+            // itself). Placeholder mnemonic; Fpu parser overrides it.
+            mask: 0xFFC0,
+            value: 0xF200,
+            mnemonic: "FPU",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::Fpu,
             fixed_size: None,
         },
         OpcodePattern {

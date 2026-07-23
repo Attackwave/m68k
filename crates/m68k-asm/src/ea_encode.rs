@@ -212,7 +212,7 @@ fn encode_brief_index(
 }
 
 /// Encode a 68020+ full-format (memory indirect) EA. Mirrors `decode_full_ea`
-/// in reverse; port of the Python reference's `_encode_full_ea`.
+/// in reverse.
 ///
 /// Extension word layout:
 /// - bit 15: index is `An` (vs `Dn`)
@@ -226,8 +226,7 @@ fn encode_brief_index(
 /// - bits 5-4: base displacement size (0=null, 2=word, 3=long)
 /// - bits 3-0: indirect/index/outer-displacement selector (i_i_s)
 ///
-/// PC-relative full-format EAs (`base_is_pc`) are not supported — mirroring
-/// the Python reference, which also leaves this case unimplemented.
+/// PC-relative full-format EAs (`base_is_pc`) are not supported.
 fn encode_full_ea(
     mi: &MemoryIndirectOperand,
     allowed: u16,

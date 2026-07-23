@@ -193,7 +193,7 @@ mod tests {
     #[test]
     fn test_disassemble_unmatched_opcode_falls_back_to_data_word() {
         // 0xFFFF matches no opcode pattern; decode_next reports it as a data
-        // word rather than an error (mirrors the Python disassembler).
+        // word rather than an error.
         let bytes = vec![0xFF, 0xFF, 0x4E, 0x75]; // dc.w $ffff; rts
         let mut disasm = Disassembler::new(bytes, 0);
         let lines = disasm.disassemble();

@@ -866,7 +866,9 @@ pub fn encode_instruction(
         _ if fpu_short_cmd(mnemonic).is_some() => {
             let cmd = fpu_short_cmd(mnemonic).unwrap();
             match (src, dst) {
-                (Some(s), Some(Operand::FpReg(fpd))) => enc_fpu_short(cmd, s, *fpd, pc + 2, cpu),
+                (Some(s), Some(Operand::FpReg(fpd))) => {
+                    enc_fpu_short(cmd, s, *fpd, size, pc + 2, cpu)
+                }
                 _ => Err(AsmError::new(format!("{} requires <ea>,FPn", mnemonic))),
             }
         }
@@ -890,6 +892,14 @@ pub fn encode_instruction(
             }
             (Some(s), Some(Operand::Immediate(mask))) => {
                 enc_fmovem_mem_to_regs(s, FpRegSet(*mask as u8), pc + 2, cpu)
+            }
+            // A single FPn (not a `/`-list) parses as Operand::FpReg rather than
+            // Operand::Immediate(mask); treat it as a one-register mask.
+            (Some(Operand::FpReg(fp)), Some(d)) => {
+                enc_fmovem_regs_to_mem(FpRegSet(1 << fp), d, pc + 2, cpu)
+            }
+            (Some(s), Some(Operand::FpReg(fp))) => {
+                enc_fmovem_mem_to_regs(s, FpRegSet(1 << fp), pc + 2, cpu)
             }
             (Some(Operand::FpCtrlList(mask)), Some(d)) => {
                 enc_fmovem_ctrl_to_mem(*mask, d, pc + 2, cpu)
@@ -1110,17 +1120,8 @@ mod tests {
             .collect()
     }
 
-    // Reference bytes generated from the Python assembler (source of truth):
-    //   bftst d0{4:8}          -> e8c00108
-    //   bfextu d1{d2:d3},d4    -> e9c1e818
-    //   bfins d0,d1{4:8}       -> efc10108
-    //   bfset (a0){0:32}       -> eed00000
-    //   bfinv (a0){0:8}        -> efd00028
-    //   bfffo d2{8:d5},d3      -> edc23a28
-    //   bfchg d1{d2:16}        -> eac1a010
-
     #[test]
-    fn test_bftst_matches_python_reference() {
+    fn test_bftst_reference_bytes() {
         let bf = Operand::Bitfield(
             Box::new(Operand::DataReg(0)),
             Box::new(BitfieldSpec::Immediate(4)),
@@ -1145,7 +1146,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bfins_matches_python_reference() {
+    fn test_bfins_reference_bytes() {
         let src = Operand::DataReg(0);
         let bf = Operand::Bitfield(
             Box::new(Operand::DataReg(1)),
@@ -1157,7 +1158,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bfset_matches_python_reference() {
+    fn test_bfset_reference_bytes() {
         let bf = Operand::Bitfield(
             Box::new(Operand::AddrRegIndirect(0)),
             Box::new(BitfieldSpec::Immediate(0)),
@@ -1168,7 +1169,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bfinv_matches_python_reference() {
+    fn test_bfinv_reference_bytes() {
         let bf = Operand::Bitfield(
             Box::new(Operand::AddrRegIndirect(0)),
             Box::new(BitfieldSpec::Immediate(0)),
@@ -1336,7 +1337,8 @@ mod tests {
         assert!(encode_instruction("EXTB", None, Some(&src), None, 0, "68000").is_err());
     }
 
-    // FPU dispatcher tests. Reference bytes from the Python assembler unless noted otherwise.
+    // FPU dispatcher tests. Reference bytes verified against real `vasm -m68040` output
+    // unless noted otherwise.
 
     #[test]
     fn test_dispatch_fadd_reg_reg() {
@@ -1376,17 +1378,18 @@ mod tests {
         let src = Operand::DataReg(0);
         let dst = Operand::FpReg(1);
         let words = encode_instruction("FSMOVE", None, Some(&src), Some(&dst), 0, "68020").unwrap();
-        assert_eq!(words, vec![0xF200, 0x5CC0]);
+        assert_eq!(words, vec![0xF200, 0x50C0]);
     }
 
     #[test]
     fn test_dispatch_fmovem_range_to_predec_bugfix() {
-        // fmovem fp0-fp3,-(a7): fails in the Python reference (a bug - pure ranges without
-        // a '/' aren't recognized there); Rust's parser handles this correctly.
+        // fmovem fp0-fp3,-(a7): a pure range without a '/' - the parser must
+        // recognize this form, not just slash-separated lists.
+        // vasm: fmovem fp0-fp3,-(a7) -> f227e00f
         let src = Operand::Immediate(0b1111);
         let dst = Operand::AddrRegPreDec(7);
         let words = encode_instruction("FMOVEM", None, Some(&src), Some(&dst), 0, "68020").unwrap();
-        assert_eq!(words, vec![0xF227, 0xC00F]);
+        assert_eq!(words, vec![0xF227, 0xE00F]);
     }
 
     #[test]
@@ -1398,11 +1401,12 @@ mod tests {
 
     #[test]
     fn test_dispatch_fdbeq() {
+        // vasm: fdbeq d0,$1010 (at pc=$1000) -> f2480001000c
         let src = Operand::DataReg(0);
         let dst = Operand::Address(0x1010);
         let words =
             encode_instruction("FDBEQ", None, Some(&src), Some(&dst), 0x1000, "68020").unwrap();
-        assert_eq!(words, vec![0xF2C8, 0x0001, 0x000C]);
+        assert_eq!(words, vec![0xF248, 0x0001, 0x000C]);
     }
 
     #[test]
@@ -1414,8 +1418,9 @@ mod tests {
 
     #[test]
     fn test_dispatch_ftrapeq_no_operand() {
+        // vasm: ftrapeq -> f27c0001
         let words = encode_instruction("FTRAPEQ", None, None, None, 0, "68020").unwrap();
-        assert_eq!(words, vec![0xF27A, 0x0001]);
+        assert_eq!(words, vec![0xF27C, 0x0001]);
     }
 
     #[test]
@@ -1444,7 +1449,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_fsincos_via_ex() {
-        // fsincos fp1,fp2,fp3 -> f2000cb2
+        // vasm: fsincos fp1,fp2:fp3 -> f20005b2
         let src = Operand::FpReg(1);
         let cos = Operand::FpReg(2);
         let sin = Operand::FpReg(3);
@@ -1458,7 +1463,7 @@ mod tests {
             "68020",
         )
         .unwrap();
-        assert_eq!(words, vec![0xF200, 0x0CB2]);
+        assert_eq!(words, vec![0xF200, 0x05B2]);
     }
 
     #[test]

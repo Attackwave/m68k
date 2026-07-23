@@ -41,8 +41,7 @@ pub trait FloppyImageReader {
     }
 }
 
-/// Verify a path exists and is a regular file, mirroring the Python base
-/// class's constructor-time check (`FloppyImageReader.__init__`).
+/// Verify a path exists and is a regular file.
 pub(crate) fn require_file(path: &Path) -> Result<PathBuf, FloppyError> {
     if !path.is_file() {
         return Err(FloppyError::new(format!(

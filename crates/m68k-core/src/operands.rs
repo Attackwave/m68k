@@ -51,8 +51,7 @@ pub enum Operand {
     /// `([bd,An],Xn,od)` (pre-indexed) or `([bd,An,Xn],od)` (post-indexed),
     /// with `An` optionally suppressed (base register absent) or replaced by
     /// `PC` — mirrors the decoder's `MemoryIndirectOperand` but without the
-    /// PC-relative-target bookkeeping, which the assembler doesn't support
-    /// (matching the Python reference implementation).
+    /// PC-relative-target bookkeeping, which the assembler doesn't support.
     MemoryIndirect(Box<MemoryIndirectOperand>),
 }
 

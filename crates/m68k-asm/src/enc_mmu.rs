@@ -282,29 +282,6 @@ pub fn enc_prestore(ea_op: &Operand, ext_pc: u32, cpu: &str) -> Result<Vec<u16>,
 mod tests {
     use super::*;
 
-    // Reference bytes (source: Python assembler unless noted otherwise):
-    //   pmove tc,(a0)     -> f0104000
-    //   pmove (a0),tc     -> f0100000
-    //   pmove srp,(a0)    -> f0105000
-    //   ptest #3,(a0)     -> f0500c00
-    //   pflush #2,#3,(a0) -> f0100062
-    //   pflusha           -> f010
-    //   pflushan          -> f018
-    //   pflushn (a0)      -> f518
-    //   plpaw (a0)        -> f588
-    //   plpar (a0)        -> f5c8
-    //   lpstop #$2700     -> f80001c02700
-    //   cinvl #1,a0       -> f420
-    //   cinvp #1,a0       -> f430
-    //   cpushl #3,a0      -> f460
-    //   cpushp #3,a0      -> f470
-    //   cinva a0          -> f420
-    //   cpusha a0         -> f4a0
-    //   cpush #2,a0       -> f4b8
-    //   cinv #2,a0        -> f438
-    //   psave -(a0)       -> f0a0
-    //   prestore (a0)+    -> f0d8
-
     #[test]
     fn test_pmove_reg_to_ea() {
         // PMOVE TC,(A0) -- TC is the source (register-to-memory, R/W=1).
@@ -404,21 +381,21 @@ mod tests {
     }
 
     #[test]
-    fn test_plpaw_matches_python() {
+    fn test_plpaw_reference_bytes() {
         let dst = Operand::AddrRegIndirect(0);
         let words = enc_mmu_single_reg(0xF588, &dst, "68030").unwrap();
         assert_eq!(words, vec![0xF588]);
     }
 
     #[test]
-    fn test_plpar_matches_python() {
+    fn test_plpar_reference_bytes() {
         let dst = Operand::AddrRegIndirect(0);
         let words = enc_mmu_single_reg(0xF5C8, &dst, "68030").unwrap();
         assert_eq!(words, vec![0xF5C8]);
     }
 
     #[test]
-    fn test_lpstop_matches_python() {
+    fn test_lpstop_reference_bytes() {
         let words = enc_lpstop(0x2700, "68060").unwrap();
         assert_eq!(words, vec![0xF800, 0x01C0, 0x2700]);
     }
@@ -466,13 +443,13 @@ mod tests {
     }
 
     #[test]
-    fn test_psave_matches_python() {
+    fn test_psave_reference_bytes() {
         let dst = Operand::AddrRegPreDec(0);
         assert_eq!(enc_psave(&dst, 0, "68030").unwrap(), vec![0xF0A0]);
     }
 
     #[test]
-    fn test_prestore_matches_python() {
+    fn test_prestore_reference_bytes() {
         let src = Operand::AddrRegPostInc(0);
         assert_eq!(enc_prestore(&src, 0, "68030").unwrap(), vec![0xF0D8]);
     }

@@ -167,9 +167,8 @@ impl FloppyImageReader for UaeExtendedBackend {
             return Ok(data.clone());
         }
 
-        // Re-attempt decoding (mirrors the Python fallback path), in case the
-        // up-front decode at open() time failed for this track but the raw
-        // data is present.
+        // Re-attempt decoding, in case the up-front decode at open() time
+        // failed for this track but the raw data is present.
         if let Some(raw_data) = self.raw_tracks.get(&(track, side)).cloned() {
             decode_track_sectors(track, side, &raw_data, &mut self.decoded_sectors);
         }

@@ -45,10 +45,10 @@ impl FloppyImage {
 }
 
 /// Backend selector for [`open_floppy_image`]. `Auto` picks based on file
-/// extension and content, matching the Python factory's `backend="auto"` default.
+/// extension and content.
 ///
-/// The proprietary `capsimg`-backed reader (Python's `"caps"` backend) is not
-/// ported — see `ipf` module docs — so there is no `Caps` variant here.
+/// The proprietary `capsimg`-backed reader is not implemented — see `ipf`
+/// module docs — so there is no `Caps` variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Backend {
     Auto,
@@ -95,9 +95,9 @@ fn open_adf(path: &Path) -> Result<FloppyImage, FloppyError> {
     }
 }
 
-/// The native IPF parser is used directly (no capsimg backend is ported —
-/// Python's own factory already falls back to it whenever capsimg isn't
-/// available, which is the common case in most environments).
+/// The native IPF parser is used directly (no capsimg backend is
+/// implemented — it would only be a fallback for the common case where
+/// capsimg isn't available anyway).
 fn open_ipf(path: &Path) -> Result<FloppyImage, FloppyError> {
     NativeIpfBackend::open(path).map(FloppyImage::NativeIpf)
 }

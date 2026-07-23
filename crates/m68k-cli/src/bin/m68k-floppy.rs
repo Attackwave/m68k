@@ -1,5 +1,4 @@
-//! CLI entry point for floppy image inspection. Port of the Python reference's
-//! `m68k_disasm/floppy/cli.py`.
+//! CLI entry point for floppy image inspection.
 
 use std::io::Write;
 use std::path::PathBuf;

@@ -26,8 +26,10 @@ impl DecodedInstruction {
         let ops_str = ops.join(", ");
         if ops_str.is_empty() {
             self.mnemonic.clone()
-        } else {
+        } else if self.mnemonic.len() < 8 {
             format!("{:<8}{}", self.mnemonic, ops_str)
+        } else {
+            format!("{} {}", self.mnemonic, ops_str)
         }
     }
 }
@@ -989,6 +991,385 @@ fn parse_operands(
             }
             Ok((mnemonic.into(), operands, target_addr))
         }
+        ParserType::Fpu => decode_fpu_cpgen(op, stream, inst_pc, cpu, target_addr),
+        ParserType::FpuScc => {
+            let cc = stream.read_word()? & 0x3F;
+            let mnemonic = format!("fs{}", fpu_cc_name(cc)?);
+            let ea_mode = ((op >> 3) & 0x7) as u8;
+            let ea_reg = (op & 0x7) as u8;
+            let ea = decode_ea(ea_mode, ea_reg, "b", stream, inst_pc, cpu)?;
+            operands.push(DecodedOperand::from_ea(ea));
+            Ok((mnemonic, operands, target_addr))
+        }
+        ParserType::FpuDbcc => {
+            let reg = (op & 0x7) as u8;
+            let cc = stream.read_word()? & 0x3F;
+            // Displacement is relative to the PC after the condition word (opword + cc
+            // word), not after the opword alone - verified against real vasm output for
+            // `fdbeq d0,$1010` at pc=$1000: pc_after_ext=$1004, disp=$0c, target=$1010.
+            let ext_pc = stream.current_pc();
+            let disp = sign_extend_16(stream.read_word()?);
+            let target = (ext_pc as i32 + disp) as u32;
+            target_addr = Some(target);
+            let mnemonic = format!("fdb{}", fpu_cc_name(cc)?);
+            operands.push(DecodedOperand::from_ea(EAOperand::DataReg(reg)));
+            operands.push(DecodedOperand::from_ea(EAOperand::AbsoluteLong(target)));
+            Ok((mnemonic, operands, target_addr))
+        }
+        ParserType::FpuTrapcc => {
+            let mode = op & 0x7;
+            let cc = stream.read_word()? & 0x3F;
+            let base_mnemonic = format!("ftrap{}", fpu_cc_name(cc)?);
+            let mnemonic = match mode {
+                2 => {
+                    let val = stream.read_word()?;
+                    operands.push(DecodedOperand::special(format!("#${:04x}", val)));
+                    format!("{}.w", base_mnemonic)
+                }
+                3 => {
+                    let val = stream.read_long()?;
+                    operands.push(DecodedOperand::special(format!("#${:08x}", val)));
+                    format!("{}.l", base_mnemonic)
+                }
+                4 => base_mnemonic,
+                _ => return Err("unknown FTRAPcc mode".into()),
+            };
+            Ok((mnemonic, operands, target_addr))
+        }
+        ParserType::FpuBcc => {
+            let size_bit = (op >> 6) & 1;
+            let cc = op & 0x1F;
+            let mnemonic = format!("fb{}", fpu_cc_name(cc)?);
+            let ext_pc = stream.current_pc();
+            let target = if size_bit == 1 {
+                let d32 = stream.read_long()? as i32;
+                (ext_pc as i32 + d32) as u32
+            } else {
+                let d16 = sign_extend_16(stream.read_word()?);
+                (ext_pc as i32 + d16) as u32
+            };
+            target_addr = Some(target);
+            operands.push(DecodedOperand::from_ea(EAOperand::AbsoluteLong(target)));
+            Ok((mnemonic, operands, target_addr))
+        }
+        ParserType::FpuSave => {
+            let ea_mode = ((op >> 3) & 0x7) as u8;
+            let ea_reg = (op & 0x7) as u8;
+            let ea = decode_ea(ea_mode, ea_reg, "b", stream, inst_pc, cpu)?;
+            operands.push(DecodedOperand::from_ea(ea));
+            Ok(("fsave".into(), operands, target_addr))
+        }
+        ParserType::FpuRestore => {
+            let ea_mode = ((op >> 3) & 0x7) as u8;
+            let ea_reg = (op & 0x7) as u8;
+            let ea = decode_ea(ea_mode, ea_reg, "b", stream, inst_pc, cpu)?;
+            operands.push(DecodedOperand::from_ea(ea));
+            Ok(("frestore".into(), operands, target_addr))
+        }
+    }
+}
+
+/// FPU condition-code mnemonic suffix (lowercase) for a 6-bit (0-31) condition value.
+fn fpu_cc_name(cc: u16) -> Result<&'static str, String> {
+    Ok(match cc & 0x1F {
+        0x00 => "f",
+        0x01 => "eq",
+        0x02 => "ogt",
+        0x03 => "oge",
+        0x04 => "olt",
+        0x05 => "ole",
+        0x06 => "ogl",
+        0x07 => "or",
+        0x08 => "un",
+        0x09 => "ueq",
+        0x0A => "ugt",
+        0x0B => "uge",
+        0x0C => "ult",
+        0x0D => "ule",
+        0x0E => "ne",
+        0x0F => "t",
+        0x10 => "sf",
+        0x11 => "seq",
+        0x12 => "gt",
+        0x13 => "ge",
+        0x14 => "lt",
+        0x15 => "le",
+        0x16 => "gl",
+        0x17 => "gle",
+        0x18 => "ngle",
+        0x19 => "ngl",
+        0x1A => "nle",
+        0x1B => "nlt",
+        0x1C => "nge",
+        0x1D => "ngt",
+        0x1E => "sne",
+        0x1F => "st",
+        _ => unreachable!("5-bit field"),
+    })
+}
+
+/// FPU source-format specifier (extension word bits 12-10) to size-suffix character.
+fn fpu_fmt_suffix(fmt: u16) -> &'static str {
+    match fmt & 0x7 {
+        0 => "l",
+        1 => "s",
+        2 => "x",
+        3 => "p",
+        4 => "w",
+        5 => "d",
+        6 => "b",
+        _ => "x",
+    }
+}
+
+/// FPU monadic/dyadic arithmetic opclass/opmode (extension word bits 6-0) to mnemonic.
+fn fpu_arith_name(cmd: u16) -> Option<&'static str> {
+    Some(match cmd {
+        0x00 => "fmove",
+        0x01 => "fint",
+        0x02 => "fsinh",
+        0x03 => "fintrz",
+        0x04 => "fsqrt",
+        0x06 => "flognp1",
+        0x08 => "fetoxm1",
+        0x09 => "ftanh",
+        0x0A => "fatan",
+        0x0B => "ftan",
+        0x0C => "fasin",
+        0x0D => "fatanh",
+        0x0E => "fsin",
+        0x0F => "ftentox",
+        0x10 => "ftwotox",
+        0x11 => "fetox",
+        0x12 => "flog10",
+        0x14 => "flog2",
+        0x15 => "flogn",
+        0x18 => "fabs",
+        0x19 => "fcosh",
+        0x1A => "fneg",
+        0x1C => "facos",
+        0x1D => "fcos",
+        0x1E => "fgetexp",
+        0x1F => "fgetman",
+        0x20 => "fdiv",
+        0x21 => "fmod",
+        0x22 => "fadd",
+        0x23 => "fmul",
+        0x24 => "fsgldiv",
+        0x25 => "frem",
+        0x26 => "fscale",
+        0x27 => "fsglmul",
+        0x28 => "fsub",
+        0x38 => "fcmp",
+        0x3A => "ftst",
+        _ => return None,
+    })
+}
+
+/// "Short" (rounding-precision-forcing) FPU opclass/opmode to mnemonic.
+fn fpu_short_name(cmd: u16) -> Option<&'static str> {
+    Some(match cmd {
+        0x40 => "fsmove",
+        0x41 => "fssqrt",
+        0x44 => "fdmove",
+        0x45 => "fdsqrt",
+        0x60 => "fsdiv",
+        0x62 => "fsadd",
+        0x63 => "fsmul",
+        0x64 => "fddiv",
+        0x66 => "fdadd",
+        0x67 => "fdmul",
+        0x68 => "fssub",
+        0x6C => "fdsub",
+        _ => return None,
+    })
+}
+
+/// FPU control-register mask (extension word bits 12-10) to register-list text,
+/// e.g. `fpcr/fpsr/fpiar` for mask 0b111.
+fn fpu_ctrl_list_name(mask: u16) -> String {
+    let mut parts = Vec::new();
+    if mask & 0b100 != 0 {
+        parts.push("fpcr");
+    }
+    if mask & 0b010 != 0 {
+        parts.push("fpsr");
+    }
+    if mask & 0b001 != 0 {
+        parts.push("fpiar");
+    }
+    parts.join("/")
+}
+
+/// Reverse an 8-bit FPU register mask (see `enc_fpu::reverse_fp_mask` for the encoder side:
+/// the postincrement/control static-list format has FP0 as the MSB, opposite of predecrement).
+fn reverse_fp_mask(mask: u8) -> u8 {
+    let mut out = 0u8;
+    for i in 0..8 {
+        if (mask >> i) & 1 != 0 {
+            out |= 1 << (7 - i);
+        }
+    }
+    out
+}
+
+/// Format an FPU data-register mask (bit N = FPn) as `fp0/fp2-fp4` register-list text.
+fn fpu_reg_list_text(mask: u8) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut i = 0u8;
+    while i < 8 {
+        if (mask >> i) & 1 != 0 {
+            let start = i;
+            let mut end = i;
+            while end + 1 < 8 && (mask >> (end + 1)) & 1 != 0 {
+                end += 1;
+            }
+            if end > start {
+                parts.push(format!("fp{}-fp{}", start, end));
+            } else {
+                parts.push(format!("fp{}", start));
+            }
+            i = end + 1;
+        } else {
+            i += 1;
+        }
+    }
+    parts.join("/")
+}
+
+/// Decode the FPU cpGEN group (opword base 0xF200): arithmetic, FMOVE, FMOVECR, FSINCOS,
+/// and FMOVEM, all dispatched on the extension word's top bits (15-13) and, for the
+/// arithmetic/FMOVE cases, the R/M and opclass/opmode fields.
+fn decode_fpu_cpgen(
+    op: u16,
+    stream: &mut InstructionStream,
+    inst_pc: u32,
+    cpu: &str,
+    target_addr: Option<u32>,
+) -> Result<(String, Vec<DecodedOperand>, Option<u32>), String> {
+    let ext = stream.read_word()?;
+    let mut operands: Vec<DecodedOperand> = Vec::new();
+    let group = (ext >> 13) & 0x7;
+    let ea_mode = ((op >> 3) & 0x7) as u8;
+    let ea_reg = (op & 0x7) as u8;
+
+    match group {
+        0b110 | 0b111 => {
+            // FMOVEM data-register list <-> memory. bit13 (part of `group`) is dr,
+            // bits12-11 are list-mode (00/01=predecrement static/dynamic,
+            // 10/11=postincrement-or-control static/dynamic).
+            let dr = (ext >> 13) & 1;
+            let list_mode = (ext >> 11) & 0x3;
+            let is_predec = list_mode & 0b10 == 0;
+            let raw_mask = (ext & 0xFF) as u8;
+            let mask = if is_predec {
+                raw_mask
+            } else {
+                reverse_fp_mask(raw_mask)
+            };
+            let reg_list = fpu_reg_list_text(mask);
+            let ea = decode_ea(ea_mode, ea_reg, "x", stream, inst_pc, cpu)?;
+            if dr == 1 {
+                operands.push(DecodedOperand::special(reg_list));
+                operands.push(DecodedOperand::from_ea(ea));
+            } else {
+                operands.push(DecodedOperand::from_ea(ea));
+                operands.push(DecodedOperand::special(reg_list));
+            }
+            Ok(("fmovem".into(), operands, target_addr))
+        }
+        0b100 | 0b101 => {
+            // FMOVE <-> FPU control register(s) (FPCR/FPSR/FPIAR). bit13 is dr
+            // (1 = ctrl -> EA, 0 = EA -> ctrl); bits12-10 are the control-register mask.
+            let dr = (ext >> 13) & 1;
+            let mask = (ext >> 10) & 0x7;
+            let reg_list = fpu_ctrl_list_name(mask);
+            let ea = decode_ea(ea_mode, ea_reg, "l", stream, inst_pc, cpu)?;
+            if dr == 1 {
+                operands.push(DecodedOperand::special(reg_list));
+                operands.push(DecodedOperand::from_ea(ea));
+            } else {
+                operands.push(DecodedOperand::from_ea(ea));
+                operands.push(DecodedOperand::special(reg_list));
+            }
+            Ok(("fmove".into(), operands, target_addr))
+        }
+        0b010 | 0b011 => {
+            // <ea>,FPn (group 010) or FPn,<ea> (group 011): arithmetic, FMOVE,
+            // FMOVECR (src format specifier 0b111), or FSINCOS (cmd bits 6-5 = 01).
+            let rm_dst = ((ext >> 7) & 0x7) as u8;
+            let cmd = ext & 0x7F;
+            let fmt = (ext >> 10) & 0x7;
+
+            if group == 0b010 && fmt == 0b111 {
+                // FMOVECR #rom_offset,FPn: no EA is consumed (bits 5-0 of op are ignored
+                // by real hardware here, but stay in the same opword as a normal cpGEN op).
+                let rom_offset = ext & 0x7F;
+                operands.push(DecodedOperand::special(format!("#${:x}", rom_offset)));
+                operands.push(DecodedOperand::special(format!("fp{}", rm_dst)));
+                return Ok(("fmovecr".into(), operands, target_addr));
+            }
+            if group == 0b010 && (cmd & 0x78) == 0x30 {
+                // FSINCOS <ea>,FPc:FPd - cmd bits 6-3 = 0110, cos_dst in cmd bits 2-0,
+                // sin_dst (the "destination register" field) in ext bits 9-7.
+                let cos_dst = cmd & 0x7;
+                let ea = decode_ea(ea_mode, ea_reg, fpu_fmt_suffix(fmt), stream, inst_pc, cpu)?;
+                operands.push(DecodedOperand::from_ea(ea));
+                operands.push(DecodedOperand::special(format!(
+                    "fp{}:fp{}",
+                    cos_dst, rm_dst
+                )));
+                return Ok(("fsincos".into(), operands, target_addr));
+            }
+
+            let base_mnemonic = fpu_arith_name(cmd)
+                .or_else(|| fpu_short_name(cmd))
+                .ok_or("unknown FPU arithmetic opclass/opmode")?;
+            let suffix = fpu_fmt_suffix(fmt);
+            let ea = decode_ea(ea_mode, ea_reg, suffix, stream, inst_pc, cpu)?;
+            // Only append the size suffix when it isn't the assembler's default (word,
+            // verified against real vasm output for unsuffixed <ea>,FPn arithmetic/FMOVE),
+            // so a plain round-trip doesn't spuriously widen to e.g. `fadd.w`.
+            let mnemonic = if suffix == "w" {
+                base_mnemonic.to_string()
+            } else {
+                format!("{}.{}", base_mnemonic, suffix)
+            };
+            if group == 0b010 {
+                operands.push(DecodedOperand::from_ea(ea));
+                operands.push(DecodedOperand::special(format!("fp{}", rm_dst)));
+            } else {
+                operands.push(DecodedOperand::special(format!("fp{}", rm_dst)));
+                operands.push(DecodedOperand::from_ea(ea));
+            }
+            Ok((mnemonic, operands, target_addr))
+        }
+        0b000 => {
+            // FPn,FPm (reg-reg) or FPn (monadic, src==dst): R/M=0, source register in
+            // bits 12-10, destination register in bits 9-7, opclass/opmode in bits 6-0.
+            let src_reg = (ext >> 10) & 0x7;
+            let dst_reg = (ext >> 7) & 0x7;
+            let cmd = ext & 0x7F;
+
+            if (cmd & 0x78) == 0x30 {
+                // FSINCOS FPn,FPc:FPd (reg-reg form).
+                let cos_dst = cmd & 0x7;
+                operands.push(DecodedOperand::special(format!("fp{}", src_reg)));
+                operands.push(DecodedOperand::special(format!(
+                    "fp{}:fp{}",
+                    cos_dst, dst_reg
+                )));
+                return Ok(("fsincos".into(), operands, target_addr));
+            }
+
+            let mnemonic = fpu_arith_name(cmd)
+                .or_else(|| fpu_short_name(cmd))
+                .ok_or("unknown FPU arithmetic opclass/opmode")?;
+            operands.push(DecodedOperand::special(format!("fp{}", src_reg)));
+            operands.push(DecodedOperand::special(format!("fp{}", dst_reg)));
+            Ok((mnemonic.into(), operands, target_addr))
+        }
+        _ => Err("unknown FPU cpGEN extension-word group".into()),
     }
 }
 
@@ -1117,6 +1498,180 @@ mod tests {
         } else {
             panic!("Expected RTD instruction, got data word");
         }
+    }
+
+    // FPU decoder tests. Reference bytes verified against real `vasm -m68040` output
+    // (see crates/m68k-asm/src/enc_fpu.rs for the matching encoder-side verification).
+    fn decode_one(bytes: &[u8], cpu: &str) -> DecodedInstruction {
+        let mut stream = InstructionStream::new(bytes, 0x1000);
+        match decode_next(&mut stream, cpu).unwrap().1 {
+            DecodeResult::Instruction(inst) => inst,
+            DecodeResult::DataWord(_) => panic!("expected instruction, got data word"),
+        }
+    }
+
+    #[test]
+    fn test_decode_fadd_dn_default_word() {
+        // vasm: fadd d0,fp2 -> f2005122 (no suffix -> word specifier, not extended)
+        let inst = decode_one(&[0xF2, 0x00, 0x51, 0x22], "68040");
+        assert_eq!(inst.mnemonic, "fadd");
+    }
+
+    #[test]
+    fn test_decode_fadd_dn_long_suffix_shown() {
+        // vasm: fadd.l d0,fp2 -> f2004122
+        let inst = decode_one(&[0xF2, 0x00, 0x41, 0x22], "68040");
+        assert_eq!(inst.mnemonic, "fadd.l");
+    }
+
+    #[test]
+    fn test_decode_fadd_reg_reg() {
+        // vasm: fadd fp1,fp2 -> f2000522
+        let inst = decode_one(&[0xF2, 0x00, 0x05, 0x22], "68040");
+        assert_eq!(inst.mnemonic, "fadd");
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[0].format(&labels), "fp1");
+        assert_eq!(inst.operands[1].format(&labels), "fp2");
+    }
+
+    #[test]
+    fn test_decode_fmove_ctrl_reg_direction() {
+        // vasm: fmove fpiar,d0 -> f200a400 (ctrl -> EA) vs fmove d0,fpiar -> f2008400 (EA -> ctrl)
+        let labels = HashMap::new();
+        let to_dn = decode_one(&[0xF2, 0x00, 0xA4, 0x00], "68040");
+        assert_eq!(to_dn.operands[0].format(&labels), "fpiar");
+        assert_eq!(to_dn.operands[1].format(&labels), "d0");
+
+        let from_dn = decode_one(&[0xF2, 0x00, 0x84, 0x00], "68040");
+        assert_eq!(from_dn.operands[0].format(&labels), "d0");
+        assert_eq!(from_dn.operands[1].format(&labels), "fpiar");
+    }
+
+    #[test]
+    fn test_decode_fmovem_predec_mask_not_reversed() {
+        // vasm: fmovem fp0/fp1,-(a7) -> f227e003
+        let inst = decode_one(&[0xF2, 0x27, 0xE0, 0x03], "68040");
+        assert_eq!(inst.mnemonic, "fmovem");
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[0].format(&labels), "fp0-fp1");
+    }
+
+    #[test]
+    fn test_decode_fmovem_nonpredec_mask_reversed() {
+        // vasm: fmovem fp0/fp1,(a0) -> f210f0c0 (postincrement/control: mask stored reversed)
+        let inst = decode_one(&[0xF2, 0x10, 0xF0, 0xC0], "68040");
+        assert_eq!(inst.mnemonic, "fmovem");
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[0].format(&labels), "fp0-fp1");
+    }
+
+    #[test]
+    fn test_decode_fmovem_mem_to_regs_mask_reversed() {
+        // vasm: fmovem (a0)+,fp0/fp1 -> f218d0c0
+        let inst = decode_one(&[0xF2, 0x18, 0xD0, 0xC0], "68040");
+        assert_eq!(inst.mnemonic, "fmovem");
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[1].format(&labels), "fp0-fp1");
+    }
+
+    #[test]
+    fn test_decode_fmovecr() {
+        // vasm: fmovecr #0,fp0 -> f2005c00
+        let inst = decode_one(&[0xF2, 0x00, 0x5C, 0x00], "68040");
+        assert_eq!(inst.mnemonic, "fmovecr");
+    }
+
+    #[test]
+    fn test_decode_fsincos_reg_reg() {
+        // vasm: fsincos fp1,fp2:fp3 -> f20005b2
+        let inst = decode_one(&[0xF2, 0x00, 0x05, 0xB2], "68040");
+        assert_eq!(inst.mnemonic, "fsincos");
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[0].format(&labels), "fp1");
+        assert_eq!(inst.operands[1].format(&labels), "fp2:fp3");
+    }
+
+    #[test]
+    fn test_decode_fbeq_word() {
+        // vasm: fbeq $1010 (at pc=$1000) -> f281000e
+        let inst = decode_one(&[0xF2, 0x81, 0x00, 0x0E], "68040");
+        assert_eq!(inst.mnemonic, "fbeq");
+        assert_eq!(inst.target_address, Some(0x1010));
+    }
+
+    #[test]
+    fn test_decode_fbeq_long() {
+        // vasm: fbeq.l $1010 (at pc=$1000) -> f2c10000000e
+        let inst = decode_one(&[0xF2, 0xC1, 0x00, 0x00, 0x00, 0x0E], "68040");
+        assert_eq!(inst.mnemonic, "fbeq");
+        assert_eq!(inst.target_address, Some(0x1010));
+    }
+
+    #[test]
+    fn test_decode_fdbeq() {
+        // vasm: fdbeq d0,$1010 (at pc=$1000) -> f2480001000c
+        let inst = decode_one(&[0xF2, 0x48, 0x00, 0x01, 0x00, 0x0C], "68040");
+        assert_eq!(inst.mnemonic, "fdbeq");
+        assert_eq!(inst.target_address, Some(0x1010));
+    }
+
+    #[test]
+    fn test_decode_fseq() {
+        // vasm: fseq d0 -> f2400001
+        let inst = decode_one(&[0xF2, 0x40, 0x00, 0x01], "68040");
+        assert_eq!(inst.mnemonic, "fseq");
+    }
+
+    #[test]
+    fn test_decode_ftrapeq_no_operand() {
+        // vasm: ftrapeq -> f27c0001
+        let inst = decode_one(&[0xF2, 0x7C, 0x00, 0x01], "68040");
+        assert_eq!(inst.mnemonic, "ftrapeq");
+        assert!(inst.operands.is_empty());
+    }
+
+    #[test]
+    fn test_decode_ftrapeq_word() {
+        // vasm: ftrapeq.w #1234 -> f27a000104d2
+        let inst = decode_one(&[0xF2, 0x7A, 0x00, 0x01, 0x04, 0xD2], "68040");
+        assert_eq!(inst.mnemonic, "ftrapeq.w");
+    }
+
+    #[test]
+    fn test_decode_ftrapeq_long() {
+        // vasm: ftrapeq.l #12345678 -> f27b000100bc614e
+        let inst = decode_one(&[0xF2, 0x7B, 0x00, 0x01, 0x00, 0xBC, 0x61, 0x4E], "68040");
+        assert_eq!(inst.mnemonic, "ftrapeq.l");
+    }
+
+    #[test]
+    fn test_decode_fnop() {
+        // vasm: fnop -> f2800000 (encoded as fbf with zero displacement)
+        let inst = decode_one(&[0xF2, 0x80, 0x00, 0x00], "68040");
+        assert_eq!(inst.mnemonic, "fbf");
+    }
+
+    #[test]
+    fn test_decode_fsave() {
+        // vasm: fsave -(a0) -> f320
+        let inst = decode_one(&[0xF3, 0x20], "68040");
+        assert_eq!(inst.mnemonic, "fsave");
+    }
+
+    #[test]
+    fn test_decode_frestore() {
+        // vasm: frestore (a0)+ -> f358
+        let inst = decode_one(&[0xF3, 0x58], "68040");
+        assert_eq!(inst.mnemonic, "frestore");
+    }
+
+    #[test]
+    fn test_decode_fpu_requires_68020_or_later() {
+        let bytes = [0xF2, 0x00, 0x05, 0x22];
+        let mut stream = InstructionStream::new(&bytes, 0x1000);
+        // On 68000, the F-line opcode has no matching pattern and falls back to a data word.
+        let (_addr, result) = decode_next(&mut stream, "68000").unwrap();
+        assert!(matches!(result, DecodeResult::DataWord(_)));
     }
 
     #[test]
