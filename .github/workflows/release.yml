@@ -9,7 +9,15 @@ permissions:
   contents: write
 
 jobs:
+  approve:
+    name: Approve release
+    runs-on: ubuntu-latest
+    environment: release
+    steps:
+      - run: echo "Release approved for ${{ github.ref_name }}"
+
   build-and-release:
+    needs: approve
     strategy:
       matrix:
         include:
