@@ -148,6 +148,14 @@ impl NativeIpfBackend {
     }
 
     /// Decode all sectors from a track's TRCK chunk and cache them.
+    ///
+    /// `track`/`side` are the logical coordinates from the TRCK chunk header
+    /// (used as the public `read_sector` key). The MFM sector headers embed
+    /// the raw Amiga track number instead (`track*2+side`) - that's what
+    /// must be passed to `decode_track` as `expected_track`, since
+    /// `MfmDecoder` compares against the header's raw value directly (see
+    /// `mfm.rs::decode_sector_from_raw` and `uae.rs::decode_track_sectors`,
+    /// which has the same contract for the same reason).
     fn decode_track_sectors(&mut self, track: u32, side: u32) {
         let Some(raw_data) = self.track_chunks.get(&(track, side)) else {
             return;
@@ -158,7 +166,8 @@ impl NativeIpfBackend {
         let Ok(decoder) = MfmDecoder::new(raw_data) else {
             return;
         };
-        let Ok(decoded) = decoder.decode_track(Some(track), Some(side)) else {
+        let raw_track = track * 2 + side;
+        let Ok(decoded) = decoder.decode_track(Some(raw_track), Some(side)) else {
             return;
         };
         for sector in decoded {
@@ -277,6 +286,105 @@ mod tests {
         let path = dir.path().join("nonexistent.ipf");
         let err = NativeIpfBackend::open(&path).unwrap_err();
         assert!(err.0.contains("File not found"));
+    }
+
+    // Regression test for the same track-number/side bug fixed in uae.rs:
+    // decode_track_sectors must pass the raw Amiga track number
+    // (track*2+side) to MfmDecoder, not the TRCK chunk's own logical track
+    // field, since real MFM sector headers encode the combined value.
+    // Built with a real MFM-encoded sector (not the all-zero placeholder
+    // track the other tests here use), which never exercises the
+    // track-number comparison.
+
+    fn encode_mfm_long(value: u32) -> (u32, u32) {
+        let odd = (value & 0xAAAA_AAAA) >> 1;
+        let even = value & 0x5555_5555;
+        (odd, even)
+    }
+
+    fn build_valid_sector(
+        raw_track: u32,
+        sector: u32,
+        sectors_to_end: u32,
+        data: &[u8],
+    ) -> Vec<u8> {
+        const SECTOR_RAW_SIZE: usize = 1088;
+        let mut sector_raw = vec![0u8; SECTOR_RAW_SIZE];
+
+        sector_raw[0..2].copy_from_slice(&0xAAAAu16.to_be_bytes());
+        sector_raw[2..4].copy_from_slice(&0xAAAAu16.to_be_bytes());
+        sector_raw[4..6].copy_from_slice(&0x4489u16.to_be_bytes());
+        sector_raw[6..8].copy_from_slice(&0x4489u16.to_be_bytes());
+
+        let info_value = (0xFFu32 << 24) | (raw_track << 16) | (sector << 8) | sectors_to_end;
+        let (info_odd, info_even) = encode_mfm_long(info_value);
+        sector_raw[0x08..0x0C].copy_from_slice(&info_odd.to_be_bytes());
+        sector_raw[0x0C..0x10].copy_from_slice(&info_even.to_be_bytes());
+
+        let checksum = (info_odd ^ info_even) & 0x5555_5555;
+        let (cksum_odd, cksum_even) = encode_mfm_long(checksum);
+        sector_raw[0x30..0x34].copy_from_slice(&cksum_odd.to_be_bytes());
+        sector_raw[0x34..0x38].copy_from_slice(&cksum_even.to_be_bytes());
+
+        let mut data_odd = vec![0u8; 512];
+        let mut data_even = vec![0u8; 512];
+        for (i, &byte) in data.iter().enumerate() {
+            data_odd[i] = (byte & 0xAA) >> 1;
+            data_even[i] = byte & 0x55;
+        }
+        let mut data_checksum = 0u32;
+        for i in 0..512 / 4 {
+            data_checksum ^= u32::from_be_bytes(data_odd[i * 4..i * 4 + 4].try_into().unwrap());
+            data_checksum ^= u32::from_be_bytes(data_even[i * 4..i * 4 + 4].try_into().unwrap());
+        }
+        data_checksum &= 0x5555_5555;
+        let (data_cksum_odd, data_cksum_even) = encode_mfm_long(data_checksum);
+        sector_raw[0x38..0x3C].copy_from_slice(&data_cksum_odd.to_be_bytes());
+        sector_raw[0x3C..0x40].copy_from_slice(&data_cksum_even.to_be_bytes());
+
+        sector_raw[0x40..0x40 + 512].copy_from_slice(&data_odd);
+        sector_raw[0x240..0x240 + 512].copy_from_slice(&data_even);
+        sector_raw
+    }
+
+    /// Build a TRCK chunk payload: 4-byte (track,side) header followed by a
+    /// raw MFM bitstream keyed by the raw Amiga track number (track*2+side),
+    /// as it would appear in a real capture.
+    fn build_trck_data(track: u32, side: u32, data_byte: u8) -> Vec<u8> {
+        let mut trck = Vec::new();
+        trck.extend_from_slice(&(track as u16).to_be_bytes());
+        trck.extend_from_slice(&(side as u16).to_be_bytes());
+        for _ in 0..20 {
+            trck.extend_from_slice(&0xAAAAu16.to_be_bytes());
+        }
+        let raw_track = track * 2 + side;
+        trck.extend(build_valid_sector(raw_track, 0, 1, &[data_byte; 512]));
+        trck
+    }
+
+    #[test]
+    fn test_read_sector_both_sides_with_real_mfm_headers() {
+        let dir = tempdir();
+        let mut buf = Vec::new();
+        write_chunk(&mut buf, b"CAPS", &[0, 0, 0, 1]);
+        let info_data: Vec<u8> = [80u16, 2, 0, 0]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        write_chunk(&mut buf, b"INFO", &info_data);
+        // track 0, side 0 -> raw_track 0; track 0, side 1 -> raw_track 1.
+        write_chunk(&mut buf, b"TRCK", &build_trck_data(0, 0, 0x11));
+        write_chunk(&mut buf, b"TRCK", &build_trck_data(0, 1, 0x22));
+        let path = dir.path().join("test.ipf");
+        std::fs::write(&path, buf).unwrap();
+
+        let mut reader = NativeIpfBackend::open(&path).unwrap();
+
+        let side0 = reader.read_sector(0, 0, 0).unwrap();
+        assert_eq!(side0, vec![0x11u8; 512]);
+
+        let side1 = reader.read_sector(0, 1, 0).unwrap();
+        assert_eq!(side1, vec![0x22u8; 512]);
     }
 
     fn tempdir() -> TempDir {

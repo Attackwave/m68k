@@ -1,6 +1,6 @@
 //! Shared primitives used by both the m68k assembler and disassembler:
 //! tokenizing, expression ASTs, effective-address category constraints,
-//! the opcode table, float encoding, and error types.
+//! the opcode table, and error types.
 //!
 //! This crate has no dependency on `m68k-asm` or `m68k-disasm` — it exists
 //! so both can share the parsing/encoding building blocks that don't differ
@@ -15,7 +15,6 @@ pub mod amiga_hunk;
 pub mod ea_categories;
 pub mod errors;
 pub mod expr;
-pub mod floats;
 pub mod opcodes;
 pub mod operands;
 pub mod tokens;
