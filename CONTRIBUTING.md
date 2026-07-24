@@ -60,3 +60,9 @@ If you add new instruction definitions or parsing rules, you **must** add corres
 3. Push your branch to your fork.
 4. Open a Pull Request against our `main` branch.
 5. Provide a description of the changes in the PR template.
+
+### 6. Branch & Release Protections
+
+- `main` is a protected branch: all changes, including from maintainers, land via a Pull Request. Direct pushes are rejected, and the PR's CI check (`build`) must pass before merging.
+- Release tags (`v*`) are protected once pushed: they cannot be deleted or force-moved to a different commit.
+- Publishing release binaries for a new tag requires manual maintainer approval (a GitHub Environment gate) before the build workflow runs, in addition to CI passing on the commit being tagged.
