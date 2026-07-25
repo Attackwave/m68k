@@ -93,19 +93,6 @@ pub fn tokenize(line: &str) -> Vec<Token> {
             continue;
         }
 
-        // Character literal
-        if ch == '\'' && i + 2 < chars.len() && chars[i + 2] == '\'' {
-            let text: String = chars[i..i + 3].iter().collect();
-            tokens.push(Token::new(
-                TokenKind::Char,
-                text,
-                Some(chars[i + 1] as u64),
-                col,
-            ));
-            i += 3;
-            continue;
-        }
-
         // Hex ($FF)
         if ch == '$' && i + 1 < chars.len() && chars[i + 1].is_ascii_hexdigit() {
             let start = i;

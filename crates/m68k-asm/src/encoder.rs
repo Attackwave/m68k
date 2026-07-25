@@ -73,8 +73,28 @@ fn fpu_short_cmd(mnemonic: &str) -> Option<u16> {
     })
 }
 
+/// Extract a branch target address from any operand variant
+/// `parse_operand_text` can produce for a plain numeric-or-label operand.
+/// FBcc/FDBcc previously matched only `Operand::Address`, but a label that
+/// resolves during parsing (rather than falling through to the
+/// forward-reference placeholder) comes back as `AbsoluteShort`/
+/// `AbsoluteLong`/`Memory` instead — the same set `encode_branch`/
+/// `encode_dbcc_branch` in assembler.rs already handle for plain
+/// Bcc/DBcc. Without this, `FBEQ label`/`FDBEQ D0,label` failed with
+/// "requires an address operand" for any already-resolvable label.
+fn branch_target_address(op: &Operand) -> Option<i64> {
+    match op {
+        Operand::Address(t) => Some(*t),
+        Operand::Immediate(t) => Some(*t),
+        Operand::Memory(t) => Some(*t),
+        Operand::AbsoluteShort(t) => Some(*t as i64),
+        Operand::AbsoluteLong(t) => Some(*t as i64),
+        _ => None,
+    }
+}
+
 /// FPU condition-code value (0-31), by condition mnemonic suffix (e.g. "EQ", "OGT", "F").
-fn fpu_cc(cond: &str) -> Option<u16> {
+pub(crate) fn fpu_cc(cond: &str) -> Option<u16> {
     Some(match cond {
         "F" => 0x00,
         "EQ" => 0x01,
@@ -146,7 +166,7 @@ pub fn encode_instruction(
         // Branch instructions
         "BRA" => {
             if let Some(Operand::Address(t)) = dst {
-                enc_bra(*t as i32, pc + 2)
+                enc_bra(*t as i32, pc + 2, cpu)
             } else {
                 Err(AsmError::new("BRA requires address operand"))
             }
@@ -184,7 +204,7 @@ pub fn encode_instruction(
                         )));
                     }
                 };
-                enc_bcc(cond, *t as i32, pc + 2)
+                enc_bcc(cond, *t as i32, pc + 2, cpu)
             } else {
                 Err(AsmError::new("Bcc requires address operand"))
             }
@@ -915,8 +935,8 @@ pub fn encode_instruction(
         // FBcc: FBEQ, FBOGT, FBUN, ... (32 condition codes)
         _ if mnemonic.starts_with("FB") && fpu_cc(&mnemonic[2..]).is_some() => {
             let cc = fpu_cc(&mnemonic[2..]).unwrap();
-            match dst.or(src) {
-                Some(Operand::Address(t)) => enc_fbcc(cc, *t, pc + 2, size),
+            match dst.or(src).and_then(branch_target_address) {
+                Some(t) => enc_fbcc(cc, t, pc + 2, size),
                 _ => Err(AsmError::new(format!(
                     "{} requires an address operand",
                     mnemonic
@@ -927,10 +947,8 @@ pub fn encode_instruction(
         // FDBcc: FDBEQ, FDBOGT, ... (32 condition codes)
         _ if mnemonic.starts_with("FDB") && fpu_cc(&mnemonic[3..]).is_some() => {
             let cc = fpu_cc(&mnemonic[3..]).unwrap();
-            match (src, dst) {
-                (Some(Operand::DataReg(rn)), Some(Operand::Address(t))) => {
-                    enc_fdbcc(cc, *rn, *t, pc + 4)
-                }
+            match (src, dst.and_then(branch_target_address)) {
+                (Some(Operand::DataReg(rn)), Some(t)) => enc_fdbcc(cc, *rn, t, pc + 4),
                 _ => Err(AsmError::new(format!(
                     "{} requires Dn and an address operand",
                     mnemonic
@@ -1242,12 +1260,12 @@ mod tests {
     fn test_encode_bra() {
         let dst = Operand::Address(0x100);
         let words = encode_instruction("BRA", None, None, Some(&dst), 0xFE, "68000").unwrap();
-        // PC after opword = 0xFE + 2 = 0x100, disp = 0x100 - 0x100 = 0
-        // Wait: target=0x100, pc=0xFE
-        // pc passed to enc_bra = pc + 2 = 0x100
-        // disp = 0x100 - 0x100 = 0
-        // op = 0x6000 | 0 = 0x6000
-        assert_eq!(words, vec![0x6000]);
+        // PC after opword = 0xFE + 2 = 0x100, disp = 0x100 - 0x100 = 0.
+        // disp==0's low byte (0x00) is the reserved word-displacement-form
+        // marker, so this must NOT encode as the 1-word short form (which
+        // would be indistinguishable from BRA.w with a 0 low byte to the
+        // CPU) — it must fall through to the explicit word form instead.
+        assert_eq!(words, vec![0x6000, 0x0000]);
     }
 
     #[test]

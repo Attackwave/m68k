@@ -210,6 +210,21 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
     if hunk_count == 0 || (last_hunk as usize) + 1 != hunk_count {
         return Err(HunkError::new("inconsistent hunk count in HUNK_HEADER"));
     }
+    // hunk_count comes straight from the file with no upper bound of its
+    // own; the last_hunk+1==hunk_count check above doesn't help since
+    // last_hunk is attacker-controlled too. Each hunk needs at least one
+    // size longword (4 bytes) in the table that follows, so hunk_count
+    // can never legitimately exceed the file's remaining length — a
+    // crafted `hunk_count = 0xFFFFFFFF` previously drove
+    // `Vec::with_capacity(hunk_count)` (a 16 GB `Vec<u32>` allocation)
+    // before the first per-entry `u32()` read would have failed anyway.
+    if hunk_count > data.len() {
+        return Err(HunkError::new(format!(
+            "hunk count {} exceeds file size {}",
+            hunk_count,
+            data.len()
+        )));
+    }
 
     let mut hunk_sizes = Vec::with_capacity(hunk_count);
     for _ in 0..hunk_count {
@@ -220,6 +235,20 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
             r.u32()?;
         }
         hunk_sizes.push((raw & 0x3FFF_FFFF) * 4);
+    }
+    // Likewise, each hunk's own size (in longwords, so already x4 above)
+    // is attacker-controlled — the loop below allocates one Vec<u8> per
+    // hunk of exactly that size, so bound the *sum* against the file
+    // size before doing so (a single oversized hunk, or many moderate
+    // ones summing past the file, would otherwise still allocate up to
+    // 4 GB per hunk).
+    let total_hunk_bytes: u64 = hunk_sizes.iter().map(|&s| s as u64).sum();
+    if total_hunk_bytes > data.len() as u64 {
+        return Err(HunkError::new(format!(
+            "total hunk size {} exceeds file size {}",
+            total_hunk_bytes,
+            data.len()
+        )));
     }
 
     let mut offsets = Vec::with_capacity(hunk_count);
@@ -388,6 +417,40 @@ mod tests {
     fn rejects_non_hunk_data() {
         let err = read_hunk_executable(&[0, 0, 0, 0], 0x1000).unwrap_err();
         assert!(err.0.contains("HUNK_HEADER"));
+    }
+
+    /// Regression: `hunk_count` came straight from the file with no
+    /// upper bound, previously driving `Vec::with_capacity(hunk_count)`
+    /// (a 16 GB `Vec<u32>` for `hunk_count = 0xFFFFFFFF`) before the
+    /// first per-entry read would have failed anyway.
+    #[test]
+    fn rejects_absurd_hunk_count() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x00, 0x00, 0x03, 0xf3]); // HUNK_HEADER magic
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // empty resident-library list
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // hunk_count: absurd
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // first_hunk
+        buf.extend_from_slice(&0xFFFF_FFFEu32.to_be_bytes()); // last_hunk (consistent with hunk_count)
+
+        let err = read_hunk_executable(&buf, 0x1000).unwrap_err();
+        assert!(err.0.contains("hunk count"), "unexpected error: {}", err.0);
+    }
+
+    /// Regression: each hunk's own size (attacker-controlled, read from
+    /// the file) previously drove `vec![0u8; s as usize]` per hunk with
+    /// no bound against the actual file size.
+    #[test]
+    fn rejects_hunk_size_exceeding_file_length() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x00, 0x00, 0x03, 0xf3]); // HUNK_HEADER magic
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // empty resident-library list
+        buf.extend_from_slice(&1u32.to_be_bytes()); // hunk_count = 1
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // first_hunk
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // last_hunk
+        buf.extend_from_slice(&0x0FFF_FFFFu32.to_be_bytes()); // hunk size: ~4GB in longwords
+
+        let err = read_hunk_executable(&buf, 0x1000).unwrap_err();
+        assert!(err.0.contains("hunk size"), "unexpected error: {}", err.0);
     }
 
     #[test]

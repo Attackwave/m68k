@@ -63,6 +63,9 @@ impl UaeExtendedBackend {
         }
 
         let track_data_base = 12 + num_entries as u64 * 12;
+        let file_len = file
+            .seek(SeekFrom::End(0))
+            .map_err(|e| FloppyError::new(e.to_string()))?;
 
         let mut table_data = vec![0u8; num_entries as usize * 12];
         file.seek(SeekFrom::Start(12))
@@ -82,6 +85,17 @@ impl UaeExtendedBackend {
             // misread as a non-MFM track and silently dropped.
             let track_type = table_data[base + 3];
             let size = u32::from_be_bytes(table_data[base + 4..base + 8].try_into().unwrap());
+            // num_entries is capped at 200 above, but each entry's own
+            // size is read straight from the file with no bound — a
+            // crafted table previously drove `vec![0u8; entry.size as
+            // usize]` below up to 4 GB per track before read_exact would
+            // have failed anyway. Reject up front instead.
+            if file_offset.saturating_add(size as u64) > file_len {
+                return Err(FloppyError::new(format!(
+                    "track entry {} size {} exceeds file length (offset {}, file len {})",
+                    i, size, file_offset, file_len
+                )));
+            }
             entries.push(TrackEntry {
                 track_type,
                 size,
@@ -220,6 +234,28 @@ mod tests {
         let path = dir.join("test.adf");
         std::fs::write(&path, buf).unwrap();
         path
+    }
+
+    /// Regression: a track table entry claiming a size far larger than
+    /// the rest of the file (num_entries is capped at 200, but each
+    /// entry's own size wasn't) previously drove an unbounded
+    /// `vec![0u8; entry.size as usize]` allocation — up to 4 GB per track
+    /// — before the inevitable `read_exact` failure.
+    #[test]
+    fn test_track_size_exceeding_file_length_is_rejected() {
+        let dir = tempdir();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"UAE-1ADF");
+        buf.extend_from_slice(&1u32.to_be_bytes()); // num_entries = 1
+        buf.extend_from_slice(&1u32.to_be_bytes()); // type = 1 (raw MFM)
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // size: absurd
+        buf.extend_from_slice(&24u32.to_be_bytes()); // file_offset
+        buf.extend_from_slice(&[0u8; 8]); // a few real bytes, nowhere near declared size
+        let path = dir.path().join("evil.adf");
+        std::fs::write(&path, &buf).unwrap();
+
+        let result = UaeExtendedBackend::open(&path);
+        assert!(result.is_err());
     }
 
     #[test]

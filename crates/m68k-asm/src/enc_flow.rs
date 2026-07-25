@@ -35,16 +35,28 @@ fn cond_code(name: &str) -> Result<u8, AsmError> {
 }
 
 /// Encode Bcc instruction.
-pub fn enc_bcc(cond: &str, target: i32, pc: u32) -> Result<Vec<u16>, AsmError> {
+pub fn enc_bcc(cond: &str, target: i32, pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
     let cc = cond_code(cond)?;
     let disp = target.wrapping_sub(pc as i32);
 
-    if (-127..=127).contains(&disp) {
+    // disp==0 (low byte 0x00) and disp==-1 (low byte 0xFF) are reserved:
+    // 0x00 signals the 16-bit word-displacement form and 0xFF signals the
+    // 68020+ 32-bit form, so a genuine short displacement of exactly those
+    // values must be promoted to the word form instead of colliding with
+    // those markers. Byte range is -128..=127; the low bound is included.
+    if (-128..=127).contains(&disp) && disp != 0 && disp != -1 {
         let op = 0x6000 | ((cc as u16) << 8) | ((disp as u8) as u16);
         Ok(vec![op])
     } else if (-32768..=32767).contains(&disp) {
         let op = 0x6000 | ((cc as u16) << 8);
         Ok(vec![op, (disp & 0xFFFF) as u16])
+    } else if cpu == "68000" {
+        // The 32-bit long-displacement form below is 68020+ only. Without
+        // this check, a Bcc target more than 32KB away on `--cpu 68000`
+        // silently emitted the 68020 encoding instead of an error.
+        Err(AsmError::new(
+            "Bcc displacement out of range for 68000 (target > 32KB away requires 68020+)",
+        ))
     } else {
         // 68020+ long displacement: low byte 0xFF marks the 32-bit form (0x00
         // marks the 16-bit form above), immediately followed by the 32-bit
@@ -60,15 +72,16 @@ pub fn enc_bcc(cond: &str, target: i32, pc: u32) -> Result<Vec<u16>, AsmError> {
 }
 
 /// Encode BRA instruction.
-pub fn enc_bra(target: i32, pc: u32) -> Result<Vec<u16>, AsmError> {
-    enc_bcc("t", target, pc)
+pub fn enc_bra(target: i32, pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
+    enc_bcc("t", target, pc, cpu)
 }
 
 /// Encode BSR instruction.
 pub fn enc_bsr(target: i32, pc: u32) -> Result<Vec<u16>, AsmError> {
     let disp = target.wrapping_sub(pc as i32);
 
-    if (-127..=127).contains(&disp) {
+    // See enc_bcc above: disp==0/-1 collide with the word/long form markers.
+    if (-128..=127).contains(&disp) && disp != 0 && disp != -1 {
         let op = 0x6100 | ((disp as u8) as u16);
         Ok(vec![op])
     } else if (-32768..=32767).contains(&disp) {
@@ -165,7 +178,7 @@ pub fn enc_illegal() -> Result<Vec<u16>, AsmError> {
 /// Encode LEA instruction.
 pub fn enc_lea(src: &Operand, dst_reg: u8, pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
     // LEA allows: (An), (d16,An), (d32,An), (bd,An,Xn), ABSW, ABSL, (d16,PC), (bd,PC,Xn)
-    let allowed = AREG_IND | AINDEXED | ABSW | ABSL | PCDISP | PCINDEXED;
+    let allowed = AREG_IND | AREG_DISP | AINDEXED | ABSW | ABSL | PCDISP | PCINDEXED;
     let (src_mode, src_reg, src_ext) = encode_ea(src, "w", pc, allowed, cpu)?;
     let op = 0x41C0 | ((dst_reg as u16) << 9) | ((src_mode as u16) << 3) | (src_reg as u16);
     let mut words = vec![op];
@@ -175,7 +188,7 @@ pub fn enc_lea(src: &Operand, dst_reg: u8, pc: u32, cpu: &str) -> Result<Vec<u16
 
 /// Encode PEA instruction.
 pub fn enc_pea(src: &Operand, pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    let allowed = AREG_IND | AINDEXED | ABSW | ABSL | PCDISP | PCINDEXED;
+    let allowed = AREG_IND | AREG_DISP | AINDEXED | ABSW | ABSL | PCDISP | PCINDEXED;
     let (src_mode, src_reg, src_ext) = encode_ea(src, "w", pc, allowed, cpu)?;
     let op = 0x4840 | ((src_mode as u16) << 3) | (src_reg as u16);
     let mut words = vec![op];
@@ -437,10 +450,19 @@ pub fn enc_subq(
     crate::enc_math::enc_quick(data, dst, size, pc, false, cpu)
 }
 
+/// ADDA/SUBA/CMPA size opmode bit (bit 8): the base opcodes below already
+/// encode the word opmode (0b011) in bits 7-6, so only the long form needs
+/// an extra bit set (0b111) — unlike MOVE, whose size lives entirely in
+/// bits 13-12. A prior version shifted the size into bits 13-12 instead,
+/// which for `.l` produced a completely different (and for SUBA.L, an
+/// entirely different *instruction*: 0x90C0|0x2000 = 0xB0C0 = CMPA) opcode.
+fn areg_size_opmode_bit(size: &str) -> u16 {
+    if size == "l" { 0x0100 } else { 0x0000 }
+}
+
 /// Encode ADDA instruction (immediate).
 pub fn enc_adda_imm(value: i64, reg: u8, size: &str) -> Result<Vec<u16>, AsmError> {
-    let sz = if size == "l" { 3 } else { 1 };
-    let op = 0xD0FC | ((reg as u16) << 9) | ((sz as u16) << 12);
+    let op = 0xD0FC | ((reg as u16) << 9) | areg_size_opmode_bit(size);
     if size == "l" {
         Ok(vec![
             op,
@@ -452,7 +474,8 @@ pub fn enc_adda_imm(value: i64, reg: u8, size: &str) -> Result<Vec<u16>, AsmErro
     }
 }
 
-/// Encode ADDA instruction (EA).
+/// Encode ADDA instruction (EA). Source EA accepts any addressing mode
+/// (including address registers), per the M68000PRM ADDA table.
 pub fn enc_adda_ea(
     src: &Operand,
     reg: u8,
@@ -460,18 +483,20 @@ pub fn enc_adda_ea(
     pc: u32,
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
-    let sz = if size == "l" { 3 } else { 1 };
-    let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, DATA, cpu)?;
-    let op = 0xD0C0 | ((reg as u16) << 9) | ((src_mode as u16) << 3) | (src_reg as u16);
-    let mut words = vec![op | ((sz as u16 - 1) << 12)];
+    let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, ALL, cpu)?;
+    let op = 0xD0C0
+        | ((reg as u16) << 9)
+        | areg_size_opmode_bit(size)
+        | ((src_mode as u16) << 3)
+        | (src_reg as u16);
+    let mut words = vec![op];
     words.extend(src_ext);
     Ok(words)
 }
 
 /// Encode SUBA instruction (immediate).
 pub fn enc_suba_imm(value: i64, reg: u8, size: &str) -> Result<Vec<u16>, AsmError> {
-    let sz = if size == "l" { 3 } else { 1 };
-    let op = 0x90FC | ((reg as u16) << 9) | ((sz as u16) << 12);
+    let op = 0x90FC | ((reg as u16) << 9) | areg_size_opmode_bit(size);
     if size == "l" {
         Ok(vec![
             op,
@@ -483,7 +508,8 @@ pub fn enc_suba_imm(value: i64, reg: u8, size: &str) -> Result<Vec<u16>, AsmErro
     }
 }
 
-/// Encode SUBA instruction (EA).
+/// Encode SUBA instruction (EA). Source EA accepts any addressing mode
+/// (including address registers), per the M68000PRM SUBA table.
 pub fn enc_suba_ea(
     src: &Operand,
     reg: u8,
@@ -491,10 +517,13 @@ pub fn enc_suba_ea(
     pc: u32,
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
-    let sz = if size == "l" { 3 } else { 1 };
-    let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, DATA, cpu)?;
-    let op = 0x90C0 | ((reg as u16) << 9) | ((src_mode as u16) << 3) | (src_reg as u16);
-    let mut words = vec![op | ((sz as u16 - 1) << 12)];
+    let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, ALL, cpu)?;
+    let op = 0x90C0
+        | ((reg as u16) << 9)
+        | areg_size_opmode_bit(size)
+        | ((src_mode as u16) << 3)
+        | (src_reg as u16);
+    let mut words = vec![op];
     words.extend(src_ext);
     Ok(words)
 }
@@ -694,6 +723,8 @@ pub fn enc_cmp(
 }
 
 /// Encode CMPA instruction.
+/// Encode CMPA instruction. Source EA accepts any addressing mode
+/// (including address registers), per the M68000PRM CMPA table.
 pub fn enc_cmpa(
     src: &Operand,
     reg: u8,
@@ -701,10 +732,13 @@ pub fn enc_cmpa(
     pc: u32,
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
-    let sz = if size == "l" { 3 } else { 1 };
-    let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, DATA, cpu)?;
-    let op = 0xB0C0 | ((reg as u16) << 9) | ((src_mode as u16) << 3) | (src_reg as u16);
-    let mut words = vec![op | ((sz as u16 - 1) << 12)];
+    let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, ALL, cpu)?;
+    let op = 0xB0C0
+        | ((reg as u16) << 9)
+        | areg_size_opmode_bit(size)
+        | ((src_mode as u16) << 3)
+        | (src_reg as u16);
+    let mut words = vec![op];
     words.extend(src_ext);
     Ok(words)
 }
@@ -948,13 +982,13 @@ mod tests {
     #[test]
     fn test_bra_byte() {
         // BRA.S label with disp=-2 (0xFE = -2)
-        let words = enc_bra(0x100, 0x102).unwrap();
+        let words = enc_bra(0x100, 0x102, "68000").unwrap();
         assert_eq!(words, vec![0x60FE]);
     }
 
     #[test]
     fn test_bne_word() {
-        let words = enc_bcc("ne", 0x200, 0x102).unwrap();
+        let words = enc_bcc("ne", 0x200, 0x102, "68000").unwrap();
         assert_eq!(words, vec![0x6600, 0x00FE]);
     }
 
@@ -969,8 +1003,16 @@ mod tests {
         // vasm: bra.l far (disp32=0x13886 in the corresponding assembler test) uses
         // opword 0x60FF (low byte 0xFF marks the 32-bit form) followed directly by
         // the 32-bit displacement, with no padding word.
-        let words = enc_bcc("t", 0x20000, 0x1002).unwrap();
+        let words = enc_bcc("t", 0x20000, 0x1002, "68020").unwrap();
         assert_eq!(words, vec![0x60FF, 0x0001, 0xEFFE]);
+    }
+
+    /// Regression: a Bcc target more than 32KB away previously silently
+    /// emitted the 68020+ 32-bit displacement form even when targeting
+    /// plain 68000, which has no such encoding.
+    #[test]
+    fn test_bcc_long_displacement_rejected_on_68000() {
+        assert!(enc_bcc("t", 0x20000, 0x1002, "68000").is_err());
     }
 
     #[test]

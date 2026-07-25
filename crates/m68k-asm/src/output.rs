@@ -375,10 +375,21 @@ impl IntelHexWriter {
             let extended_addr = (addr >> 16) & 0xFFFF;
             if extended_addr != self.current_extended_addr {
                 self.current_extended_addr = extended_addr;
+                // Type-04 (Extended Linear Address) record layout:
+                // byte_count=0x02, address field=0x0000 (unused/reserved
+                // for this record type), record_type=0x04, and the ULBA
+                // itself is the record's 2-byte *data* payload — not part
+                // of the address field. Previously the ULBA was passed as
+                // `compute_hex_checksum`'s `address` parameter with an
+                // empty data slice, so the checksum never covered the
+                // ULBA bytes actually written into the record string,
+                // producing a record whose checksum doesn't match a
+                // standards-conformant reader's recomputation.
+                let ulba_bytes = [(extended_addr >> 8) as u8, (extended_addr & 0xFF) as u8];
                 let record = format!(
                     ":02000004{:04X}{:02X}",
                     extended_addr,
-                    compute_hex_checksum(0x02, 0x0000, 0x04, &[])
+                    compute_hex_checksum(0x02, 0x0000, 0x04, &ulba_bytes)
                 );
                 self.records.push(record);
             }
@@ -961,6 +972,18 @@ mod tests {
 
         let output = generate_intel_hex(&instructions);
         assert!(output.contains("04")); // Extended address record type
+
+        // Regression: the type-04 record's checksum previously didn't
+        // cover the ULBA bytes actually written into the record string
+        // (they were passed as compute_hex_checksum's unused `address`
+        // parameter instead of as `data`), so the checksum was wrong for
+        // any nonzero ULBA. For ULBA=0x0001: sum = 0x02+0x00+0x00+0x04
+        // +0x00+0x01 = 0x07, checksum = (~0x07+1) & 0xFF = 0xF9.
+        assert!(
+            output.lines().any(|l| l == ":020000040001F9"),
+            "expected extended-address record with correct checksum, got:\n{}",
+            output
+        );
     }
 
     #[test]

@@ -157,6 +157,24 @@ impl SymbolTable {
         );
     }
 
+    /// Like [`Self::force_set`], but also records the defining section
+    /// (see [`Self::define_in_section`]) — used by branch relaxation, which
+    /// re-derives every label's PC from scratch on each iteration and must
+    /// preserve section tracking across those overwrites.
+    pub fn force_set_in_section(
+        &mut self,
+        name: &str,
+        value: u32,
+        line_no: Option<usize>,
+        section: Option<&str>,
+    ) {
+        self.symbols.insert(
+            name.to_string(),
+            SymbolEntry::new(name.to_string(), value, true, line_no)
+                .with_section(section.map(|s| s.to_string())),
+        );
+    }
+
     /// Iterate over all defined symbols.
     pub fn iter(&self) -> impl Iterator<Item = (&String, &SymbolEntry)> {
         self.symbols.iter()
@@ -240,10 +258,9 @@ pub struct BranchInfo {
     pub instr_index: usize,
     /// Branch mnemonic (BRA, BSR, Bcc, DBcc).
     pub mnemonic: String,
-    /// Target symbol name (if symbolic).
-    pub target_symbol: Option<String>,
-    /// Target address (if absolute).
-    pub target_address: Option<u32>,
+    /// Raw target operand text (label or expression), re-evaluated against
+    /// the symbol table on each relaxation iteration.
+    pub target_text: Option<String>,
     /// Current size hint.
     pub size_hint: BranchSize,
     /// Source line number.
@@ -1330,9 +1347,51 @@ impl Assembler {
     /// Also handles END directive (strips remaining source) and
     /// repetitive constructs.
     /// Returns expanded source text.
+    /// Expand macros, REPT/IRP/IRPC, etc. Runs [`Self::macro_preprocess_pass`]
+    /// repeatedly: a single pass only expands invocations of macros already
+    /// known at the point they're scanned, so a macro that calls another
+    /// macro previously came out as a literal "unknown mnemonic" error —
+    /// the body of the outer macro was substituted in but never re-scanned
+    /// for invocations of its own. Bounded by MAX_MACRO_EXPANSION_DEPTH
+    /// (rather than iterating until the output stops changing) as the
+    /// termination guard against runaway/self-recursive macro expansion,
+    /// since comparing successive outputs for equality doesn't by itself
+    /// distinguish "fully expanded" from "still changing forever".
     fn macro_preprocess(&mut self, source: &str) -> String {
+        const MAX_MACRO_EXPANSION_DEPTH: usize = 64;
+        // Definitions must persist across passes, not just within one:
+        // a macro's `MACRO...ENDM` block is consumed (removed from the
+        // text) by the pass that defines it, so a later pass re-scanning
+        // the *expanded* body for further invocations has no text left
+        // to rediscover that definition from — it must still be in
+        // self.macro_definitions from the pass that originally parsed it.
         self.macro_definitions.clear();
         self.macro_unique_counter = 0;
+        let mut current = source.to_string();
+        for _ in 0..MAX_MACRO_EXPANSION_DEPTH {
+            let (next, any_macro_invoked) = self.macro_preprocess_pass(&current);
+            if !any_macro_invoked {
+                return next;
+            }
+            current = next;
+        }
+        self.errors.warning(
+            format!(
+                "macro expansion did not terminate within {} passes (possible unbounded recursion)",
+                MAX_MACRO_EXPANSION_DEPTH
+            ),
+            None,
+        );
+        current
+    }
+
+    /// Single pass of macro/REPT/IRP/IRPC expansion. Returns the expanded
+    /// source and whether any macro invocation (not REPT/IRP/IRPC, which
+    /// don't need a further pass since they don't introduce new macro
+    /// definitions) was expanded, so the caller knows whether another pass
+    /// could find newly-exposed invocations.
+    fn macro_preprocess_pass(&mut self, source: &str) -> (String, bool) {
+        let mut any_macro_invoked = false;
         let mut output = Vec::new();
         let lines: Vec<&str> = source.lines().collect();
         let mut i = 0;
@@ -1518,6 +1577,7 @@ impl Assembler {
                 && let Some(def) = self.macro_definitions.get(&mnemonic1.to_lowercase())
             {
                 // Expand macro
+                any_macro_invoked = true;
                 self.macro_unique_counter += 1;
                 let unique_id = self.macro_unique_counter;
 
@@ -1568,7 +1628,7 @@ impl Assembler {
             i += 1;
         }
 
-        output.join("\n")
+        (output.join("\n"), any_macro_invoked)
     }
 
     /// Run the two-pass assembly process.
@@ -1718,11 +1778,18 @@ impl Assembler {
                 if is_branch {
                     // Estimate with word-sized branch (conservative)
                     let estimated_size = estimate_branch_size(mnemonic);
+                    // DBcc takes `Dn,label`, so the target text is the
+                    // second operand; plain Bcc/BRA/BSR take the target
+                    // as their only operand.
+                    let target_text = if is_dbcc_mnemonic(mnemonic) {
+                        operand_texts.get(1).cloned()
+                    } else {
+                        operand_texts.first().cloned()
+                    };
                     self.branches.push(BranchInfo {
                         instr_index: self.code.len(),
                         mnemonic: mnemonic.clone(),
-                        target_symbol: None, // Will be resolved in pass 2
-                        target_address: None,
+                        target_text,
                         size_hint: BranchSize::Any,
                         line_no: Some(line.line_no),
                     });
@@ -1767,9 +1834,12 @@ impl Assembler {
                 handle_set(label, args, &mut self.symbols, self.pc, line_no).map(|_| 0)
             }
             "dc" => {
-                // DC.B/W/L - estimate based on size and count
+                // DC.B/W/L - must match encode_dc's byte counting exactly,
+                // since a diverging estimate here desyncs every label that
+                // follows (Pass 1 previously counted string/char literal
+                // *arguments* instead of the bytes they expand to).
                 let size_suffix = args.first().map(|s| s.as_str()).unwrap_or("w");
-                let element_size = match size_suffix {
+                let element_size: u32 = match size_suffix {
                     "b" => 1,
                     "w" => 2,
                     "l" => 4,
@@ -1778,15 +1848,31 @@ impl Assembler {
                     "x" | "p" => 12,
                     _ => 2,
                 };
-                let count = (args.len() - 1).max(1) as u32;
-                let total = element_size * count;
+                let values = if args.len() > 1 { &args[1..] } else { &[] };
+                let mut total: u32 = 0;
+                for value_str in values {
+                    let trimmed = value_str.trim();
+                    if matches!(size_suffix, "s" | "d" | "x" | "p") {
+                        total = total.saturating_add(element_size);
+                    } else if trimmed.starts_with('"') || trimmed.starts_with('\'') {
+                        let bytes = crate::directives::parse_dc_string(trimmed).map_err(|e| {
+                            AsmError::with_line(format!("invalid DC string: {}", e), line_no)
+                        })?;
+                        total = total.saturating_add(bytes.len() as u32);
+                    } else {
+                        total = total.saturating_add(element_size);
+                    }
+                }
                 // Align to word boundary
-                Ok((total + 1) & !1)
+                Ok(total.saturating_add(1) & !1)
             }
             "ds" => {
-                // DS.B/W/L - reserve space
+                // DS.B/W/L - reserve space. Must match encode_ds exactly:
+                // that function does NOT round up to an even address, so
+                // this estimate mustn't either (a prior mismatch here made
+                // every label after an odd-sized DS.B off by one byte).
                 let size_suffix = args.first().map(|s| s.as_str()).unwrap_or("w");
-                let element_size = match size_suffix {
+                let element_size: u32 = match size_suffix {
                     "b" => 1,
                     "w" => 2,
                     "l" => 4,
@@ -1797,8 +1883,10 @@ impl Assembler {
                 } else {
                     1
                 };
-                let total = element_size * count;
-                Ok((total + 1) & !1)
+                let total = element_size
+                    .checked_mul(count)
+                    .ok_or_else(|| AsmError::with_line("DS size too large", line_no))?;
+                Ok(total)
             }
             "even" => {
                 // Pad to even address if needed
@@ -1843,7 +1931,7 @@ impl Assembler {
             }
             "dcb" => {
                 let size_suffix = args.first().map(|s| s.as_str()).unwrap_or("w");
-                let element_size = match size_suffix {
+                let element_size: u32 = match size_suffix {
                     "b" => 1,
                     "w" => 2,
                     "l" => 4,
@@ -1854,8 +1942,10 @@ impl Assembler {
                 } else {
                     0
                 };
-                let total = element_size * count;
-                Ok((total + 1) & !1)
+                let total = element_size
+                    .checked_mul(count)
+                    .ok_or_else(|| AsmError::with_line("DCB size too large", line_no))?;
+                Ok(total.saturating_add(1) & !1)
             }
             "end" => Ok(0),
             "fail" => {
@@ -1958,13 +2048,31 @@ impl Assembler {
         size: Option<&str>,
         operand_texts: &[String],
     ) -> Result<u32, AsmError> {
+        // `Operand::Address(0)` is parse_operand_text's fallback for a bare
+        // symbol it couldn't resolve yet (undefined forward reference) — it
+        // is NOT a real "address 0" operand. Widening it to AbsoluteLong
+        // here forces the conservative (largest) EA encoding size during
+        // estimation; without this, a forward-referenced symbol that later
+        // resolves above 0xFFFF silently grows by 2 bytes in pass 2 and
+        // desyncs every label after it (the value 0 always fits in the
+        // short/Absolute.W encoding, so pass 1 would otherwise underestimate).
+        let widen_forward_ref = |op: Operand| -> Operand {
+            match op {
+                Operand::Address(0) => Operand::AbsoluteLong(0),
+                other => other,
+            }
+        };
         let src = if !operand_texts.is_empty() {
-            parse_operand_text(&operand_texts[0], &self.symbols, self.pc).ok()
+            parse_operand_text(&operand_texts[0], &self.symbols, self.pc)
+                .ok()
+                .map(widen_forward_ref)
         } else {
             None
         };
         let dst = if operand_texts.len() > 1 {
-            parse_operand_text(&operand_texts[1], &self.symbols, self.pc).ok()
+            parse_operand_text(&operand_texts[1], &self.symbols, self.pc)
+                .ok()
+                .map(widen_forward_ref)
         } else {
             None
         };
@@ -2011,18 +2119,22 @@ impl Assembler {
 
             // Check each branch (use index to avoid borrow conflicts)
             for i in 0..self.branches.len() {
-                let (mnemonic, line_no, size_hint) = {
+                let (mnemonic, line_no, size_hint, target_text) = {
                     let b = &self.branches[i];
-                    (b.mnemonic.clone(), b.line_no, b.size_hint)
+                    (
+                        b.mnemonic.clone(),
+                        b.line_no,
+                        b.size_hint,
+                        b.target_text.clone(),
+                    )
                 };
-                let target_addr = if let Some(ref symbol) = self.branches[i].target_symbol {
-                    self.symbols.resolve(symbol).ok()
-                } else {
-                    self.branches[i].target_address
-                };
+                let branch_pc = self.get_pc_for_line(line_no)?;
+                let target_addr = target_text
+                    .as_deref()
+                    .and_then(|t| evaluate_expr_str(t, &self.symbols, branch_pc).ok())
+                    .map(|v| v as u32);
 
                 if let Some(target) = target_addr {
-                    let branch_pc = self.get_pc_for_line(line_no)?;
                     let new_size =
                         self.determine_branch_size(&mnemonic, branch_pc, target, size_hint);
 
@@ -2045,11 +2157,11 @@ impl Assembler {
     /// Recalculate PC values for all lines based on current branch sizes.
     fn recalculate_pcs(&mut self, lines: &[ParsedLine]) {
         self.line_pcs.clear();
-        let mut pc = self.origin;
+        self.pc = self.origin;
         let mut cond_stack: Vec<bool> = Vec::new();
 
         for line in lines {
-            self.line_pcs.push((line.line_no, pc));
+            self.line_pcs.push((line.line_no, self.pc));
 
             // Handle conditional directives
             let mut skip = false;
@@ -2090,10 +2202,24 @@ impl Assembler {
 
             if !skip && cond_stack.last().copied().unwrap_or(true) {
                 if let Some(ref label) = line.label {
-                    let _ = self.symbols.define(label, pc, Some(line.line_no));
+                    // Each relaxation iteration recomputes PCs from scratch,
+                    // so re-defining an already-defined symbol here must
+                    // overwrite it rather than error out (define() would
+                    // silently no-op on iteration 2+, freezing the label at
+                    // its iteration-1 value even as branch sizes change).
+                    // Section must be preserved too (ELF/IEEE-695 output
+                    // rely on it), so use the section-aware overwrite.
+                    let section = self.sections.current_section().map(|s| s.kind.name());
+                    self.symbols
+                        .force_set_in_section(label, self.pc, Some(line.line_no), section);
                 }
+                // estimate_line_size_with_branches (via estimate_line_size)
+                // updates self.pc directly for directives like ORG/SECTION
+                // that reposition the location counter rather than just
+                // advancing it — so self.pc, not a local copy, must be the
+                // single source of truth here.
                 if let Ok(size) = self.estimate_line_size_with_branches(line) {
-                    pc += size;
+                    self.pc += size;
                 }
             }
         }
@@ -2126,6 +2252,15 @@ impl Assembler {
     }
 
     /// Determine the optimal branch size for a given displacement.
+    ///
+    /// Sizes only ever grow across relaxation iterations, never shrink:
+    /// once a branch has been widened to Word, it stays Word even if a
+    /// later recalculation (based on that same widening) would make Short
+    /// look sufficient again. Without this monotonicity, a branch whose
+    /// target sits exactly at the reserved disp==0/-1 boundary can flip
+    /// Short -> Word -> Short -> Word forever, since growing to Word moves
+    /// the target closer (shrinking disp back into short range) and
+    /// shrinking back to Short reopens the same disp==0/-1 collision.
     fn determine_branch_size(
         &self,
         mnemonic: &str,
@@ -2133,22 +2268,42 @@ impl Assembler {
         target: u32,
         hint: BranchSize,
     ) -> BranchSize {
-        if hint != BranchSize::Any {
-            return hint;
-        }
-
-        // DBcc always uses word displacement
-        if mnemonic.starts_with("DB") {
+        // DBcc always uses word displacement. `mnemonic` here is
+        // lowercase (as produced by the parser), matching is_dbcc_mnemonic.
+        if is_dbcc_mnemonic(mnemonic) {
             return BranchSize::Word;
         }
 
-        // For BRA/BSR/Bcc on 68000, max is word (no long form)
+        if hint == BranchSize::Word || hint == BranchSize::Long {
+            return hint;
+        }
+
+        // For BRA/BSR/Bcc, disp==0/-1 are excluded from the short range:
+        // their low byte (0x00/0xFF) collides with the word/long-form
+        // markers, so the encoder falls through to the word form for
+        // those displacements (see encode_bra/encode_bsr/enc_bcc) — the
+        // size estimate must agree.
         let disp = target as i32 - branch_pc as i32 - 2;
 
-        if (-128..=127).contains(&disp) {
+        if (-128..=127).contains(&disp) && disp != 0 && disp != -1 {
             BranchSize::Short
-        } else {
+        } else if (-32768..=32767).contains(&disp) {
             BranchSize::Word
+        } else if self.cpu == "68000" {
+            // 68000 has no 32-bit branch displacement form; encode_bra/
+            // encode_bsr/enc_bcc's word-form fallback will surface this
+            // as an out-of-range error in pass 2 (matching the previous
+            // behavior of always picking Word here and letting the
+            // encoder reject it).
+            BranchSize::Word
+        } else {
+            // Previously this estimate had no long-form branch: a
+            // Bcc/BRA/BSR target more than 32KB away always got the Word
+            // hint, so pass 1 (and the relaxation loop, which never grows
+            // past what determine_branch_size returns) never accounted
+            // for the extra 2 bytes the 68020+ 32-bit form needs —
+            // desyncing every label after it once such a branch existed.
+            BranchSize::Long
         }
     }
 
@@ -2503,7 +2658,7 @@ impl Assembler {
             _ => {
                 // Bcc family - delegate to enc_flow
                 let cond = branch_condition(mnemonic)?;
-                crate::enc_flow::enc_bcc(&cond, target as i32, pc + 2)
+                crate::enc_flow::enc_bcc(&cond, target as i32, pc + 2, &self.cpu)
                     .map_err(|e| AsmError::with_line(e.message.clone(), line.line_no))?
             }
         };
@@ -2564,8 +2719,12 @@ impl Assembler {
 
     /// Encode BRA with size hint.
     fn encode_bra(&self, disp: i32, size_hint: BranchSize) -> Result<Vec<u16>, AsmError> {
+        // disp==0/-1 collide with the word/long-form low-byte markers
+        // (0x00/0xFF) and must fall through to the word form instead.
         match size_hint {
-            BranchSize::Short | BranchSize::Any if (-128..=127).contains(&disp) => {
+            BranchSize::Short | BranchSize::Any
+                if (-128..=127).contains(&disp) && disp != 0 && disp != -1 =>
+            {
                 let op = 0x6000 | ((disp & 0xFF) as u16);
                 return Ok(vec![op]);
             }
@@ -2596,8 +2755,11 @@ impl Assembler {
 
     /// Encode BSR with size hint.
     fn encode_bsr(&self, disp: i32, size_hint: BranchSize) -> Result<Vec<u16>, AsmError> {
+        // See encode_bra above: disp==0/-1 must fall through to word form.
         match size_hint {
-            BranchSize::Short | BranchSize::Any if (-128..=127).contains(&disp) => {
+            BranchSize::Short | BranchSize::Any
+                if (-128..=127).contains(&disp) && disp != 0 && disp != -1 =>
+            {
                 let op = 0x6100 | ((disp & 0xFF) as u16);
                 return Ok(vec![op]);
             }
@@ -2763,9 +2925,26 @@ impl Assembler {
                 Ok(())
             }
             "cnop" => {
-                // CNOP in pass 2: emit NOP padding
-                let _offset = evaluate_expr_str(&args[0], &self.symbols, self.pc)? as u32;
-                let alignment = evaluate_expr_str(&args[1], &self.symbols, self.pc)? as u32;
+                // CNOP in pass 2: emit NOP padding. Pass 1 (see above)
+                // validates alignment is a nonzero power of two — that
+                // check must be repeated here too, not assumed carried
+                // over: if `alignment`'s expression depends on a SET
+                // symbol whose value changed between pass 1 and pass 2,
+                // pass 1's validation could have run against a different
+                // value than what's used here, and `target % alignment`
+                // below would divide by zero on an alignment of 0.
+                let _offset = evaluate_expr_str(&args[0], &self.symbols, self.pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+                    as u32;
+                let alignment = evaluate_expr_str(&args[1], &self.symbols, self.pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+                    as u32;
+                if alignment == 0 || !alignment.is_power_of_two() {
+                    return Err(AsmError::with_line(
+                        format!("CNOP alignment must be power of 2, got {}", alignment),
+                        line.line_no,
+                    ));
+                }
                 let target = self.pc + _offset;
                 let padding = if target.is_multiple_of(alignment) {
                     0
@@ -2875,22 +3054,6 @@ impl Assembler {
                     }
                     total_bytes += 1;
                 }
-            } else if trimmed.len() == 2 && trimmed.starts_with('\'') && trimmed.ends_with('\'') {
-                // Character literal: 'A'
-                if element_size != 1 {
-                    return Err(AsmError::with_line(
-                        "character literals only supported with DC.B",
-                        line.line_no,
-                    ));
-                }
-                let ch = trimmed.chars().nth(1).unwrap();
-                if words.len() * 2 == total_bytes {
-                    words.push((ch as u16) << 8);
-                } else {
-                    let last = words.last_mut().unwrap();
-                    *last |= ch as u16;
-                }
-                total_bytes += 1;
             } else {
                 let value = evaluate_expr_str(value_str, &self.symbols, self.pc)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
@@ -2958,7 +3121,7 @@ impl Assembler {
         let count = evaluate_expr_str(count_str, &self.symbols, self.pc)
             .map_err(|e| AsmError::with_line(e.message, line.line_no))? as u32;
 
-        let element_size = match size_suffix.as_str() {
+        let element_size: u32 = match size_suffix.as_str() {
             "b" => 1,
             "w" => 2,
             "l" => 4,
@@ -2972,7 +3135,9 @@ impl Assembler {
 
         // DS reserves space but doesn't emit code
         // Just advance the PC
-        let total_bytes = element_size * count;
+        let total_bytes = element_size
+            .checked_mul(count)
+            .ok_or_else(|| AsmError::with_line("DS size too large", line.line_no))?;
         self.pc += total_bytes;
         self.sections.set_current_pc(self.pc);
 
@@ -3000,7 +3165,7 @@ impl Assembler {
         let value = evaluate_expr_str(value_str, &self.symbols, self.pc)
             .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
 
-        let element_size = match size_suffix.as_str() {
+        let element_size: u32 = match size_suffix.as_str() {
             "b" => 1,
             "w" => 2,
             "l" => 4,
@@ -3011,6 +3176,13 @@ impl Assembler {
                 ));
             }
         };
+        // Reject before allocating: element_size * count can overflow u32
+        // (panicking on a crafted DCB.L $80000000,0) and, even unchecked,
+        // a huge count would otherwise drive an unbounded Vec allocation
+        // below.
+        element_size
+            .checked_mul(count)
+            .ok_or_else(|| AsmError::with_line("DCB size too large", line.line_no))?;
 
         let mut words = Vec::new();
 
@@ -3050,7 +3222,7 @@ impl Assembler {
             source: Some(line.raw.clone()),
         });
 
-        let total_bytes = (element_size as u32) * count;
+        let total_bytes = element_size * count;
         self.pc += if total_bytes.is_multiple_of(2) {
             total_bytes
         } else {
@@ -3194,13 +3366,38 @@ fn parse_float_value(text: &str, format: &str, line_no: usize) -> Result<Vec<u16
             ])
         }
         "x" | "p" => {
-            // Extended precision (96-bit = 6 words) or packed decimal (96-bit)
-            // Accept hex value with $ prefix, parse as u128
+            // Extended precision (96-bit) and packed decimal (96-bit) are
+            // only supported as raw hex/integer literals here — there's no
+            // IEEE-754-extended or true packed-BCD conversion from a
+            // decimal literal like "3.14". Previously an unparseable
+            // literal (e.g. any float-looking value) silently fell back
+            // to `unwrap_or(0)`, emitting six zero words with no
+            // diagnostic instead of surfacing the limitation.
             let text = text.trim();
             let val: u128 = if let Some(hex) = text.strip_prefix('$') {
-                u128::from_str_radix(hex, 16).unwrap_or(0)
+                u128::from_str_radix(hex, 16).map_err(|_| {
+                    AsmError::with_line(
+                        format!(
+                            "DC.{} requires a hex ($...) or integer literal; \
+                             float-to-extended/packed-decimal conversion is not supported: {}",
+                            format.to_uppercase(),
+                            text
+                        ),
+                        line_no,
+                    )
+                })?
             } else {
-                text.parse::<u128>().unwrap_or(0)
+                text.parse::<u128>().map_err(|_| {
+                    AsmError::with_line(
+                        format!(
+                            "DC.{} requires a hex ($...) or integer literal; \
+                             float-to-extended/packed-decimal conversion is not supported: {}",
+                            format.to_uppercase(),
+                            text
+                        ),
+                        line_no,
+                    )
+                })?
             };
             Ok(vec![
                 ((val >> 80) & 0xFFFF) as u16,
@@ -3804,6 +4001,55 @@ local\\@ EQU $
         assert_eq!(asm.symbols.resolve("local0002").unwrap(), 0x1002);
     }
 
+    /// Regression: a macro invoking another macro previously errored with
+    /// "unknown mnemonic" — macro_preprocess only ran a single scan pass,
+    /// so an invocation newly exposed by expanding the outer macro's body
+    /// was substituted in as literal text but never re-scanned. This also
+    /// exercises that macro definitions persist across the now-multiple
+    /// preprocessing passes: `inner`'s `MACRO...ENDM` block is consumed
+    /// (removed from the text) by the pass that parses it, so a later
+    /// pass re-scanning `outer`'s expanded body must still find `inner`
+    /// in the retained definition table, not in the text.
+    #[test]
+    fn test_nested_macro_invocation() {
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble(
+            "
+inner   MACRO
+    NOP
+    ENDM
+outer   MACRO
+    inner
+    RTS
+    ENDM
+    outer
+",
+        );
+        assert!(result.is_ok(), "assembly failed: {:?}", result.err());
+        assert_eq!(asm.code.len(), 2);
+        assert_eq!(asm.code[0].words, vec![0x4E71]); // NOP from inner
+        assert_eq!(asm.code[1].words, vec![0x4E75]); // RTS from outer
+    }
+
+    /// A self-recursive macro must not hang the assembler: the expansion
+    /// depth limit should kick in and produce an error (an unexpanded
+    /// invocation left over once the limit is hit) rather than looping
+    /// forever or exhausting memory.
+    #[test]
+    fn test_self_recursive_macro_does_not_hang() {
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble(
+            "
+recur   MACRO
+    NOP
+    recur
+    ENDM
+    recur
+",
+        );
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_rept_simple() {
         let mut asm = Assembler::new(0x1000);
@@ -3958,6 +4204,204 @@ target:
         // BRA should be encoded as short (2 bytes) since target is close
         let bra_instr = &asm.code[0];
         assert_eq!(bra_instr.words.len(), 1); // 1 word = short branch
+    }
+
+    /// Regression for the branch-relaxation "no-op" bug: `BranchInfo`
+    /// previously never had its target populated, so pass 1 always assumed
+    /// a word-sized branch while pass 2 emitted short whenever it fit,
+    /// desyncing every label after the branch from the physical layout.
+    #[test]
+    fn test_branch_relaxation_label_matches_physical_layout() {
+        let mut asm = Assembler::new(0x1000);
+        let result = asm.assemble(
+            "
+start:
+    BRA next
+next:
+    RTS
+",
+        );
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        // `next` must resolve to where RTS actually landed, not to a
+        // pass-1 estimate that pass 2 never matched.
+        let next_addr = asm.symbols.resolve("next").unwrap();
+        let rts_instr = asm.code.iter().find(|i| i.words == vec![0x4E75]).unwrap();
+        assert_eq!(next_addr, rts_instr.pc);
+    }
+
+    /// disp==0 (branch target is the address immediately following the
+    /// branch's own opword) must fall through to the word-displacement
+    /// form: the low byte 0x00 is reserved to signal that form, so a
+    /// 1-word encoding with that byte would be ambiguous with BRA.w
+    /// reusing its own opcode word as the displacement. Using a numeric
+    /// target (rather than a label placed right after the branch, whose
+    /// own address would shift as the branch grows) pins disp==0 exactly.
+    #[test]
+    fn test_bra_disp_zero_uses_word_form() {
+        let mut asm = Assembler::new(0x1000);
+        // BRA at $1000 is 2 bytes -> PC after opword = $1002 -> disp==0
+        // means target == $1002.
+        let result = asm.assemble("    BRA $1002\n");
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        assert_eq!(asm.code[0].words, vec![0x6000, 0x0000]);
+    }
+
+    /// DS.B with an odd count must not silently round up in pass 1 while
+    /// pass 2 doesn't: previously this offset every following label by 1.
+    #[test]
+    fn test_ds_b_odd_count_label_matches_pass2() {
+        let mut asm = Assembler::new(0x1000);
+        let result = asm.assemble(
+            "
+    DS.B 3
+after:
+    NOP
+",
+        );
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        assert_eq!(asm.symbols.resolve("after").unwrap(), 0x1003);
+        assert_eq!(asm.code[0].pc, 0x1003);
+    }
+
+    /// DC.B with a string literal must count its actual byte length in
+    /// pass 1, not the single-argument count: previously "HELLO" was
+    /// estimated as 1 byte instead of the 6 bytes (5 chars + pad) pass 2
+    /// emits, offsetting every following label by 4 bytes.
+    #[test]
+    fn test_dc_b_string_label_matches_pass2() {
+        let mut asm = Assembler::new(0x1000);
+        let result = asm.assemble(
+            "
+    DC.B \"HELLO\"
+after:
+    NOP
+",
+        );
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        assert_eq!(asm.symbols.resolve("after").unwrap(), 0x1006);
+        assert_eq!(asm.code[1].pc, 0x1006);
+    }
+
+    /// DS.L/DCB.L with a huge count must return a clean error instead of
+    /// panicking on `element_size * count` integer overflow (previously
+    /// unchecked in both pass 1's size estimate and pass 2's encoder).
+    #[test]
+    fn test_ds_and_dcb_huge_count_errors_instead_of_panicking() {
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DS.L $80000000\n");
+        assert!(result.is_err());
+
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DCB.L $80000000,0\n");
+        assert!(result.is_err());
+    }
+
+    /// Regression: DC.X/DC.P's hex/integer literal parsing silently fell
+    /// back to `unwrap_or(0)` on unparseable input (e.g. a decimal float
+    /// literal, since neither format is actually implemented), emitting
+    /// six zero words with no diagnostic instead of a clear error.
+    #[test]
+    fn test_dc_x_rejects_float_literal_instead_of_emitting_zeros() {
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DC.X 3.14\n");
+        assert!(result.is_err());
+
+        // Hex and plain integer literals must keep working.
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DC.X $1234\n");
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+    }
+
+    /// A forward-referenced symbol used as a memory operand must be
+    /// estimated conservatively (Absolute.L) in pass 1: if it later
+    /// resolves above 0xFFFF, pass 2 upgrades from the 1-word Absolute.W
+    /// form pass 1 assumed for the placeholder value 0, growing the
+    /// instruction by 2 bytes and desyncing every following label.
+    #[test]
+    fn test_forward_ref_absolute_long_label_matches_pass2() {
+        let mut asm = Assembler::new(0x1000);
+        let result = asm.assemble(
+            "
+    MOVE.W D0,faraway
+after:
+    NOP
+    ORG $20000
+faraway:
+    RTS
+",
+        );
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        assert_eq!(asm.symbols.resolve("after").unwrap(), 0x1006);
+        assert_eq!(asm.code[0].words, vec![0x33C0, 0x0002, 0x0000]);
+    }
+
+    /// Bcc short-form boundary: -128 must be the smallest short
+    /// displacement accepted (previously the encoder rejected -128 even
+    /// though it fits in a signed byte, only determine_branch_size allowed
+    /// it — a mismatch that becomes observable once relaxation actually
+    /// runs). +127/-129/+128 pin the rest of the boundary.
+    #[test]
+    fn test_bra_short_range_boundaries() {
+        let mut asm = Assembler::new(0x1000);
+        // disp = target - (pc + 2). BRA opcode is 2 bytes.
+        asm.assemble("    BRA $1081\n").unwrap();
+        assert_eq!(asm.code[0].words.len(), 1, "disp=127 should be short");
+
+        let mut asm = Assembler::new(0x1000);
+        asm.assemble("    BRA $1082\n").unwrap();
+        assert_eq!(asm.code[0].words.len(), 2, "disp=128 should be word");
+
+        let mut asm = Assembler::new(0x1000);
+        asm.assemble("    BRA $0F82\n").unwrap();
+        assert_eq!(asm.code[0].words.len(), 1, "disp=-128 should be short");
+
+        let mut asm = Assembler::new(0x1000);
+        asm.assemble("    BRA $0F81\n").unwrap();
+        assert_eq!(asm.code[0].words.len(), 2, "disp=-129 should be word");
+    }
+
+    /// Regression for 4.8: determine_branch_size previously had no long
+    /// (68020+, 32-bit displacement) tier — any Bcc/BRA/BSR target beyond
+    /// word range always got the Word size hint, so pass 1's size
+    /// estimate (used for label PCs) stayed at 4 bytes even though
+    /// encode_bra/enc_bcc would emit the 6-byte long form once the
+    /// physical displacement was computed, desyncing every label after
+    /// the branch (the exact class of bug 1.1 fixed for the word tier).
+    #[test]
+    fn test_bcc_long_branch_label_matches_pass2_on_68020() {
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68020");
+        let result = asm.assemble(
+            "
+    ORG $0
+    BEQ far
+    ORG $10000
+far:
+    RTS
+",
+        );
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        assert_eq!(asm.symbols.resolve("far").unwrap(), 0x10000);
+        // BEQ.l opword low byte 0xFF marks the 32-bit form.
+        assert_eq!(asm.code[0].words[0] & 0xFF, 0xFF);
+        assert_eq!(asm.code[0].words.len(), 3);
+    }
+
+    /// On 68000 (no long-branch form), the same out-of-range target must
+    /// be a clean assembly error, not a silently-emitted 68020 encoding.
+    #[test]
+    fn test_bcc_long_branch_rejected_on_68000() {
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble(
+            "
+    ORG $0
+    BEQ far
+    ORG $10000
+far:
+    RTS
+",
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -4136,6 +4580,16 @@ target:
         assert_eq!(asm.code[2].pc, 0x1004);
     }
 
+    /// Regression: pass 2's CNOP handler previously had no alignment
+    /// validation (unlike pass 1), so `target % alignment` with
+    /// alignment==0 would divide by zero.
+    #[test]
+    fn test_cnop_zero_alignment_errors_instead_of_panicking() {
+        let mut asm = Assembler::new(0x1000);
+        let result = asm.assemble("    CNOP 0,0\n");
+        assert!(result.is_err());
+    }
+
     #[test]
     fn test_assemble_offset() {
         let mut asm = Assembler::new(0x1000);
@@ -4264,6 +4718,91 @@ mymexc MACRO
         let mut asm = Assembler::new(0);
         asm.set_cpu(cpu);
         asm.assemble_bytes(source).unwrap()
+    }
+
+    /// Regression: ADDA/SUBA/CMPA previously shifted the size into bits
+    /// 13-12 (like MOVE) instead of setting opmode bit 8 (0x0100) for the
+    /// long form. `.l` forms were silently wrong — ADDA.L became an F-line
+    /// trap opcode and SUBA.L collided with CMPA.W's opcode entirely. `.w`
+    /// forms were coincidentally correct since bit 12 is already set in
+    /// the base opcode. Covers all 6 forms (ADDA/SUBA/CMPA x imm/ea) at
+    /// both sizes, plus An as a source operand (previously rejected: the
+    /// EA category was DATA, which excludes address registers, even
+    /// though ADDA/SUBA/CMPA accept any addressing mode as source).
+    #[test]
+    fn test_adda_suba_cmpa_size_bit_and_areg_source() {
+        // ADDA.L (A2),A1 -> D3D2 (not F2D2, which is an F-line trap opcode).
+        assert_eq!(
+            assemble_source_with_cpu("    ADDA.L (A2),A1\n", "68000"),
+            vec![0xD3, 0xD2]
+        );
+        // ADDA.W (A2),A1 -> D2D2, unchanged.
+        assert_eq!(
+            assemble_source_with_cpu("    ADDA.W (A2),A1\n", "68000"),
+            vec![0xD2, 0xD2]
+        );
+        // SUBA.L #-1,A1 -> 93FC FFFFFFFF (not B2FC, which is CMPA.W's opcode).
+        assert_eq!(
+            assemble_source_with_cpu("    SUBA.L #-1,A1\n", "68000"),
+            vec![0x93, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF]
+        );
+        // SUBA.W (A2),A1 -> 92D2, unchanged.
+        assert_eq!(
+            assemble_source_with_cpu("    SUBA.W (A2),A1\n", "68000"),
+            vec![0x92, 0xD2]
+        );
+        // CMPA.L (A2),A1 -> B3D2 (not B2D2, CMPA.W's opcode).
+        assert_eq!(
+            assemble_source_with_cpu("    CMPA.L (A2),A1\n", "68000"),
+            vec![0xB3, 0xD2]
+        );
+        // CMPA.W (A2),A1 -> B2D2, unchanged.
+        assert_eq!(
+            assemble_source_with_cpu("    CMPA.W (A2),A1\n", "68000"),
+            vec![0xB2, 0xD2]
+        );
+        // An as source must be accepted (previously rejected as "addressing
+        // mode not allowed" under the too-narrow DATA category).
+        assert_eq!(
+            assemble_source_with_cpu("    CMPA.L A0,A1\n", "68000"),
+            vec![0xB3, 0xC8]
+        );
+        assert_eq!(
+            assemble_source_with_cpu("    ADDA.L A0,A1\n", "68000"),
+            vec![0xD3, 0xC8]
+        );
+        assert_eq!(
+            assemble_source_with_cpu("    SUBA.L A0,A1\n", "68000"),
+            vec![0x93, 0xC8]
+        );
+    }
+
+    /// Regression for B10: FBcc/FDBcc previously errored with "requires
+    /// an address operand" for any label, since encoder.rs's dispatch
+    /// only matched Operand::Address — but parse_operand_text returns
+    /// AbsoluteShort/AbsoluteLong/Memory for a label that's already
+    /// resolvable at parse time (not the Address(0) forward-reference
+    /// placeholder), which FBcc/FDBcc's original dispatch rejected.
+    #[test]
+    fn test_fbcc_fdbcc_accept_forward_and_backward_labels() {
+        // Backward reference (label already defined).
+        let bytes = assemble_source_with_cpu("target:\n    FBEQ target\n", "68020");
+        assert_eq!(bytes, vec![0xF2, 0x81, 0xFF, 0xFE]);
+
+        // Forward reference (label defined later in the source).
+        let bytes =
+            assemble_source_with_cpu("    FBEQ forward\n    NOP\nforward:\n    RTS\n", "68020");
+        assert_eq!(bytes, vec![0xF2, 0x81, 0x00, 0x04, 0x4E, 0x71, 0x4E, 0x75]);
+
+        // FDBcc forward reference.
+        let bytes = assemble_source_with_cpu(
+            "    FDBEQ D0,forward\n    NOP\nforward:\n    RTS\n",
+            "68020",
+        );
+        assert_eq!(
+            bytes,
+            vec![0xF2, 0x48, 0x00, 0x01, 0x00, 0x04, 0x4E, 0x71, 0x4E, 0x75]
+        );
     }
 
     #[test]
@@ -4539,19 +5078,48 @@ mymexc MACRO
         // Regression check for N4: the brief-index extension word's "long"
         // bit (bit 11, 0x0800) must reflect the parsed .W/.L index size
         // suffix instead of being hardcoded to .W.
+        //
+        // Extension word layout: bit15=D/A, bits14-12=Xn, bit11=W/L,
+        // bits10-9=scale, bit8=0, bits7-0=disp. Xn=D1 -> 0x1000, disp=0.
+        // (These expected values were previously wrong — 0x0801/0x0001 —
+        // because ea_encode.rs destructured AddrRegIndirectIndex's `Xn`
+        // and `disp` fields swapped, an all-CPU bug fixed alongside this
+        // test; disp=0/Xn=D0-D1 happened to mostly cancel the swap out
+        // except for the long bit ending up in the wrong nibble.)
         let bytes_l = assemble_source_with_cpu("    MOVE.L (0,A0,D1.L),D0\n", "68000");
         let bytes_w = assemble_source_with_cpu("    MOVE.L (0,A0,D1.W),D0\n", "68000");
-        assert_eq!(bytes_l, vec![0x20, 0x30, 0x08, 0x01]);
-        assert_eq!(bytes_w, vec![0x20, 0x30, 0x00, 0x01]);
+        assert_eq!(bytes_l, vec![0x20, 0x30, 0x18, 0x00]);
+        assert_eq!(bytes_w, vec![0x20, 0x30, 0x10, 0x00]);
     }
 
     #[test]
     fn test_pc_relative_index_l_suffix_sets_long_bit() {
+        // Xn=D2 -> bits14-12=0x2000, disp=4.
         let bytes_l = assemble_source_with_cpu("    MOVE.L ($4,PC,D2.L),D0\n", "68000");
         let bytes_w = assemble_source_with_cpu("    MOVE.L ($4,PC,D2.W),D0\n", "68000");
-        assert_eq!(bytes_w, vec![0x20, 0x3B, 0x40, 0x02]);
+        assert_eq!(bytes_w, vec![0x20, 0x3B, 0x20, 0x04]);
         // Only the extension word's long bit (0x0800) should differ.
-        assert_eq!(bytes_l, vec![0x20, 0x3B, 0x48, 0x02]);
+        assert_eq!(bytes_l, vec![0x20, 0x3B, 0x28, 0x04]);
+    }
+
+    /// Regression for the ea_encode.rs Xn/disp field-swap bug: the brief
+    /// index extension word's Xn nibble and displacement byte were bound
+    /// in the wrong order (compiled silently since both are integers), so
+    /// any case where the index register number and displacement value
+    /// differed encoded garbage. Uses asymmetric operands (index != disp)
+    /// so the swap would be caught, unlike the pre-existing tests above
+    /// which happened to use disp=0/4 with small Xn numbers.
+    #[test]
+    fn test_addr_reg_indirect_index_asymmetric_xn_and_disp() {
+        // (4,A0,D1.W): Xn=D1 -> bits14-12=0x1000, disp=4.
+        let bytes = assemble_source_with_cpu("    MOVE.W (4,A0,D1.W),D0\n", "68020");
+        assert_eq!(bytes, vec![0x30, 0x30, 0x10, 0x04]);
+
+        // (0x7F,A0,D2.L): Xn=D2 -> bits14-12=0x2000, long bit 0x0800,
+        // disp=0x7F. Previously disp (0x7F) landed in the register-number
+        // nibble, overflowing into the A/D-register-select bit (15).
+        let bytes2 = assemble_source_with_cpu("    LEA ($7F,A0,D2.L),A2\n", "68020");
+        assert_eq!(bytes2, vec![0x45, 0xF0, 0x28, 0x7F]);
     }
 
     #[test]

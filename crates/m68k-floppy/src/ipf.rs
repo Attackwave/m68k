@@ -11,11 +11,39 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
 use crate::floppy_base::{FloppyError, FloppyImageReader, require_file};
 use crate::mfm::MfmDecoder;
+
+/// Read a chunk-size field and validate it against the remaining file
+/// length before the caller allocates a buffer of that size. A crafted
+/// chunk header (e.g. `size = 0xFFFFFFFF`) previously drove an unbounded
+/// `vec![0u8; size as usize]` allocation — up to 4 GB per chunk — before
+/// the inevitable `read_exact` failure, an easy DoS via a malformed IPF
+/// file. `read_exact` would fail anyway once the declared size exceeds
+/// what's left in the file, so rejecting it up front is strictly more
+/// conservative, never rejecting a chunk that would otherwise succeed.
+fn read_checked_chunk_size(file: &mut File) -> Result<u32, FloppyError> {
+    let size = read_u32_be(file)?;
+    let pos = file
+        .stream_position()
+        .map_err(|e| FloppyError::new(e.to_string()))?;
+    let len = file
+        .seek(SeekFrom::End(0))
+        .map_err(|e| FloppyError::new(e.to_string()))?;
+    file.seek(SeekFrom::Start(pos))
+        .map_err(|e| FloppyError::new(e.to_string()))?;
+    let remaining = len.saturating_sub(pos);
+    if size as u64 > remaining {
+        return Err(FloppyError::new(format!(
+            "IPF chunk size {} exceeds remaining file length {}",
+            size, remaining
+        )));
+    }
+    Ok(size)
+}
 
 #[derive(Debug, Default)]
 struct ImageInfo {
@@ -88,14 +116,14 @@ impl NativeIpfBackend {
 
             match &header {
                 b"CAPS" => {
-                    let size = read_u32_be(&mut file)?;
+                    let size = read_checked_chunk_size(&mut file)?;
                     let mut data = vec![0u8; size as usize];
                     file.read_exact(&mut data)
                         .map_err(|e| FloppyError::new(e.to_string()))?;
                     has_caps = true;
                 }
                 b"INFO" => {
-                    let size = read_u32_be(&mut file)?;
+                    let size = read_checked_chunk_size(&mut file)?;
                     let mut data = vec![0u8; size as usize];
                     file.read_exact(&mut data)
                         .map_err(|e| FloppyError::new(e.to_string()))?;
@@ -107,13 +135,13 @@ impl NativeIpfBackend {
                     has_info = true;
                 }
                 b"IMGE" => {
-                    let size = read_u32_be(&mut file)?;
+                    let size = read_checked_chunk_size(&mut file)?;
                     let mut data = vec![0u8; size as usize];
                     file.read_exact(&mut data)
                         .map_err(|e| FloppyError::new(e.to_string()))?;
                 }
                 b"TRCK" => {
-                    let size = read_u32_be(&mut file)?;
+                    let size = read_checked_chunk_size(&mut file)?;
                     let mut data = vec![0u8; size as usize];
                     file.read_exact(&mut data)
                         .map_err(|e| FloppyError::new(e.to_string()))?;
@@ -127,7 +155,7 @@ impl NativeIpfBackend {
                     }
                 }
                 _ => {
-                    let size = read_u32_be(&mut file)?;
+                    let size = read_checked_chunk_size(&mut file)?;
                     let mut skip = vec![0u8; size as usize];
                     let _ = file.read_exact(&mut skip);
                 }
@@ -232,6 +260,25 @@ mod tests {
         let reader = NativeIpfBackend::open(&path).unwrap();
         assert_eq!(reader.cylinders(), 80);
         assert_eq!(reader.heads(), 2);
+    }
+
+    /// Regression: a chunk header claiming a size far larger than the
+    /// rest of the file (e.g. `size = 0xFFFFFFFF`) previously drove an
+    /// unbounded `vec![0u8; size as usize]` allocation — up to 4 GB —
+    /// before the inevitable `read_exact` failure. Must now be rejected
+    /// with a clean error before any such allocation happens.
+    #[test]
+    fn test_chunk_size_exceeding_file_length_is_rejected() {
+        let dir = tempdir();
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"CAPS");
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        buf.extend_from_slice(&[0, 0, 0, 1]); // a few real bytes follow, nowhere near declared size
+        let path = dir.path().join("evil.ipf");
+        std::fs::write(&path, &buf).unwrap();
+
+        let result = NativeIpfBackend::open(&path);
+        assert!(result.is_err());
     }
 
     #[test]

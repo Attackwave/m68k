@@ -48,10 +48,10 @@ pub fn encode_ea(
             check_ea(mode, reg, allowed)?;
             Ok((mode, reg, vec![to_word(*disp)]))
         }
-        Operand::AddrRegIndirectIndex(n, disp, xreg, scale, is_long) => {
+        Operand::AddrRegIndirectIndex(n, xreg, disp, scale, is_long) => {
             let (mode, reg) = (6, *n);
             let xsize = if *is_long { "l" } else { "w" };
-            let ext = encode_brief_index(*disp as i32, *xreg as u8, xsize, *scale, cpu_level)?;
+            let ext = encode_brief_index(*disp as i32, *xreg, xsize, *scale, cpu_level)?;
             check_ea(mode, reg, allowed)?;
             Ok((mode, reg, vec![ext]))
         }
@@ -79,10 +79,10 @@ pub fn encode_ea(
             check_ea(mode, reg, allowed)?;
             Ok((mode, reg, vec![to_word(disp)]))
         }
-        Operand::PcRelativeIndex(disp, xreg, scale, is_long) => {
+        Operand::PcRelativeIndex(xreg, disp, scale, is_long) => {
             let (mode, reg) = (7, 3);
             let xsize = if *is_long { "l" } else { "w" };
-            let ext = encode_brief_index(*disp as i32, *xreg as u8, xsize, *scale, cpu_level)?;
+            let ext = encode_brief_index(*disp as i32, *xreg, xsize, *scale, cpu_level)?;
             check_ea(mode, reg, allowed)?;
             Ok((mode, reg, vec![ext]))
         }
@@ -146,7 +146,17 @@ fn to_word(val: i32) -> u16 {
 }
 
 fn check_ea(mode: u8, reg: u8, allowed: u16) -> Result<(), AsmError> {
-    if !ea_matches(mode, reg, allowed) && allowed != 0xFFFF {
+    // `allowed == 0xFFFF` (ea::ALL) used to bypass ea_matches entirely
+    // instead of being treated as "every category bit is set" — for
+    // callers that pass ALL because the instruction genuinely accepts
+    // every addressing mode (MOVE's source, ADDA/SUBA/CMPA/MOVEC), the two
+    // behave the same. But other callers relied on the bypass as an
+    // (unintentional) way to skip validation altogether, silently
+    // accepting invalid mode/reg combinations (see the BTST/BSET/BCLR/
+    // BCHG memory-form fix in enc_logic.rs, which replaced its `ALL`
+    // shortcut with the real DATA/DATA_ALT categories once this bypass
+    // was removed).
+    if !ea_matches(mode, reg, allowed) {
         Err(AsmError::new("addressing mode not allowed"))
     } else {
         Ok(())
