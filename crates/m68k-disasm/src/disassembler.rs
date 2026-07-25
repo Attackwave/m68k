@@ -72,26 +72,46 @@ impl Disassembler {
 
     fn pass1_discover_labels(&mut self) {
         let mut targets: Vec<u32> = Vec::new();
+        // Every address pass 2 will actually start decoding a line from —
+        // used below to reject targets that land mid-instruction (never
+        // get a line, and thus never get a label, of their own in pass 2)
+        // in addition to targets outside the decoded range entirely.
+        let mut line_starts: std::collections::HashSet<u32> = std::collections::HashSet::new();
         let mut scan_stream = InstructionStream::new(&self.data, self.origin);
         while scan_stream.remaining() >= 2 {
+            let line_pc = scan_stream.current_pc();
             match decode_next(&mut scan_stream, &self.cpu) {
                 Ok((_, DecodeResult::Instruction(inst))) => {
+                    line_starts.insert(line_pc);
                     if let Some(target) = inst.target_address {
                         targets.push(target);
                     }
                 }
                 Ok((addr, DecodeResult::DataWord(_))) => {
+                    line_starts.insert(line_pc);
                     targets.push(addr);
                 }
                 Err(_) => break,
             }
         }
 
+        // Branch/jump targets outside the decoded range, or that land
+        // mid-instruction rather than on one of pass 2's actual line
+        // starts, have no line of their own in pass 2's output — a
+        // generated `labelN` name for one would be a dangling reference
+        // (`bra labelN` with no `labelN:` anywhere in the listing).
+        // format() falls back to rendering the raw address for anything
+        // not in `self.labels`. `known_labels` (externally supplied, e.g.
+        // from a symbol table) are exempt: the caller vouches for those
+        // independently of what this binary slice covers.
         let mut label_idx = 0usize;
         targets.sort();
         targets.dedup();
         self.labels.clone_from(&self.known_labels);
         for addr in targets {
+            if !line_starts.contains(&addr) {
+                continue;
+            }
             if let std::collections::hash_map::Entry::Vacant(e) = self.labels.entry(addr) {
                 e.insert(format!("label{}", label_idx));
                 label_idx += 1;
@@ -161,13 +181,32 @@ mod tests {
 
     #[test]
     fn test_disassemble_discovers_branch_label() {
-        // BRA.S +2 (to the RTS below), then RTS
-        let bytes = vec![0x60, 0x02, 0x4E, 0x75];
+        // BRA.w disp=$0002 targets pc_after_opword(0x2002)+2 = 0x2004,
+        // i.e. the RTS immediately following this 4-byte BRA.w encoding.
+        let bytes = vec![0x60, 0x00, 0x00, 0x02, 0x4E, 0x75];
         let mut disasm = Disassembler::new(bytes, 0x2000);
         let lines = disasm.disassemble();
 
         assert_eq!(disasm.labels().get(&0x2004), Some(&"label0".to_string()));
         assert!(lines[0].text.contains("label0"));
+    }
+
+    /// Regression: a branch target outside the decoded range (or landing
+    /// mid-instruction rather than on an actual decoded line) must not
+    /// get an auto-generated label — pass 2 never emits a line at that
+    /// address, so `bra labelN` would reference a `labelN:` that appears
+    /// nowhere in the listing. format() must fall back to the raw
+    /// address instead.
+    #[test]
+    fn test_disassemble_out_of_range_target_has_no_dangling_label() {
+        // BRA.w with disp pointing well past the end of this 4-byte input.
+        let bytes = vec![0x60, 0x00, 0x10, 0x00];
+        let mut disasm = Disassembler::new(bytes, 0x2000);
+        let lines = disasm.disassemble();
+
+        assert!(disasm.labels().is_empty());
+        assert!(lines[0].text.contains("$00003002"));
+        assert!(!lines[0].text.contains("label"));
     }
 
     #[test]

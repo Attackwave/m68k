@@ -108,16 +108,16 @@ pub enum EAOperand {
     PreDec(u8),
     /// Displacement: (d16,An)
     AddrDisp(u8, i32),
-    /// Index: (d8,An,Xn.size)
-    AddrIndex(u8, i8, String, String),
+    /// Index: (d8,An,Xn.size*scale)
+    AddrIndex(u8, i8, String, String, u8),
     /// Absolute short: xxx.W
     AbsoluteShort(u16),
     /// Absolute long: xxx.L
     AbsoluteLong(u32),
     /// PC relative displacement: (xxx).W(PC)
     PcDisp(i32, u32),
-    /// PC relative index: (d8,PC,Xn.size)
-    PcIndex(i32, u32, String, String),
+    /// PC relative index: (d8,PC,Xn.size*scale)
+    PcIndex(i32, u32, String, String, u8),
     /// Immediate: #value
     Immediate(u64, String),
     /// Float immediate: #$hex
@@ -157,9 +157,9 @@ impl OperandTrait for EAOperand {
                 let reg = &REG_ADDR[*n as usize];
                 format_disp(*disp, Some(reg), None)
             }
-            EAOperand::AddrIndex(n, disp, idx_reg, idx_size) => {
+            EAOperand::AddrIndex(n, disp, idx_reg, idx_size, scale) => {
                 let reg = &REG_ADDR[*n as usize];
-                format_disp(*disp as i32, Some(reg), Some((idx_reg, idx_size, &1)))
+                format_disp(*disp as i32, Some(reg), Some((idx_reg, idx_size, scale)))
             }
             EAOperand::AbsoluteShort(addr) => {
                 let se = sign_extend_16(*addr) as u32;
@@ -184,12 +184,17 @@ impl OperandTrait for EAOperand {
                     format!("${:08x}(pc)", addr)
                 }
             }
-            EAOperand::PcIndex(target, _disp, idx_reg, idx_size) => {
+            EAOperand::PcIndex(target, _disp, idx_reg, idx_size, scale) => {
                 let addr = *target as u32;
-                if let Some(label) = labels.get(&addr) {
-                    format!("{}(pc,{}.{})", label, idx_reg, idx_size)
+                let scale_str = if *scale > 1 {
+                    format!("*{}", scale)
                 } else {
-                    format!("${:08x}(pc,{}.{})", addr, idx_reg, idx_size)
+                    String::new()
+                };
+                if let Some(label) = labels.get(&addr) {
+                    format!("{}(pc,{}.{}{})", label, idx_reg, idx_size, scale_str)
+                } else {
+                    format!("${:08x}(pc,{}.{}{})", addr, idx_reg, idx_size, scale_str)
                 }
             }
             EAOperand::Immediate(val, size) => {
@@ -316,10 +321,27 @@ fn format_signed(val: i32) -> String {
 }
 
 fn format_disp(disp: i32, reg: Option<&str>, idx: Option<(&String, &String, &u8)>) -> String {
-    let disp_str = format_signed(disp);
+    // A zero displacement with a base register renders without the
+    // leading "$0" — `(a0)` / `(a0,d1.w)`, not `$0(a0)` / `$0(a0,d1.w)` —
+    // matching how every other m68k assembler/disassembler shows a plain
+    // register-indirect (with index) mode. Only applies when there's a
+    // base register: a bare `$0` with no `(reg)` suffix (e.g. formatting
+    // an absolute address or outer displacement elsewhere) is unaffected,
+    // since this function is only reached from AddrDisp/AddrIndex, both
+    // of which always pass a base register.
+    let disp_str = if disp == 0 && reg.is_some() {
+        String::new()
+    } else {
+        format_signed(disp)
+    };
     if let Some(r) = reg {
-        if let Some((idx_reg, idx_size, _scale)) = idx {
-            format!("{}({},{}.{})", disp_str, r, idx_reg, idx_size)
+        if let Some((idx_reg, idx_size, scale)) = idx {
+            let scale_str = if *scale > 1 {
+                format!("*{}", scale)
+            } else {
+                String::new()
+            };
+            format!("{}({},{}.{}{})", disp_str, r, idx_reg, idx_size, scale_str)
         } else {
             format!("{}({})", disp_str, r)
         }
@@ -333,13 +355,20 @@ fn hex_bytes(bytes: &[u8]) -> String {
 }
 
 /// Parse a 68000 brief-format index extension word.
-pub fn parse_index_extension(ext_word: u16) -> (String, String, i8) {
+///
+/// Returns (index register, index size, displacement, scale). Scale
+/// (bits 10-9, 68020+ only — always 0b00/scale=1 on 68000/68010) was
+/// previously dropped here and hardcoded to 1 at every call site, so a
+/// `*4`/`*2`/`*8` scaled brief-format index silently disassembled without
+/// its scale factor even though the assembler encodes it correctly.
+pub fn parse_index_extension(ext_word: u16) -> (String, String, i8, u8) {
     let idx_type = if ext_word & 0x8000 != 0 { "a" } else { "d" };
     let idx_num = (ext_word >> 12) & 0x7;
     let idx_reg = format!("{}{}", idx_type, idx_num);
     let idx_size = if ext_word & 0x0800 != 0 { "l" } else { "w" };
+    let scale = 1u8 << ((ext_word >> 9) & 0x3);
     let disp = ext_word as i8;
-    (idx_reg, idx_size.to_string(), disp)
+    (idx_reg, idx_size.to_string(), disp, scale)
 }
 
 /// Decode full 68020+ extension word format.
@@ -471,8 +500,8 @@ pub fn decode_ea(
         6 => {
             let ext_word = stream.read_word()?;
             if ext_word & 0x0100 == 0 || level < 2 {
-                let (idx_reg, idx_size, disp) = parse_index_extension(ext_word);
-                Ok(EAOperand::AddrIndex(reg, disp, idx_reg, idx_size))
+                let (idx_reg, idx_size, disp, scale) = parse_index_extension(ext_word);
+                Ok(EAOperand::AddrIndex(reg, disp, idx_reg, idx_size, scale))
             } else {
                 let mi = decode_full_ea(reg, ext_word, stream, inst_pc, false)?;
                 Ok(EAOperand::MemoryIndirect(mi))
@@ -497,9 +526,15 @@ pub fn decode_ea(
                 let ext_pc = stream.current_pc();
                 let ext_word = stream.read_word()?;
                 if ext_word & 0x0100 == 0 || level < 2 {
-                    let (idx_reg, idx_size, disp) = parse_index_extension(ext_word);
+                    let (idx_reg, idx_size, disp, scale) = parse_index_extension(ext_word);
                     let target = (ext_pc as i32 + disp as i32) as u32;
-                    Ok(EAOperand::PcIndex(disp as i32, target, idx_reg, idx_size))
+                    Ok(EAOperand::PcIndex(
+                        disp as i32,
+                        target,
+                        idx_reg,
+                        idx_size,
+                        scale,
+                    ))
                 } else {
                     let mi = decode_full_ea(reg, ext_word, stream, inst_pc, true)?;
                     Ok(EAOperand::MemoryIndirect(mi))
@@ -600,6 +635,26 @@ mod tests {
         assert_eq!(stream.current_pc(), 0x1002);
         assert_eq!(stream.read_word().unwrap(), 0x5678);
         assert!(stream.read_word().is_err());
+    }
+
+    /// Regression: `(d16,An)`/`(d8,An,Xn)` with disp==0 previously rendered
+    /// as `$0(a0)` instead of the conventional `(a0)`.
+    #[test]
+    fn test_zero_displacement_omits_dollar_zero() {
+        let labels = HashMap::new();
+        assert_eq!(
+            EAOperand::AddrDisp(0, 0).format(&labels),
+            "(a0)".to_string()
+        );
+        assert_eq!(
+            EAOperand::AddrIndex(0, 0, "d1".to_string(), "w".to_string(), 1).format(&labels),
+            "(a0,d1.w)".to_string()
+        );
+        // Nonzero displacement is unaffected.
+        assert_eq!(
+            EAOperand::AddrDisp(0, 4).format(&labels),
+            "$4(a0)".to_string()
+        );
     }
 
     #[test]

@@ -6,7 +6,9 @@ use clap::{Parser, ValueEnum};
 use m68k_asm::amiga_hunk_writer::generate_hunk_exe;
 use m68k_asm::assembler::Assembler;
 use m68k_asm::ieee695::generate_ieee695_sections;
-use m68k_asm::output::{OutputFormat, generate_elf_sections, generate_intel_hex, generate_srecord};
+use m68k_asm::output::{
+    OutputFormat, generate_binary, generate_elf_sections, generate_intel_hex, generate_srecord,
+};
 
 #[derive(Parser, Debug)]
 #[command(name = "m68k-asm")]
@@ -113,6 +115,19 @@ fn run(args: Args) -> Result<(), String> {
         eprintln!("{}", format_diagnostic(diag, &input_name));
     }
 
+    // The ERROR directive (and other non-fatal diagnostics collected into
+    // asm.errors rather than surfaced via assemble_bytes's Result) doesn't
+    // stop assembly, so assemble_bytes above can return Ok even though the
+    // source contains an ERROR. Previously nothing checked has_errors()
+    // here, so the CLI printed the error but still wrote an output file
+    // and exited 0 — a build script driving this CLI would see success.
+    if asm.errors.has_errors() {
+        return Err(format!(
+            "{}: assembly reported errors, no output written",
+            input_name
+        ));
+    }
+
     // Determine output path
     let output_path = args.output.clone().unwrap_or_else(|| {
         let mut p = args.input.clone();
@@ -142,17 +157,28 @@ fn run(args: Args) -> Result<(), String> {
     // Generate output
     let output_data = match args.format {
         OutputFormatArg::Binary => {
-            let mut bytes = Vec::new();
-            for instr in &asm.code {
-                for word in &instr.words {
-                    bytes.push((word >> 8) as u8);
-                    bytes.push((word & 0xFF) as u8);
+            // Previously concatenated `instr.words` directly, ignoring
+            // `instr.pc` entirely — a gap between ORG-separated blocks
+            // (e.g. `ORG $1000 / NOP / ORG $1010 / RTS`) collapsed to
+            // nothing, producing a file inconsistent with S-Record/Intel-
+            // Hex/ELF (which all honor `pc`) and silently dropping DS
+            // reservations. generate_binary fills gaps with zero bytes
+            // between the lowest and highest instruction address instead.
+            const MAX_BINARY_SIZE: usize = 16 * 1024 * 1024; // 68k address space
+            match generate_binary(&asm.code) {
+                Some((bytes, _base_addr)) => {
+                    if bytes.len() > MAX_BINARY_SIZE {
+                        return Err(format!(
+                            "binary output would be {} bytes (limit {} bytes) \
+                             — check for a large gap between ORG-separated blocks",
+                            bytes.len(),
+                            MAX_BINARY_SIZE
+                        ));
+                    }
+                    bytes
                 }
+                None => return Err("no code generated".to_string()),
             }
-            if bytes.is_empty() {
-                return Err("no code generated".to_string());
-            }
-            bytes
         }
         OutputFormatArg::Srecord => {
             let srec = generate_srecord(&asm.code, &args.srec_name);

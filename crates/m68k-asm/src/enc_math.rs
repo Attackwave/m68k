@@ -40,7 +40,27 @@ pub fn enc_add(
         return Ok(words);
     }
 
-    Err(AsmError::new("ADD destination must be a data register"))
+    // Dn to EA form (opmode bit 8 set, base 0xD100): the memory-destination
+    // direction of ADD, analogous to AND/OR's `enc_and`/`enc_or` in
+    // enc_logic.rs. Previously missing entirely, so `ADD D0,(A0)` was
+    // rejected with "ADD destination must be a data register" even though
+    // it's a standard, common instruction form. Base must be 0xD100, not
+    // 0xD1C0 — the latter hardcodes opmode bits 7-6 to `11`, which is the
+    // ADDA.L encoding, colliding with (and silently corrupting) the
+    // size_code that gets OR'd in right after.
+    if let Operand::DataReg(src_reg) = src {
+        let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALTERABLE_MEMORY, cpu)?;
+        let op = 0xD100
+            | ((size_code as u16) << 6)
+            | ((*src_reg as u16) << 9)
+            | ((dst_mode as u16) << 3)
+            | (dst_reg as u16);
+        words.push(op);
+        words.extend(dst_ext);
+        return Ok(words);
+    }
+
+    Err(AsmError::new("ADD: one operand must be a data register"))
 }
 
 /// Encode a SUB instruction.
@@ -74,7 +94,21 @@ pub fn enc_sub(
         return Ok(words);
     }
 
-    Err(AsmError::new("SUB destination must be a data register"))
+    // Dn to EA form (opmode bit 8 set, base 0x9100): see enc_add above for
+    // why the base must not hardcode opmode bits 7-6.
+    if let Operand::DataReg(src_reg) = src {
+        let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALTERABLE_MEMORY, cpu)?;
+        let op = 0x9100
+            | ((size_code as u16) << 6)
+            | ((*src_reg as u16) << 9)
+            | ((dst_mode as u16) << 3)
+            | (dst_reg as u16);
+        words.push(op);
+        words.extend(dst_ext);
+        return Ok(words);
+    }
+
+    Err(AsmError::new("SUB: one operand must be a data register"))
 }
 
 /// Encode MULU/MULU.L. `is_signed` selects MULS.L's ext-word bit 11 when
@@ -288,6 +322,9 @@ pub fn enc_quick(
     is_add: bool,
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
+    if !(1..=8).contains(&data) {
+        return Err(AsmError::new("quick immediate data must be 1-8"));
+    }
     let size_code = size_code(size)?;
     let data_enc = if data == 8 { 0 } else { data & 0x7 };
     let base = if is_add { 0x5000 } else { 0x5100 };
@@ -295,6 +332,24 @@ pub fn enc_quick(
     if let Operand::DataReg(dst_reg) = dst {
         let op =
             base | ((size_code as u16) << 6) | ((data_enc as u16) << 9) | ((*dst_reg as u16) << 3);
+        return Ok(vec![op]);
+    }
+
+    if let Operand::AddrReg(dst_reg) = dst {
+        // An is a valid ADDQ/SUBQ destination for .w/.l (the CPU always
+        // performs a 32-bit operation on An regardless of the size
+        // suffix), but NOT for .b — address registers have no byte-sized
+        // access. Previously An fell through to the ALTERABLE_MEMORY-only
+        // path below, which excludes AREG entirely, rejecting even the
+        // valid .w/.l forms (e.g. the very common `ADDQ #4,A0`).
+        if size_code == 0 {
+            return Err(AsmError::new("ADDQ/SUBQ.B does not support An"));
+        }
+        let op = base
+            | ((size_code as u16) << 6)
+            | ((data_enc as u16) << 9)
+            | (1 << 3)
+            | (*dst_reg as u16);
         return Ok(vec![op]);
     }
 
@@ -374,6 +429,56 @@ mod tests {
         assert_eq!(words, vec![0xD280]);
     }
 
+    /// Regression: the Dn-to-EA (memory-destination) direction of ADD/SUB
+    /// was missing entirely, so `ADD D0,(A0)` errored with "ADD
+    /// destination must be a data register" even though it's a standard
+    /// instruction form (AND/OR already support it via enc_and/enc_or).
+    /// Also covers a bug in the fix itself: the initial base opcode
+    /// (0xD1C0/0x91C0) hardcoded opmode bits 7-6 to `11`, colliding with
+    /// (and being unaffected by) the OR'd-in size_code, so every size
+    /// produced the ADDA.L/SUBA.L opcode instead of ADD/SUB — verified by
+    /// checking all three sizes disassemble as `add`/`sub`, not `adda`.
+    #[test]
+    fn test_add_sub_dn_to_ea_all_sizes() {
+        let words = enc_add(
+            &Operand::DataReg(0),
+            &Operand::AddrRegIndirect(0),
+            "b",
+            0,
+            "68000",
+        )
+        .unwrap();
+        assert_eq!(words, vec![0xD110]);
+        let words = enc_add(
+            &Operand::DataReg(0),
+            &Operand::AddrRegIndirect(0),
+            "w",
+            0,
+            "68000",
+        )
+        .unwrap();
+        assert_eq!(words, vec![0xD150]);
+        let words = enc_add(
+            &Operand::DataReg(0),
+            &Operand::AddrRegIndirect(0),
+            "l",
+            0,
+            "68000",
+        )
+        .unwrap();
+        assert_eq!(words, vec![0xD190]);
+
+        let words = enc_sub(
+            &Operand::DataReg(0),
+            &Operand::AddrRegIndirect(0),
+            "w",
+            0,
+            "68000",
+        )
+        .unwrap();
+        assert_eq!(words, vec![0x9150]);
+    }
+
     #[test]
     fn test_sub_b_d0_d1() {
         let words = enc_sub(&Operand::DataReg(0), &Operand::DataReg(1), "b", 0, "68000").unwrap();
@@ -390,6 +495,34 @@ mod tests {
     fn test_subq_1_d0() {
         let words = enc_quick(1, &Operand::DataReg(0), "l", 0, false, "68000").unwrap();
         assert_eq!(words, vec![0x5380]);
+    }
+
+    /// Regression: An previously fell through to the ALTERABLE_MEMORY-only
+    /// EA path (which excludes AREG), so `ADDQ #4,A0` — a common,
+    /// perfectly valid instruction — was rejected with "addressing mode
+    /// not allowed". An is valid for .w/.l (not .b, which has no
+    /// address-register form).
+    #[test]
+    fn test_addq_subq_areg_destination() {
+        // ADDQ.W #4,A0 -> 5848 (verified against the assembled+disassembled
+        // CLI output: `addq #$0004, a0`).
+        let words = enc_quick(4, &Operand::AddrReg(0), "w", 0, true, "68000").unwrap();
+        assert_eq!(words, vec![0x5848]);
+        // SUBQ.L #1,A3 -> 538B.
+        let words = enc_quick(1, &Operand::AddrReg(3), "l", 0, false, "68000").unwrap();
+        assert_eq!(words, vec![0x538B]);
+        // ADDQ.B #1,A0 must be rejected (no byte-sized An operation).
+        assert!(enc_quick(1, &Operand::AddrReg(0), "b", 0, true, "68000").is_err());
+    }
+
+    /// Regression: quick immediate data (1-8) had no range check, so
+    /// `#0` silently encoded as `#8` and `#9` as `#1` via the unguarded
+    /// `data & 0x7` mapping.
+    #[test]
+    fn test_addq_subq_rejects_out_of_range_data() {
+        assert!(enc_quick(0, &Operand::DataReg(0), "l", 0, true, "68000").is_err());
+        assert!(enc_quick(9, &Operand::DataReg(0), "l", 0, true, "68000").is_err());
+        assert!(enc_quick(8, &Operand::DataReg(0), "l", 0, true, "68000").is_ok());
     }
 
     #[test]

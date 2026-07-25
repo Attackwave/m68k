@@ -88,7 +88,8 @@ pub fn enc_movem_rm(
         reg_mask
     };
 
-    let allowed = AREG_IND | APOSTINC | APREDEC | ABSW | ABSL | PCDISP | PCINDEXED | AINDEXED;
+    let allowed =
+        AREG_IND | APOSTINC | APREDEC | AREG_DISP | AINDEXED | ABSW | ABSL | PCDISP | PCINDEXED;
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, allowed, cpu)?;
 
     if dst_mode < 2 {
@@ -111,7 +112,8 @@ pub fn enc_movem_mr(
     pc: u32,
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
-    let allowed = AREG_IND | APOSTINC | APREDEC | ABSW | ABSL | PCDISP | PCINDEXED | AINDEXED;
+    let allowed =
+        AREG_IND | APOSTINC | APREDEC | AREG_DISP | AINDEXED | ABSW | ABSL | PCDISP | PCINDEXED;
     let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, allowed, cpu)?;
 
     if src_mode < 2 {
@@ -179,7 +181,7 @@ pub fn enc_moves(
             "MOVES requires one register and one EA operand",
         ));
     };
-    let ea_allowed = DREG | AREG_IND | APOSTINC | APREDEC | AINDEXED | ABSW | ABSL;
+    let ea_allowed = DREG | AREG_IND | APOSTINC | APREDEC | AREG_DISP | AINDEXED | ABSW | ABSL;
     let (ea_mode, ea_reg, ea_ext) = encode_ea(ea_ast, size, pc, ea_allowed, cpu)?;
     let base = 0x0E00 | (size_code << 9);
     let op = base | ((ea_mode as u16) << 3) | (ea_reg as u16);

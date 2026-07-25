@@ -219,7 +219,21 @@ pub fn enc_bit_reg(
     };
     let is_data = matches!(dst, Operand::DataReg(_));
     let size = if is_data { "l" } else { "b" };
-    let allowed = if is_data { DATA } else { ALL };
+    // Memory-form category depends on the instruction per the M68000PRM:
+    // BTST's memory operand is read-only (DATA — no address-register,
+    // matching alterable/non-alterable data addressing), while
+    // BSET/BCLR/BCHG read-modify-write memory and so require DATA_ALT
+    // (alterable data — excludes PC-relative/immediate too). The Dn case
+    // above always uses `l` size regardless of mnemonic. Previously this
+    // used `ALL` (0xFFFF) for every memory form, which `check_ea` treats
+    // as a blanket bypass of validation entirely (see check_ea in
+    // ea_encode.rs) — e.g. `BTST #1,A0` or `BSET #1,(label,PC)` silently
+    // encoded a nonsensical EA instead of being rejected.
+    let allowed = if is_data || mnemonic == "btst" {
+        DATA
+    } else {
+        DATA_ALT
+    };
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, allowed, cpu)?;
     let mut words =
         vec![base | ((src_reg as u16) << 9) | ((dst_mode as u16) << 3) | (dst_reg as u16)];
@@ -244,7 +258,14 @@ pub fn enc_bit_imm(
     };
     let is_data = matches!(dst, Operand::DataReg(_));
     let size = if is_data { "l" } else { "b" };
-    let allowed = if is_data { DATA } else { ALL };
+    // See enc_bit_reg above: BTST's memory operand is read-only (DATA),
+    // BSET/BCLR/BCHG's is read-modify-write (DATA_ALT). Previously `ALL`
+    // (0xFFFF) bypassed validation entirely for every memory form.
+    let allowed = if is_data || mnemonic == "btst" {
+        DATA
+    } else {
+        DATA_ALT
+    };
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, allowed, cpu)?;
     let mut words = vec![base | ((dst_mode as u16) << 3) | (dst_reg as u16), bit];
     words.extend(dst_ext);
@@ -364,6 +385,31 @@ fn all_dreg(regs: &[&Operand]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: BTST/BSET/BCLR/BCHG's memory-form EA category used to
+    /// be `ALL` (0xFFFF), which check_ea previously treated as a blanket
+    /// bypass of ea_matches entirely — so invalid destinations (An for
+    /// BTST, which the PRM restricts to a read-only DATA operand; PC-
+    /// relative for BSET/BCLR/BCHG, which need a writable DATA_ALT
+    /// operand) were silently accepted instead of rejected.
+    #[test]
+    fn test_bit_ops_reject_invalid_memory_ea() {
+        // BTST #imm,An: An is not a valid BTST destination.
+        assert!(enc_bit_imm("btst", 1, &Operand::AddrReg(0), 0, "68000").is_err());
+        // BSET Dn,(d16,PC): PC-relative is read-only, not valid for a
+        // read-modify-write BSET destination.
+        assert!(enc_bit_reg("bset", 0, &Operand::PcRelativeDisp(4, false), 2, "68000").is_err());
+    }
+
+    #[test]
+    fn test_bit_ops_accept_valid_memory_ea() {
+        // BTST #1,D0 -> 0800 0001 (data-register form, size forced to .l).
+        let words = enc_bit_imm("btst", 1, &Operand::DataReg(0), 0, "68000").unwrap();
+        assert_eq!(words, vec![0x0800, 0x0001]);
+        // BSET #1,(A0) -> 08D0 0001.
+        let words = enc_bit_imm("bset", 1, &Operand::AddrRegIndirect(0), 0, "68000").unwrap();
+        assert_eq!(words, vec![0x08D0, 0x0001]);
+    }
 
     #[test]
     fn test_and_b_d0_d1() {

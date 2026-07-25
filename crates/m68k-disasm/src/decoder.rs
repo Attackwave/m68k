@@ -1510,6 +1510,26 @@ mod tests {
         }
     }
 
+    /// Regression: the brief-format index extension word's scale bits
+    /// (9-8, 68020+) were previously dropped during decode and hardcoded
+    /// to 1 in formatting, so a scaled index like `D1.W*4` silently
+    /// disassembled as `D1.W` even though the assembler encodes the scale
+    /// correctly — a round-trip break for every scaled brief-format index.
+    #[test]
+    fn test_decode_brief_index_scale_is_preserved() {
+        let labels = std::collections::HashMap::new();
+        // LEA $4(A0,D1.W*4),A2 -> 45F0 1404 (assembled/verified via CLI).
+        let bytes = [0x45, 0xF0, 0x14, 0x04];
+        let mut stream = InstructionStream::new(&bytes, 0);
+        let (_addr, result) = decode_next(&mut stream, "68020").unwrap();
+        if let DecodeResult::Instruction(inst) = result {
+            assert_eq!(inst.mnemonic, "lea");
+            assert_eq!(inst.operands[0].format(&labels), "$4(a0,d1.w*4)");
+        } else {
+            panic!("Expected instruction");
+        }
+    }
+
     #[test]
     fn test_decode_rtd() {
         let bytes = [0x4E, 0x74, 0x00, 0x0C];

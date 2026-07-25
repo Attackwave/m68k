@@ -120,7 +120,15 @@ pub fn generate_hunk_exe(sections: &SectionManager, symbols: &SymbolTable) -> Ve
             push_u32(&mut out, HUNK_SYMBOL);
             for (name, value) in section_symbols {
                 push_name(&mut out, name);
-                push_u32(&mut out, value - base);
+                // The first filter arm above (entry.section == Some(...))
+                // doesn't itself guarantee value >= base — only the
+                // section-less address-range fallback arm does — so an
+                // unusual ORG/SECTION combination could in principle
+                // produce a symbol whose value is below its section's
+                // base_addr(). `value - base` would then underflow
+                // (panic in debug, wrap in release). saturating_sub keeps
+                // this a plain (if wrong-looking) 0 offset instead.
+                push_u32(&mut out, value.saturating_sub(base));
             }
             push_u32(&mut out, 0); // terminator
         }
