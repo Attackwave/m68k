@@ -195,7 +195,12 @@ pub fn split_line(line: &str) -> (Option<String>, String, String, Vec<String>) {
     let mut quote_char = ' ';
     let mut comment_pos = None;
 
-    for (i, ch) in line.chars().enumerate() {
+    // `char_indices()` (not `chars().enumerate()`) is required here: the
+    // index must be a byte offset for the `line[..pos]` slice below, but
+    // `enumerate()` counts *characters*, which only coincides with the
+    // byte offset for pure-ASCII input. Any multi-byte UTF-8 character
+    // before a `;` would otherwise slice mid-codepoint and panic.
+    for (i, ch) in line.char_indices() {
         if in_quote {
             if ch == quote_char {
                 in_quote = false;
@@ -430,5 +435,19 @@ mod tests {
         );
         assert_eq!(result.0, Some("myLabel".to_string()));
         assert_eq!(result.1, "instruction");
+    }
+
+    #[test]
+    fn test_split_line_multibyte_utf8_before_comment_does_not_panic() {
+        // Fuzzing regression: the comment-stripping loop used to pair a
+        // `chars().enumerate()` *character* index with a byte-indexed
+        // `line[..pos]` slice. Any multi-byte UTF-8 character before a `;`
+        // made the character index diverge from the byte offset, slicing
+        // mid-codepoint and panicking ("byte index is not a char
+        // boundary"). `\u{fffd}` (replacement character, 3 bytes) is what
+        // `String::from_utf8_lossy` produces for invalid input, which is
+        // how the fuzz harness (assembler_pipeline) reached this.
+        let result = split_line("\u{fffd} ; comment");
+        assert_eq!(result.1, "\u{fffd}");
     }
 }

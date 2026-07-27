@@ -314,7 +314,11 @@ impl OperandTrait for MemoryIndirectOperand {
 
 fn format_signed(val: i32) -> String {
     if val < 0 {
-        format!("-${:x}", val.abs())
+        // `val.abs()` panics for `val == i32::MIN` (no positive
+        // counterpart exists in `i32`); `unsigned_abs()` returns the
+        // correct magnitude as `u32` instead, which is what a fuzzer
+        // found reachable via a disassembled displacement.
+        format!("-${:x}", val.unsigned_abs())
     } else {
         format!("${:x}", val)
     }
@@ -616,6 +620,16 @@ pub fn format_reg_list(mask: u16, is_addr: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Fuzzing regression (cargo-fuzz `disassemble` target): `format_signed`
+    /// used `val.abs()`, which panics ("attempt to negate with overflow")
+    /// for `i32::MIN` since its positive magnitude doesn't fit in `i32`.
+    /// A displacement field decoded straight from instruction bytes can
+    /// legitimately be `i32::MIN` (a raw 0x80000000 32-bit displacement).
+    #[test]
+    fn test_format_signed_i32_min_does_not_panic() {
+        assert_eq!(format_signed(i32::MIN), "-$80000000");
+    }
 
     #[test]
     fn test_sign_extend() {

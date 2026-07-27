@@ -120,6 +120,18 @@ impl<'a> Reader<'a> {
     }
 
     fn bytes(&mut self, n: usize) -> Result<Vec<u8>, HunkError> {
+        // Every caller derives `n` from an attacker-controlled length field
+        // (e.g. `name()`'s word_count*4, or a hunk's word_count*4 body
+        // size) with no upper bound of its own. Validating against the
+        // reader's own remaining length before allocating (rather than
+        // allocating `n` bytes and letting `read_exact` fail after the
+        // fact) avoids a multi-gigabyte allocation from a few-byte input —
+        // the same DoS pattern already fixed for the hunk-count/hunk-size
+        // tables above (see `read_hunk_executable`'s comments).
+        let remaining = self.cursor.get_ref().len() as u64 - self.cursor.position();
+        if n as u64 > remaining {
+            return Err(HunkError::new("unexpected end of file"));
+        }
         let mut buf = vec![0u8; n];
         self.cursor
             .read_exact(&mut buf)
@@ -286,6 +298,20 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
                 let word_count = r.u32()?;
                 if hunk != HUNK_BSS {
                     let body = r.bytes(word_count as usize * 4)?;
+                    // `word_count` here is independent of (and, for a
+                    // malformed file, need not agree with) the hunk's own
+                    // size from the HUNK_HEADER size table that
+                    // `contents[i]` was allocated with — a body longer
+                    // than the hunk it belongs to must be a load error,
+                    // not an out-of-bounds slice panic.
+                    if body.len() > contents[i].len() {
+                        return Err(HunkError::new(format!(
+                            "hunk {} body ({} bytes) exceeds its declared size ({} bytes)",
+                            i,
+                            body.len(),
+                            contents[i].len()
+                        )));
+                    }
                     contents[i][..body.len()].copy_from_slice(&body);
                 }
             }
@@ -323,7 +349,15 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
             HUNK_SYMBOL => {
                 while let Some(sym_name) = r.name()? {
                     let value = r.u32()?;
-                    symbols[i].push((sym_name, offsets[i] + value));
+                    // `value` is an attacker-controlled 32-bit offset read
+                    // straight from the file with no bound of its own;
+                    // wrapping (matching real 32-bit address-space
+                    // wraparound) rather than panicking on overflow is
+                    // consistent with `Reader::skip`'s `checked_add` used
+                    // for length accounting elsewhere in this module,
+                    // just applied to an address computation instead of a
+                    // cursor position.
+                    symbols[i].push((sym_name, offsets[i].wrapping_add(value)));
                 }
             }
             HUNK_DEBUG => {
@@ -451,6 +485,85 @@ mod tests {
 
         let err = read_hunk_executable(&buf, 0x1000).unwrap_err();
         assert!(err.0.contains("hunk size"), "unexpected error: {}", err.0);
+    }
+
+    /// Fuzzing regression (cargo-fuzz `amiga_hunk_parse` target): `Reader::
+    /// bytes(n)` used to allocate `vec![0u8; n]` before checking whether
+    /// the reader actually had `n` bytes left, so a resident-library-name
+    /// `word_count` field claiming ~4 billion bytes (from an 8-byte input:
+    /// just the magic plus one word_count longword) drove a multi-gigabyte
+    /// allocation immediately, well before the inevitable `read_exact`
+    /// failure — an OOM from a handful of attacker bytes.
+    #[test]
+    fn rejects_absurd_name_length_without_oom() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x00, 0x00, 0x03, 0xf3]); // HUNK_HEADER magic
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // resident-lib name word_count: absurd
+
+        let err = read_hunk_executable(&buf, 0x1000).unwrap_err();
+        assert!(
+            err.0.contains("unexpected end of file"),
+            "unexpected error: {}",
+            err.0
+        );
+    }
+
+    /// Fuzzing regression (cargo-fuzz `amiga_hunk_parse` target): a
+    /// `HUNK_SYMBOL` value is a raw attacker-controlled `u32` added
+    /// directly to the hunk's load offset with no bound of its own;
+    /// `offsets[i] + value` panicked ("attempt to add with overflow")
+    /// whenever the sum exceeded `u32::MAX`, e.g. a high `load_base` (or
+    /// a large earlier hunk) combined with a large symbol value.
+    #[test]
+    fn hunk_symbol_value_overflow_does_not_panic() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x00, 0x00, 0x03, 0xf3]); // HUNK_HEADER magic
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // empty resident-library list
+        buf.extend_from_slice(&1u32.to_be_bytes()); // hunk_count = 1
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // first_hunk
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // last_hunk
+        buf.extend_from_slice(&0u32.to_be_bytes()); // hunk size: 0 longwords
+        buf.extend_from_slice(&HUNK_CODE.to_be_bytes());
+        buf.extend_from_slice(&0u32.to_be_bytes()); // word_count = 0 (empty body)
+        buf.extend_from_slice(&HUNK_SYMBOL.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // name word_count = 1 (4 bytes)
+        buf.extend_from_slice(b"sym\0");
+        buf.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes()); // symbol value: max
+        buf.extend_from_slice(&0u32.to_be_bytes()); // name list terminator
+        buf.extend_from_slice(&HUNK_END.to_be_bytes());
+
+        // load_base near u32::MAX makes offsets[0] + value overflow.
+        let exe = read_hunk_executable(&buf, 0xFFFF_FFF0).unwrap();
+        assert_eq!(exe.sections[0].symbols.len(), 1);
+    }
+
+    /// Fuzzing regression (cargo-fuzz `amiga_hunk_parse` target): a
+    /// `HUNK_CODE`/`HUNK_DATA` block's own `word_count` field is
+    /// independent of the hunk's size from the `HUNK_HEADER` size table
+    /// that `contents[i]` was allocated with — both are attacker-controlled
+    /// and a malformed file can disagree between them. A body longer than
+    /// its declared hunk size panicked ("range end index out of range")
+    /// on the fixed-size slice write instead of erroring cleanly.
+    #[test]
+    fn rejects_hunk_body_larger_than_declared_hunk_size() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x00, 0x00, 0x03, 0xf3]); // HUNK_HEADER magic
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // empty resident-library list
+        buf.extend_from_slice(&1u32.to_be_bytes()); // hunk_count = 1
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // first_hunk
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // last_hunk
+        buf.extend_from_slice(&0u32.to_be_bytes()); // declared hunk size: 0 longwords
+        buf.extend_from_slice(&HUNK_CODE.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes()); // body word_count = 1 (4 bytes) -- disagrees
+        buf.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        buf.extend_from_slice(&HUNK_END.to_be_bytes());
+
+        let err = read_hunk_executable(&buf, 0x1000).unwrap_err();
+        assert!(
+            err.0.contains("exceeds its declared size"),
+            "unexpected error: {}",
+            err.0
+        );
     }
 
     #[test]

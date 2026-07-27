@@ -66,6 +66,8 @@ pub enum ParserType {
     Eor,
     Rtd,
     Bkpt,
+    MovecFromCr,
+    MovecToCr,
     Movep,
     Bitfield,
     Pmove,
@@ -1318,6 +1320,28 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: 0,
             cpu: "68000",
             parser: ParserType::Trapv,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // MOVEC Cr,Rn (control register to general register). 68010+.
+            mask: 0xFFFF,
+            value: 0x4E7A,
+            mnemonic: "MOVEC",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68010",
+            parser: ParserType::MovecFromCr,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // MOVEC Rn,Cr (general register to control register). 68010+.
+            mask: 0xFFFF,
+            value: 0x4E7B,
+            mnemonic: "MOVEC",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68010",
+            parser: ParserType::MovecToCr,
             fixed_size: None,
         },
         OpcodePattern {

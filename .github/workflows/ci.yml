@@ -51,3 +51,40 @@ jobs:
             target/release/m68k-asm
             target/release/m68k-disasm
             target/release/m68k-floppy
+
+  fuzz-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz smoke run (60s per target)
+        # Not a full fuzzing campaign — just enough per-PR signal to catch
+        # an obviously broken target or an immediately-reachable panic,
+        # the same class of bug that a 60s local run already found twice
+        # while setting this up (a UTF-8 char-boundary panic in
+        # tokens.rs, an OOM from an unbounded allocation in
+        # amiga_hunk.rs's Reader::bytes). ASAN_OPTIONS=symbolize=0 avoids
+        # a slow/blocking external symbolizer call on every newly
+        # discovered coverage edge.
+        env:
+          ASAN_OPTIONS: symbolize=0
+        run: |
+          for target in disassemble amiga_hunk_parse assembler_pipeline floppy_adf floppy_uae floppy_ipf; do
+            echo "::group::fuzz $target"
+            cargo fuzz run "$target" -- -max_total_time=60 -timeout=10
+            echo "::endgroup::"
+          done

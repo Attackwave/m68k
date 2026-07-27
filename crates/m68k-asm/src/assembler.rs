@@ -635,12 +635,18 @@ fn parse_register(text: &str) -> Option<Operand> {
 
 /// Parse (An) - address register indirect.
 fn parse_parens_register(text: &str) -> Option<u8> {
+    // `strip_prefix`/`strip_suffix` (not byte-index slicing) are required
+    // here: they only match at an actual character boundary and return
+    // `None` otherwise, whereas slicing with a hardcoded byte offset like
+    // `&trimmed[1..]` panics if that offset lands inside a multi-byte
+    // UTF-8 character (a fuzzing-found crash: a leading multi-byte
+    // character made `trimmed.starts_with('(')` false, but the sibling
+    // `)+`/-( ` variants below only checked the *end*/*start* substring,
+    // not both, so the byte-offset slice for the other side still ran).
     let trimmed = text.trim();
-    if trimmed.starts_with('(') && trimmed.ends_with(')') {
-        let inner = &trimmed[1..trimmed.len() - 1];
-        if let Some(Operand::AddrReg(n)) = parse_register(inner) {
-            return Some(n);
-        }
+    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    if let Some(Operand::AddrReg(n)) = parse_register(inner) {
+        return Some(n);
     }
     None
 }
@@ -648,11 +654,9 @@ fn parse_parens_register(text: &str) -> Option<u8> {
 /// Parse (An)+ - post-increment.
 fn parse_parens_register_plus(text: &str) -> Option<u8> {
     let trimmed = text.trim();
-    if trimmed.ends_with(")+") {
-        let inner = &trimmed[1..trimmed.len() - 2];
-        if let Some(Operand::AddrReg(n)) = parse_register(inner) {
-            return Some(n);
-        }
+    let inner = trimmed.strip_prefix('(')?.strip_suffix(")+")?;
+    if let Some(Operand::AddrReg(n)) = parse_register(inner) {
+        return Some(n);
     }
     None
 }
@@ -660,11 +664,9 @@ fn parse_parens_register_plus(text: &str) -> Option<u8> {
 /// Parse -(An) - pre-decrement.
 fn parse_minus_parens_register(text: &str) -> Option<u8> {
     let trimmed = text.trim();
-    if trimmed.starts_with("-(") && trimmed.ends_with(')') {
-        let inner = &trimmed[2..trimmed.len() - 1];
-        if let Some(Operand::AddrReg(n)) = parse_register(inner) {
-            return Some(n);
-        }
+    let inner = trimmed.strip_prefix("-(")?.strip_suffix(')')?;
+    if let Some(Operand::AddrReg(n)) = parse_register(inner) {
+        return Some(n);
     }
     None
 }
@@ -1217,6 +1219,92 @@ pub struct Assembler {
     pub sections: SectionManager,
     /// RS (structure offset) counter for struct layout.
     pub rs_counter: u32,
+    /// `OPT` directive flag state, updated as `OPT` lines are processed.
+    pub opt: OptState,
+}
+
+/// Tracks `OPT` directive flags (`OPT flag[n][+-]`, comma-separated,
+/// vasm/Devpac syntax — e.g. `OPT O+,W5-`). Flags are letter-coded,
+/// optionally followed by a numeric sub-option, followed by `+` (enable)
+/// or `-` (disable). Most OPT flags configure optimizer/listing behavior
+/// this assembler doesn't implement as distinct passes (there's no
+/// separate "optimize branches" toggle — relaxation always runs); the one
+/// directly actionable here is `Wn` (suppress a specific warning number),
+/// since warnings are already a numbered concept in some Motorola
+/// assemblers' OPT docs. This assembler's warnings aren't numbered
+/// (see `ErrorCollector`), so `Wn-` is tracked but not yet wired to
+/// filter specific warnings — the flag state is public and queryable
+/// so callers/future warning sites can check it.
+#[derive(Debug, Clone, Default)]
+pub struct OptState {
+    /// Plain letter flags without a numeric suffix, e.g. `OPT O+` -> `flags['O'] = true`.
+    pub flags: HashMap<char, bool>,
+    /// Numbered flags, e.g. `OPT W5-` -> `numbered[('W', 5)] = false`.
+    pub numbered: HashMap<(char, u32), bool>,
+}
+
+impl OptState {
+    /// Parse and apply one comma-separated `OPT` argument list, returning
+    /// a warning message for each malformed entry (e.g. missing `+`/`-`,
+    /// empty flag letter) instead of silently ignoring it — previously
+    /// `OPT` accepted and discarded every argument unconditionally.
+    fn apply(&mut self, args: &[String]) -> Vec<String> {
+        let mut warnings = Vec::new();
+        for raw in args {
+            for entry in raw.split(',') {
+                let entry = entry.trim();
+                if entry.is_empty() {
+                    continue;
+                }
+                match parse_opt_flag(entry) {
+                    Some((letter, number, enabled)) => match number {
+                        Some(n) => {
+                            self.numbered.insert((letter, n), enabled);
+                        }
+                        None => {
+                            self.flags.insert(letter, enabled);
+                        }
+                    },
+                    None => {
+                        warnings.push(format!("OPT: ignoring malformed option '{}'", entry));
+                    }
+                }
+            }
+        }
+        warnings
+    }
+
+    /// Whether a specific numbered warning has been disabled via `OPT
+    /// Wn-`. Not yet consulted anywhere (this assembler's warnings don't
+    /// carry numbers to check against), but exposed for forward
+    /// compatibility and direct testing of the OPT-parsing behavior.
+    pub fn warning_disabled(&self, n: u32) -> bool {
+        self.numbered.get(&('W', n)) == Some(&false)
+    }
+}
+
+/// Parse a single `OPT` flag entry like `O+`, `W5-`, `D2+` into
+/// `(letter, optional_number, enabled)`. Returns `None` for anything not
+/// matching `<letter><digits?><+|->`.
+fn parse_opt_flag(entry: &str) -> Option<(char, Option<u32>, bool)> {
+    let mut chars = entry.chars();
+    let letter = chars.next()?.to_ascii_uppercase();
+    if !letter.is_ascii_alphabetic() {
+        return None;
+    }
+    let rest: String = chars.collect();
+    let (digits, sign) = rest.split_at(rest.len().checked_sub(1)?);
+    let enabled = match sign {
+        "+" => true,
+        "-" => false,
+        _ => return None,
+    };
+    let number = if digits.is_empty() {
+        None
+    } else {
+        Some(digits.parse::<u32>().ok()?)
+    };
+    Some((letter, number, enabled))
 }
 
 impl Assembler {
@@ -1237,6 +1325,7 @@ impl Assembler {
             macro_unique_counter: 0,
             sections: SectionManager::new(origin),
             rs_counter: 0,
+            opt: OptState::default(),
         }
     }
 
@@ -2395,6 +2484,14 @@ impl Assembler {
     ) -> Result<(), AsmError> {
         let pc = self.pc;
 
+        // Central CPU-gating check, before any mnemonic-specific dispatch:
+        // covers the branch path, the 3-operand special forms (CAS/CAS2/
+        // PACK/UNPK/PFLUSH/PTESTR/PTESTW), and the generic encoder.rs
+        // dispatch in one place, replacing the previously scattered (and
+        // inconsistent, some missing entirely) per-encoder cpu checks.
+        m68k_core::cpu_gate::check_mnemonic_cpu(&mnemonic.to_uppercase(), &self.cpu)
+            .map_err(|msg| AsmError::with_line(msg, line.line_no))?;
+
         // Parse operands
         let src = if !operand_texts.is_empty() {
             parse_operand_text(&operand_texts[0], &self.symbols, pc).ok()
@@ -2539,6 +2636,12 @@ impl Assembler {
                 .map_err(|e| AsmError::with_line(e.message, line.line_no))?
             }
             "CAS" => {
+                if operand_texts.len() != 3 {
+                    return Err(AsmError::with_line(
+                        "CAS takes exactly 3 operands: Dc,Du,<ea>".to_string(),
+                        line.line_no,
+                    ));
+                }
                 let sz = size.unwrap_or("w");
                 let dc = parse_operand_text(&operand_texts[0], &self.symbols, pc)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
@@ -2550,6 +2653,15 @@ impl Assembler {
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?
             }
             "PACK" | "UNPK" => {
+                if operand_texts.len() != 3 {
+                    return Err(AsmError::with_line(
+                        format!(
+                            "{} takes exactly 3 operands: src,dst,#adjustment",
+                            mnemonic_upper
+                        ),
+                        line.line_no,
+                    ));
+                }
                 let is_pack = mnemonic_upper == "PACK";
                 let s = parse_operand_text(&operand_texts[0], &self.symbols, pc)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
@@ -2905,7 +3017,9 @@ impl Assembler {
             | "endr" | "xref" | "xdef" | "public" | "extern" | "mexit" | "exitm" | "list"
             | "nolist" | "page" | "title" => Ok(()),
             "opt" => {
-                // OPT arguments are processed but currently no state is tracked
+                for msg in self.opt.apply(args) {
+                    self.errors.warning(msg, Some(line.line_no));
+                }
                 Ok(())
             }
             "print" | "printt" => {
@@ -3366,53 +3480,206 @@ fn parse_float_value(text: &str, format: &str, line_no: usize) -> Result<Vec<u16
             ])
         }
         "x" | "p" => {
-            // Extended precision (96-bit) and packed decimal (96-bit) are
-            // only supported as raw hex/integer literals here — there's no
-            // IEEE-754-extended or true packed-BCD conversion from a
-            // decimal literal like "3.14". Previously an unparseable
-            // literal (e.g. any float-looking value) silently fell back
-            // to `unwrap_or(0)`, emitting six zero words with no
-            // diagnostic instead of surfacing the limitation.
+            // A raw hex literal ($...) always means "these are the literal
+            // 96-bit contents", for either format — bypasses conversion
+            // entirely, e.g. for embedding pre-computed constants.
             let text = text.trim();
-            let val: u128 = if let Some(hex) = text.strip_prefix('$') {
-                u128::from_str_radix(hex, 16).map_err(|_| {
-                    AsmError::with_line(
-                        format!(
-                            "DC.{} requires a hex ($...) or integer literal; \
-                             float-to-extended/packed-decimal conversion is not supported: {}",
-                            format.to_uppercase(),
-                            text
-                        ),
-                        line_no,
-                    )
-                })?
+            if let Some(hex) = text.strip_prefix('$') {
+                let val = u128::from_str_radix(hex, 16).map_err(|_| {
+                    AsmError::with_line(format!("invalid hex literal: {}", text), line_no)
+                })?;
+                return Ok(u128_to_96bit_words(val));
+            }
+
+            if format == "x" {
+                // IEEE-754 80-bit extended precision, stored in the
+                // Motorola 96-bit DC.X slot: word0 = sign+exponent,
+                // word1 = reserved (0), words 2-5 = 64-bit mantissa with
+                // explicit integer bit.
+                let val: f64 = text.parse().map_err(|_| {
+                    AsmError::with_line(format!("invalid DC.X literal: {}", text), line_no)
+                })?;
+                Ok(f64_to_extended_words(val))
             } else {
-                text.parse::<u128>().map_err(|_| {
-                    AsmError::with_line(
-                        format!(
-                            "DC.{} requires a hex ($...) or integer literal; \
-                             float-to-extended/packed-decimal conversion is not supported: {}",
-                            format.to_uppercase(),
-                            text
-                        ),
-                        line_no,
-                    )
-                })?
-            };
-            Ok(vec![
-                ((val >> 80) & 0xFFFF) as u16,
-                ((val >> 64) & 0xFFFF) as u16,
-                ((val >> 48) & 0xFFFF) as u16,
-                ((val >> 32) & 0xFFFF) as u16,
-                ((val >> 16) & 0xFFFF) as u16,
-                (val & 0xFFFF) as u16,
-            ])
+                // Motorola packed-BCD decimal: word0 bit15 = sign,
+                // bits 11-0 = signed exponent (BCD, sign in bit 11),
+                // words 1-5 = 17 BCD mantissa digits (first digit alone
+                // in bits 3-0 of word1, implied decimal point after it).
+                packed_decimal_words(text, line_no)
+            }
         }
         _ => Err(AsmError::with_line(
             format!("unsupported float format: {}", format),
             line_no,
         )),
     }
+}
+
+/// Split a raw 96-bit (12-byte) value into six big-endian 16-bit words, for
+/// the DC.X/DC.P raw-hex-literal path.
+fn u128_to_96bit_words(val: u128) -> Vec<u16> {
+    vec![
+        ((val >> 80) & 0xFFFF) as u16,
+        ((val >> 64) & 0xFFFF) as u16,
+        ((val >> 48) & 0xFFFF) as u16,
+        ((val >> 32) & 0xFFFF) as u16,
+        ((val >> 16) & 0xFFFF) as u16,
+        (val & 0xFFFF) as u16,
+    ]
+}
+
+/// Convert an `f64` to the 96-bit (6-word) Motorola DC.X representation:
+/// IEEE-754 80-bit extended precision (1 sign + 15 exponent bits, then an
+/// explicit-integer-bit 64-bit mantissa) padded to 96 bits with a reserved
+/// zero word after the sign/exponent word, matching vasm/Devpac's DC.X
+/// layout (word0 = sign+exp, word1 = reserved, words 2-5 = mantissa).
+///
+/// Unlike the double -> extended conversion previously removed from
+/// `m68k-core::floats` (which round-tripped through a lossy `to_f64` that
+/// truncated the mantissa to 7 significant bits), this only ever goes
+/// double -> extended: DC.X is assembler-only (write bytes from a text
+/// literal), so there is no corresponding "format an extended value back
+/// as text" path that would need the inverse conversion.
+fn f64_to_extended_words(val: f64) -> Vec<u16> {
+    let bits = val.to_bits();
+    let sign = (bits >> 63) as u16;
+    let exp64 = ((bits >> 52) & 0x7FF) as i32;
+    let frac64 = bits & 0x000F_FFFF_FFFF_FFFF;
+
+    let (exp15, mantissa64): (u16, u64) = if exp64 == 0 {
+        if frac64 == 0 {
+            // Zero (signed).
+            (0, 0)
+        } else {
+            // Subnormal double: normalize into extended's normal range,
+            // since extended precision has a wider exponent field and can
+            // represent every subnormal double as a normal extended value.
+            let leading_zeros = frac64.leading_zeros() - 12; // frac64 is 52 significant bits in a u64
+            let shift = leading_zeros + 1;
+            let mantissa = (frac64 << shift) & 0x000F_FFFF_FFFF_FFFF;
+            let exp80 = 16383 - 1022 - leading_zeros as i32;
+            (exp80 as u16, 0x8000_0000_0000_0000 | (mantissa << 11))
+        }
+    } else if exp64 == 0x7FF {
+        // Inf or NaN: extended uses all-1s exponent too, explicit integer
+        // bit set, mantissa nonzero (with the original NaN payload,
+        // shifted up) for NaN or zero for Inf.
+        (0x7FFF, 0x8000_0000_0000_0000 | (frac64 << 11))
+    } else {
+        // Normal double: rebias the exponent (1023 -> 16383) and shift the
+        // 52-bit fraction up to a 63-bit fraction with an explicit leading
+        // integer bit (bit 63) set, per the extended-precision format.
+        let exp80 = exp64 - 1023 + 16383;
+        (exp80 as u16, 0x8000_0000_0000_0000 | (frac64 << 11))
+    };
+
+    vec![
+        (sign << 15) | exp15,
+        0,
+        ((mantissa64 >> 48) & 0xFFFF) as u16,
+        ((mantissa64 >> 32) & 0xFFFF) as u16,
+        ((mantissa64 >> 16) & 0xFFFF) as u16,
+        (mantissa64 & 0xFFFF) as u16,
+    ]
+}
+
+/// Convert a decimal-literal string (e.g. `"3.14"`, `"-123"`, `"1.5e10"`)
+/// to the 96-bit (6-word) Motorola packed-BCD decimal representation used
+/// by DC.P: word0 bit 15 = mantissa sign, bit 12 = exponent sign, bits
+/// 11-0 = 3 BCD exponent digits; word1 bits 3-0 = the single BCD digit
+/// before the decimal point; words 2-5 = the remaining 16 BCD mantissa
+/// digits (4 per word), most-significant first.
+fn packed_decimal_words(text: &str, line_no: usize) -> Result<Vec<u16>, AsmError> {
+    let text = text.trim();
+    let invalid = || AsmError::with_line(format!("invalid DC.P literal: {}", text), line_no);
+
+    let (mantissa_sign, rest) = match text.strip_prefix('-') {
+        Some(r) => (1u16, r),
+        None => (0u16, text.strip_prefix('+').unwrap_or(text)),
+    };
+
+    // Split off an optional exponent suffix (e/E followed by an optional
+    // sign and digits), then the optional fractional part.
+    let (mantissa_part, exp_part) = match rest.find(['e', 'E']) {
+        Some(pos) => (&rest[..pos], &rest[pos + 1..]),
+        None => (rest, ""),
+    };
+
+    let (exp_sign, exp_digits) = if let Some(e) = exp_part.strip_prefix('-') {
+        (1u16, e)
+    } else {
+        (0u16, exp_part.strip_prefix('+').unwrap_or(exp_part))
+    };
+    let explicit_exp: i32 = if exp_digits.is_empty() {
+        0
+    } else {
+        exp_digits.parse().map_err(|_| invalid())?
+    };
+
+    let (int_part, frac_part) = match mantissa_part.find('.') {
+        Some(pos) => (&mantissa_part[..pos], &mantissa_part[pos + 1..]),
+        None => (mantissa_part, ""),
+    };
+    if !int_part.chars().all(|c| c.is_ascii_digit())
+        || !frac_part.chars().all(|c| c.is_ascii_digit())
+        || (int_part.is_empty() && frac_part.is_empty())
+    {
+        return Err(invalid());
+    }
+
+    // Normalize to exactly 17 significant decimal digits (the packed
+    // format's fixed mantissa width) with the decimal point after the
+    // first digit, adjusting the exponent accordingly — e.g. "314.159"
+    // becomes digits "31415900000000000" with explicit_exp bumped by 2
+    // (matching scientific notation 3.14159 x 10^2).
+    let mut digits: Vec<u8> = int_part
+        .bytes()
+        .chain(frac_part.bytes())
+        .map(|b| b - b'0')
+        .collect();
+    // Point position (digits before the decimal) in the un-normalized
+    // digit string; used to compute how far the point moves once
+    // normalized to a single leading digit.
+    let point_pos = int_part.len() as i32;
+
+    // Strip leading zeros (they don't count as significant digits and
+    // shift where the normalized point lands), but keep at least one
+    // digit so an all-zero literal still normalizes to "0".
+    let leading_zeros = digits.iter().take_while(|&&d| d == 0).count();
+    let effective_point = point_pos - leading_zeros as i32;
+    digits.drain(0..leading_zeros.min(digits.len().saturating_sub(1)));
+
+    let is_zero = digits.iter().all(|&d| d == 0);
+    let normalized_exp = if is_zero { 0 } else { effective_point - 1 };
+    let total_exp = explicit_exp + normalized_exp;
+    let (exp_sign, exp_mag) = if total_exp < 0 {
+        (1u16, (-total_exp) as u32)
+    } else {
+        (exp_sign, total_exp as u32)
+    };
+    if exp_mag > 999 {
+        return Err(AsmError::with_line(
+            format!("DC.P exponent out of range (-999..=999): {}", text),
+            line_no,
+        ));
+    }
+
+    digits.truncate(17);
+    digits.resize(17, 0);
+
+    let bcd_exp = ((exp_mag / 100) % 10) << 8 | ((exp_mag / 10) % 10) << 4 | (exp_mag % 10);
+    let word0 = (mantissa_sign << 15) | (exp_sign << 12) | (bcd_exp as u16);
+
+    let word1 = digits[0] as u16;
+    let mut words = vec![word0, word1];
+    for chunk in digits[1..17].chunks(4) {
+        let w = (chunk[0] as u16) << 12
+            | (chunk[1] as u16) << 8
+            | (chunk[2] as u16) << 4
+            | (chunk[3] as u16);
+        words.push(w);
+    }
+    Ok(words)
 }
 
 /// Estimate branch instruction size in bytes (for pass 1).
@@ -4301,15 +4568,151 @@ after:
     /// literal, since neither format is actually implemented), emitting
     /// six zero words with no diagnostic instead of a clear error.
     #[test]
-    fn test_dc_x_rejects_float_literal_instead_of_emitting_zeros() {
+    fn test_dc_x_converts_float_literal_instead_of_emitting_zeros() {
+        // Regression for 2.7/4.5: this used to silently emit six zero
+        // words via `unwrap_or(0)`. It was then changed to reject float
+        // literals outright as an interim fix; now it does the real
+        // conversion, so a plausible non-zero, non-error encoding is the
+        // right behavior again.
         let mut asm = Assembler::new(0);
         let result = asm.assemble("    DC.X 3.14\n");
-        assert!(result.is_err());
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        assert_ne!(asm.code[0].words, vec![0, 0, 0, 0, 0, 0]);
 
         // Hex and plain integer literals must keep working.
         let mut asm = Assembler::new(0);
         let result = asm.assemble("    DC.X $1234\n");
         assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_dc_x_extended_precision_reference_value() {
+        // 1.0 in IEEE-754 80-bit extended: sign=0, exponent=16383=$3FFF
+        // (bias), explicit integer bit set, zero fraction. Motorola's
+        // 96-bit DC.X slot pads with a reserved zero word after the
+        // sign/exponent word.
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DC.X 1.0\n");
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        assert_eq!(
+            asm.code[0].words,
+            vec![0x3FFF, 0x0000, 0x8000, 0x0000, 0x0000, 0x0000]
+        );
+    }
+
+    #[test]
+    fn test_dc_x_negative_value_sets_sign_bit() {
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DC.X -1.0\n");
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        // Sign bit (word0 bit 15) set, same exponent/mantissa as +1.0.
+        assert_eq!(asm.code[0].words[0], 0x8000 | 0x3FFF);
+        assert_eq!(
+            &asm.code[0].words[1..],
+            &[0x0000, 0x8000, 0x0000, 0x0000, 0x0000]
+        );
+    }
+
+    #[test]
+    fn test_dc_x_zero() {
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DC.X 0.0\n");
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        assert_eq!(asm.code[0].words, vec![0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_dc_p_simple_integer() {
+        // DC.P 123: mantissa sign 0, exponent 0 (2 is the normalized
+        // exponent for 3 significant digits "123" -> 1.23 x 10^2), 17
+        // BCD digits "12300000000000000".
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DC.P 123\n");
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        let words = &asm.code[0].words;
+        assert_eq!(words[0], 0x0002); // sign=0, exp_sign=0, exponent=2 (BCD)
+        assert_eq!(words[1], 0x0001); // leading digit '1'
+        assert_eq!(words[2], 0x2300); // digits '2','3','0','0'
+        assert_eq!(words[3], 0x0000);
+        assert_eq!(words[4], 0x0000);
+        assert_eq!(words[5], 0x0000);
+    }
+
+    #[test]
+    fn test_dc_p_negative_with_fraction() {
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DC.P -3.14\n");
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        let words = &asm.code[0].words;
+        assert_eq!(words[0] & 0x8000, 0x8000, "mantissa sign bit must be set");
+        assert_eq!(
+            words[0] & 0x0FFF,
+            0x0000,
+            "exponent should be 0 (3.14 = 3.14 x 10^0)"
+        );
+        assert_eq!(words[1], 0x0003); // leading digit '3'
+        assert_eq!(words[2], 0x1400); // digits '1','4','0','0'
+    }
+
+    #[test]
+    fn test_dc_p_zero() {
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DC.P 0\n");
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        assert_eq!(asm.code[0].words, vec![0, 0, 0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_dc_p_hex_literal_still_raw() {
+        // A $-prefixed literal is still the raw 96-bit contents verbatim,
+        // for both DC.X and DC.P, not run through conversion.
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DC.P $000102030405060708090A0B\n");
+        assert!(result.is_ok(), "assemble failed: {:?}", result.err());
+        assert_eq!(
+            asm.code[0].words,
+            vec![0x0001, 0x0203, 0x0405, 0x0607, 0x0809, 0x0A0B]
+        );
+    }
+
+    #[test]
+    fn test_dc_p_invalid_literal_is_error() {
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble("    DC.P not_a_number\n");
+        assert!(result.is_err());
+    }
+
+    /// Fuzzing regression (cargo-fuzz `assembler_pipeline` target, found
+    /// while extending DC.X/DC.P coverage for 4.5): `UNPK`/`PACK`/`CAS`
+    /// indexed straight into `operand_texts[0..2]` without checking the
+    /// operand count first, unlike every other multi-operand special form
+    /// in this match (CAS2/PFLUSH/PTESTR/PTESTW all validate `len()`
+    /// first). `{UNPK` alone (with no operands at all) panicked with an
+    /// out-of-bounds index instead of reporting a normal assembler error.
+    #[test]
+    fn test_unpk_pack_cas_without_operands_is_error_not_panic() {
+        let mut asm = Assembler::new(0);
+        assert!(asm.assemble("    UNPK\n").is_err());
+        let mut asm = Assembler::new(0);
+        assert!(asm.assemble("    PACK\n").is_err());
+        let mut asm = Assembler::new(0);
+        assert!(asm.assemble("    CAS D0\n").is_err());
+    }
+
+    /// Fuzzing regression (cargo-fuzz `assembler_pipeline` target):
+    /// `parse_parens_register_plus`/`parse_minus_parens_register` sliced
+    /// operand text with hardcoded byte offsets (`&trimmed[1..]`,
+    /// `&trimmed[2..]`) after checking only *one* end of the string
+    /// (`ends_with(")+")` / `starts_with("-(")`) — a multi-byte UTF-8
+    /// replacement character (`\u{fffd}`, produced by the fuzz harness's
+    /// `String::from_utf8_lossy` on invalid byte sequences) at the
+    /// unchecked end made the fixed byte offset land mid-codepoint and
+    /// panic, instead of `parse_operand_text` cleanly rejecting the operand.
+    #[test]
+    fn test_parens_register_multibyte_utf8_does_not_panic() {
+        assert_eq!(parse_parens_register_plus("\u{fffd}\u{fffd})+"), None);
+        assert_eq!(parse_minus_parens_register("\u{fffd}\u{fffd})"), None);
+        assert_eq!(parse_parens_register("(\u{fffd}\u{fffd}"), None);
     }
 
     /// A forward-referenced symbol used as a memory operand must be
@@ -4618,6 +5021,40 @@ field2 DS.W 1
         assert!(result.is_ok(), "OPT failed: {:?}", result.err());
         assert_eq!(asm.code.len(), 1);
         assert_eq!(asm.code[0].words, vec![0x4E71]);
+        // N2/4.9: OPT flags are now tracked, not just accepted-and-discarded.
+        assert_eq!(asm.opt.flags.get(&'A'), Some(&true));
+        assert_eq!(asm.opt.flags.get(&'F'), Some(&true));
+    }
+
+    #[test]
+    fn test_opt_numbered_flag_tracked() {
+        let mut asm = Assembler::new(0x1000);
+        let result = asm.assemble("    OPT W5-\n");
+        assert!(result.is_ok(), "OPT failed: {:?}", result.err());
+        assert!(asm.opt.warning_disabled(5));
+        assert!(!asm.opt.warning_disabled(6));
+    }
+
+    #[test]
+    fn test_opt_flag_can_be_toggled_back() {
+        let mut asm = Assembler::new(0x1000);
+        asm.assemble("    OPT O+\nOPT O-\n").unwrap();
+        assert_eq!(asm.opt.flags.get(&'O'), Some(&false));
+    }
+
+    #[test]
+    fn test_opt_malformed_entry_warns_instead_of_silently_ignoring() {
+        let mut asm = Assembler::new(0x1000);
+        let result = asm.assemble("    OPT bogus\n");
+        assert!(result.is_ok(), "OPT failed: {:?}", result.err());
+        assert!(
+            asm.errors
+                .warnings
+                .iter()
+                .any(|w| w.message.contains("malformed option")),
+            "expected a malformed-option warning, got: {:?}",
+            asm.errors.warnings
+        );
     }
 
     #[test]
@@ -4653,6 +5090,7 @@ field2 DS.W 1
     #[test]
     fn test_assemble_movec() {
         let mut asm = Assembler::new(0x1000);
+        asm.cpu = "68010".to_string();
         let result = asm.assemble(
             "
     ORG $1000

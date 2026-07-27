@@ -275,7 +275,7 @@ fn parse_operands(
             let dst = decode_ea(dst_mode, dst_reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(imm));
             operands.push(DecodedOperand::from_ea(dst));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Quick => {
             let size_code = ((op >> 6) & 0x3) as u8;
@@ -293,7 +293,7 @@ fn parse_operands(
                 size.into(),
             )));
             operands.push(DecodedOperand::from_ea(dst));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::SingleEa => {
             let mode = ((op >> 3) & 0x7) as u8;
@@ -316,14 +316,14 @@ fn parse_operands(
             let target = if disp == 0 {
                 let ext_pc = stream.current_pc();
                 let d16 = sign_extend_16(stream.read_word()?);
-                (ext_pc as i32 + d16) as u32
+                (ext_pc as i32).wrapping_add(d16) as u32
             } else if disp == -1 {
                 let ext_pc = stream.current_pc();
                 let d32 = stream.read_long()? as i32;
-                (ext_pc as i32 + d32) as u32
+                (ext_pc as i32).wrapping_add(d32) as u32
             } else {
                 let ext_pc = stream.current_pc();
-                (ext_pc as i32 + disp as i32) as u32
+                (ext_pc as i32).wrapping_add(disp as i32) as u32
             };
             target_addr = Some(target);
             operands.push(DecodedOperand::from_ea(EAOperand::AbsoluteLong(target)));
@@ -339,7 +339,7 @@ fn parse_operands(
             let reg = (op & 0x7) as u8;
             let ext_pc = stream.current_pc();
             let disp = sign_extend_16(stream.read_word()?);
-            let target = (ext_pc as i32 + disp) as u32;
+            let target = (ext_pc as i32).wrapping_add(disp) as u32;
             target_addr = Some(target);
             operands.push(DecodedOperand::from_ea(EAOperand::DataReg(reg)));
             operands.push(DecodedOperand::from_ea(EAOperand::AbsoluteLong(target)));
@@ -580,7 +580,7 @@ fn parse_operands(
             let size = ["b", "w", "l"][size_code as usize];
             let ea = decode_ea(mode, reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(ea));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Jsr => {
             let mode = ((op >> 3) & 0x7) as u8;
@@ -613,7 +613,7 @@ fn parse_operands(
             let reg = (op & 0x7) as u8;
             let ea = decode_ea(mode, reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(ea));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Neg => {
             let size_code = ((op >> 6) & 0x3) as u8;
@@ -625,7 +625,7 @@ fn parse_operands(
             let reg = (op & 0x7) as u8;
             let ea = decode_ea(mode, reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(ea));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Negx => {
             let size_code = ((op >> 6) & 0x3) as u8;
@@ -637,7 +637,7 @@ fn parse_operands(
             let reg = (op & 0x7) as u8;
             let ea = decode_ea(mode, reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(ea));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Not => {
             let size_code = ((op >> 6) & 0x3) as u8;
@@ -649,7 +649,7 @@ fn parse_operands(
             let reg = (op & 0x7) as u8;
             let ea = decode_ea(mode, reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(ea));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Nbcd => {
             let mode = ((op >> 3) & 0x7) as u8;
@@ -716,7 +716,7 @@ fn parse_operands(
             let dst = decode_ea(mode, reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(imm));
             operands.push(DecodedOperand::from_ea(dst));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Cmpm => {
             let size_code = ((op >> 6) & 0x3) as u8;
@@ -798,7 +798,7 @@ fn parse_operands(
             let dst = decode_ea(dst_mode, dst_reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(src));
             operands.push(DecodedOperand::from_ea(dst));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Rtd => {
             let imm = stream.read_word()?;
@@ -814,6 +814,34 @@ fn parse_operands(
                 vec as u64,
                 "w".into(),
             )));
+            Ok((name, operands, target_addr))
+        }
+        ParserType::MovecFromCr => {
+            let ext = stream.read_word()?;
+            let cr = ext & 0xFFF;
+            let reg = ((ext >> 12) & 0x7) as u8;
+            let is_addr_reg = (ext >> 15) & 1 != 0;
+            let cr_name = control_reg_name(cr);
+            operands.push(DecodedOperand::special(cr_name));
+            operands.push(DecodedOperand::from_ea(if is_addr_reg {
+                EAOperand::AddrReg(reg)
+            } else {
+                EAOperand::DataReg(reg)
+            }));
+            Ok((name, operands, target_addr))
+        }
+        ParserType::MovecToCr => {
+            let ext = stream.read_word()?;
+            let cr = ext & 0xFFF;
+            let reg = ((ext >> 12) & 0x7) as u8;
+            let is_addr_reg = (ext >> 15) & 1 != 0;
+            let cr_name = control_reg_name(cr);
+            operands.push(DecodedOperand::from_ea(if is_addr_reg {
+                EAOperand::AddrReg(reg)
+            } else {
+                EAOperand::DataReg(reg)
+            }));
+            operands.push(DecodedOperand::special(cr_name));
             Ok((name, operands, target_addr))
         }
         ParserType::Movep => {
@@ -1032,7 +1060,7 @@ fn parse_operands(
             // `fdbeq d0,$1010` at pc=$1000: pc_after_ext=$1004, disp=$0c, target=$1010.
             let ext_pc = stream.current_pc();
             let disp = sign_extend_16(stream.read_word()?);
-            let target = (ext_pc as i32 + disp) as u32;
+            let target = (ext_pc as i32).wrapping_add(disp) as u32;
             target_addr = Some(target);
             let mnemonic = format!("fdb{}", fpu_cc_name(cc)?);
             operands.push(DecodedOperand::from_ea(EAOperand::DataReg(reg)));
@@ -1066,10 +1094,10 @@ fn parse_operands(
             let ext_pc = stream.current_pc();
             let target = if size_bit == 1 {
                 let d32 = stream.read_long()? as i32;
-                (ext_pc as i32 + d32) as u32
+                (ext_pc as i32).wrapping_add(d32) as u32
             } else {
                 let d16 = sign_extend_16(stream.read_word()?);
-                (ext_pc as i32 + d16) as u32
+                (ext_pc as i32).wrapping_add(d16) as u32
             };
             target_addr = Some(target);
             operands.push(DecodedOperand::from_ea(EAOperand::AbsoluteLong(target)));
@@ -1396,6 +1424,35 @@ fn decode_fpu_cpgen(
     }
 }
 
+/// MOVEC control-register name for a 12-bit control-register field, the
+/// reverse of the assembler's `cr_number` parser (`assembler.rs`).
+/// Falls back to a raw hex form (accepted by the assembler as an immediate
+/// operand, though not a real register mnemonic) for the reserved/unknown
+/// range, so re-encoding a value this table doesn't recognize can still
+/// round-trip instead of producing unparseable output.
+fn control_reg_name(cr: u16) -> String {
+    match cr {
+        0x000 => "sfc",
+        0x001 => "dfc",
+        0x002 => "cacr",
+        0x003 => "tc",
+        0x004 => "itt0",
+        0x005 => "itt1",
+        0x006 => "dtt0",
+        0x007 => "dtt1",
+        0x800 => "usp",
+        0x801 => "vbr",
+        0x802 => "caar",
+        0x803 => "msp",
+        0x804 => "isp",
+        0x805 => "mmusr",
+        0x806 => "urp",
+        0x807 => "srp",
+        _ => return format!("${:x}", cr),
+    }
+    .to_string()
+}
+
 fn read_immediate(size: &str, stream: &mut InstructionStream) -> Result<EAOperand, String> {
     match size {
         "b" => {
@@ -1648,6 +1705,23 @@ mod tests {
         let inst = decode_one(&[0xF2, 0xC1, 0x00, 0x00, 0x00, 0x0E], "68040");
         assert_eq!(inst.mnemonic, "fbeq");
         assert_eq!(inst.target_address, Some(0x1010));
+    }
+
+    /// Fuzzing regression (cargo-fuzz `disassemble` target): FBcc's target
+    /// address computation was `(ext_pc as i32 + d32) as u32`, a plain
+    /// (non-wrapping) i32 addition that panics ("attempt to add with
+    /// overflow") for the same reason real m68k addresses wrap at the
+    /// 32-bit boundary — a large displacement decoded near the top of the
+    /// address space overflows i32 addition. The same pattern (Bcc, DBcc,
+    /// and every FPU branch/loop variant) was fixed with `wrapping_add`
+    /// throughout this file; this covers the FpuBcc long-displacement form
+    /// specifically, at an origin close to `i32::MAX`.
+    #[test]
+    fn test_decode_fbcc_long_near_i32_max_does_not_panic() {
+        let bytes = [0xF2, 0xC1, 0x7F, 0xFF, 0xFF, 0xFF];
+        let mut stream = InstructionStream::new(&bytes, 0x7FFF_FFF0);
+        let (_addr, result) = decode_next(&mut stream, "68040").unwrap();
+        assert!(matches!(result, DecodeResult::Instruction(_)));
     }
 
     #[test]
