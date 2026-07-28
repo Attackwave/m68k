@@ -1409,6 +1409,24 @@ mod tests {
         assert_eq!(parse_dc_string("\"A\"").unwrap(), b"A");
     }
 
+    /// Regression guard for consolidating expression evaluation onto this
+    /// module (4.6): the AST evaluator previously also present in
+    /// `m68k-core::expr` originally recursed through a generic `impl Fn`
+    /// parameter, which blew Rust's monomorphization recursion limit on
+    /// deeply nested expressions (each recursive call instantiated a new
+    /// concrete closure-reference type). This parser's recursion is a
+    /// fixed chain of concrete (non-generic) functions taking `&SymbolTable`
+    /// directly, so it doesn't have that failure mode — this locks that in
+    /// with an expression deep enough to have triggered it under the old
+    /// design.
+    #[test]
+    fn test_deeply_nested_expression_does_not_hit_recursion_limit() {
+        let symbols = SymbolTable::new();
+        let expr = "1".to_string() + &"+1".repeat(200);
+        let result = parse_simple_expr(&expr, &symbols, 0);
+        assert_eq!(result, Ok(201));
+    }
+
     #[test]
     fn test_parse_simple_expr_number() {
         let symbols = SymbolTable::new();

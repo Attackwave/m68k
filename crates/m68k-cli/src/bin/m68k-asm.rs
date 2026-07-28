@@ -89,6 +89,7 @@ fn parse_origin(s: &str) -> Result<u32, String> {
 }
 
 fn run(args: Args) -> Result<(), String> {
+    m68k_core::cpu_gate::validate_cpu_name(&args.cpu)?;
     let origin = parse_origin(&args.origin)?;
     let input_name = args.input.to_string_lossy().to_string();
 

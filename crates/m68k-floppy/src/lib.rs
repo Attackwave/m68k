@@ -6,6 +6,8 @@
 //! - [`mfm`] — Amiga MFM bitstream decoder shared by `uae`/`ipf`.
 //! - [`factory`] — extension/content-based backend auto-selection.
 //! - [`floppy_base`] — the [`floppy_base::FloppyImageReader`] trait and [`floppy_base::FloppyError`].
+//! - [`amigados`] — read-only OFS/FFS filesystem support (directory listing, file extraction).
+//! - [`adf_writer`] — ADF image creation/writing.
 //!
 //! Not implemented: the proprietary `capsimg`-library-backed IPF backend. It
 //! would require FFI bindings to a closed-source `capsimg.{dll,so}` that may
@@ -13,6 +15,8 @@
 //! fallback whenever it's absent.
 
 pub mod adf;
+pub mod adf_writer;
+pub mod amigados;
 pub mod factory;
 pub mod floppy_base;
 pub mod ipf;

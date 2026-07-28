@@ -1,0 +1,57 @@
+[package]
+name = "m68k-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+m68k-core = { path = "../crates/m68k-core" }
+m68k-asm = { path = "../crates/m68k-asm" }
+m68k-disasm = { path = "../crates/m68k-disasm" }
+m68k-floppy = { path = "../crates/m68k-floppy" }
+
+[[bin]]
+name = "disassemble"
+path = "fuzz_targets/disassemble.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "amiga_hunk_parse"
+path = "fuzz_targets/amiga_hunk_parse.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "assembler_pipeline"
+path = "fuzz_targets/assembler_pipeline.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "floppy_adf"
+path = "fuzz_targets/floppy_adf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "floppy_uae"
+path = "fuzz_targets/floppy_uae.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "floppy_ipf"
+path = "fuzz_targets/floppy_ipf.rs"
+test = false
+doc = false
+bench = false

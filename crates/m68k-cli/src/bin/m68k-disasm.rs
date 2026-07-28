@@ -41,6 +41,7 @@ fn parse_address(s: &str) -> Result<u32, String> {
 }
 
 fn run(args: Args) -> Result<(), String> {
+    m68k_core::cpu_gate::validate_cpu_name(&args.cpu)?;
     let start_addr = parse_address(&args.address)?;
 
     let data = fs::read(&args.input)

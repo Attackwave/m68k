@@ -94,3 +94,116 @@ fn test_assembler_roundtrip_basic() {
         }
     }
 }
+
+fn hex_to_bytes(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Systematic encode -> decode -> format -> reassemble -> re-encode
+/// roundtrip over every golden encoder vector (all CPU levels present:
+/// 68000/68020/68040). This is the automated version of the manual ~35-form
+/// vasm roundtrip verification done for B9 (see AGENTS.md); it would have
+/// caught 1.2 (brief-format Xn/disp swap), 1.3 (ADDA/SUBA/CMPA size-bit
+/// position), and 1.6 (disassembler dropping scale bits) immediately, since
+/// each of those breaks either the decode step or the re-encode step for
+/// any golden vector exercising the affected form.
+///
+/// Every golden vector round-trips byte-for-byte through the
+/// disassembler's text representation: decoding, reformatting, and
+/// reassembling any golden vector reproduces the exact original bytes.
+#[test]
+fn test_golden_vectors_full_roundtrip() {
+    let data: serde_json::Value =
+        serde_json::from_str(include_str!("../../../tests/golden/vectors.json"))
+            .expect("Failed to parse golden vectors");
+    let tests = data["encoder_tests"].as_array().unwrap();
+    let origin: u32 = 0x1000;
+    let mut fails = Vec::new();
+    let mut checked = 0usize;
+
+    for t in tests {
+        let name = t["name"].as_str().unwrap();
+        let exp_hex = t["expected_hex"].as_str().unwrap_or("").to_lowercase();
+        let cpu = t["cpu"].as_str().unwrap_or("68000");
+        if exp_hex.is_empty() {
+            continue;
+        }
+
+        let original_bytes = hex_to_bytes(&exp_hex);
+
+        // Decode the golden bytes back into text.
+        let mut stream = m68k_core::addressing::InstructionStream::new(&original_bytes, origin);
+        let decoded_text = match m68k_disasm::decoder::decode_next(&mut stream, cpu) {
+            Ok((_, m68k_disasm::decoder::DecodeResult::Instruction(inst))) => {
+                inst.format(&std::collections::HashMap::new())
+            }
+            Ok((_, m68k_disasm::decoder::DecodeResult::DataWord(dw))) => {
+                fails.push(format!(
+                    "{} (cpu={}): decoded as data word instead of instruction: {}",
+                    name,
+                    cpu,
+                    dw.format(&std::collections::HashMap::new())
+                ));
+                continue;
+            }
+            Err(e) => {
+                fails.push(format!("{} (cpu={}): decode error: {}", name, cpu, e));
+                continue;
+            }
+        };
+
+        // Re-assemble the disassembler's own text rendering.
+        let reasm_source = format!("    ORG ${:x}\n    {}\n", origin, decoded_text);
+        let mut asm = Assembler::new(origin);
+        asm.set_cpu(cpu);
+        match asm.assemble_bytes(&reasm_source) {
+            Ok(reencoded_bytes) => {
+                let got_hex = bytes_to_hex(&reencoded_bytes);
+                if got_hex != exp_hex {
+                    fails.push(format!(
+                        "{} (cpu={}): decoded '{}' but reencoding it gave {} (expected {})",
+                        name,
+                        cpu,
+                        decoded_text.trim(),
+                        got_hex,
+                        exp_hex
+                    ));
+                } else {
+                    checked += 1;
+                }
+            }
+            Err(e) => {
+                fails.push(format!(
+                    "{} (cpu={}): decoded '{}' but reassembling it failed: {:?}",
+                    name,
+                    cpu,
+                    decoded_text.trim(),
+                    e
+                ));
+            }
+        }
+    }
+
+    assert!(
+        checked == tests.len() || !fails.is_empty(),
+        "sanity: checked({}) should equal total vectors({}) when no failures",
+        checked,
+        tests.len()
+    );
+
+    if !fails.is_empty() {
+        panic!(
+            "Roundtrip failures ({}, {} passed):\n{}",
+            fails.len(),
+            checked,
+            fails.join("\n")
+        );
+    }
+}
