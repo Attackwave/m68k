@@ -38,6 +38,12 @@ impl DecodedInstruction {
 pub struct DecodedOperand {
     pub ea: Option<EAOperand>,
     pub special: Option<String>,
+    /// Text appended directly after the formatted operand with no
+    /// separator, e.g. `{#5}`/`{d3}` for an FMOVE.P k-factor — unlike a
+    /// second `DecodedOperand` (which `format()` joins with `", "`), a
+    /// k-factor is syntactically part of the same operand, not a
+    /// separate one.
+    pub suffix: Option<String>,
 }
 
 impl DecodedOperand {
@@ -45,6 +51,7 @@ impl DecodedOperand {
         Self {
             ea: Some(ea),
             special: None,
+            suffix: None,
         }
     }
 
@@ -52,16 +59,31 @@ impl DecodedOperand {
         Self {
             ea: None,
             special: Some(name.into()),
+            suffix: None,
+        }
+    }
+
+    /// An EA operand with a trailing suffix appended with no separator
+    /// (e.g. `(a0){#5}` for an FMOVE.P static k-factor).
+    pub fn from_ea_with_suffix(ea: EAOperand, suffix: impl Into<String>) -> Self {
+        Self {
+            ea: Some(ea),
+            special: None,
+            suffix: Some(suffix.into()),
         }
     }
 
     pub fn format(&self, labels: &HashMap<u32, String>) -> String {
-        if let Some(ea) = &self.ea {
+        let base = if let Some(ea) = &self.ea {
             ea.format(labels)
         } else if let Some(s) = &self.special {
             s.clone()
         } else {
             String::new()
+        };
+        match &self.suffix {
+            Some(suffix) => base + suffix,
+            None => base,
         }
     }
 }
@@ -1360,6 +1382,36 @@ fn decode_fpu_cpgen(
                 operands.push(DecodedOperand::special(format!("fp{}", rm_dst)));
                 return Ok(("fmovecr".into(), operands, target_addr));
             }
+            if group == 0b011 && (fmt == 0b011 || fmt == 0b111) {
+                // FMOVE.P FPn,<ea>{k-factor}: the store direction of packed-decimal
+                // FMOVE reuses bits 6-0 for a k-factor instead of an arithmetic
+                // opclass/opmode (see `enc_fpu.rs::KFactor` for the encoding
+                // derivation, verified against real vasm output) — fmt=3 (0b011) is
+                // a static k-factor (bits 6-0 = full 7-bit two's complement value),
+                // fmt=7 (0b111) is dynamic (bits 6-4 = Dn, bits 3-0 = 0). Without this
+                // branch, `cmd` (bits 6-0) gets fed to `fpu_arith_name` below, which
+                // only recognizes it as a valid opclass by coincidence for k=0 (cmd=0
+                // happens to mean plain "fmove") and errors ("unknown FPU arithmetic
+                // opclass/opmode") for every other k-factor value.
+                let suffix = if fmt == 0b011 {
+                    // Sign-extend from bit 6 (the k-factor is a 7-bit,
+                    // not 8-bit, two's complement value) — `as i8` alone
+                    // would leave e.g. 0x7b (-5) as +123.
+                    let raw = cmd & 0x7F;
+                    let k = if raw & 0x40 != 0 {
+                        raw as i32 - 128
+                    } else {
+                        raw as i32
+                    };
+                    format!("{{#{}}}", k)
+                } else {
+                    format!("{{d{}}}", (cmd >> 4) & 0x7)
+                };
+                let ea = decode_ea(ea_mode, ea_reg, "p", stream, inst_pc, cpu)?;
+                operands.push(DecodedOperand::special(format!("fp{}", rm_dst)));
+                operands.push(DecodedOperand::from_ea_with_suffix(ea, suffix));
+                return Ok(("fmove.p".into(), operands, target_addr));
+            }
             if group == 0b010 && (cmd & 0x78) == 0x30 {
                 // FSINCOS <ea>,FPc:FPd - cmd bits 6-3 = 0110, cos_dst in cmd bits 2-0,
                 // sin_dst (the "destination register" field) in ext bits 9-7.
@@ -1705,6 +1757,58 @@ mod tests {
         let inst = decode_one(&[0xF2, 0xC1, 0x00, 0x00, 0x00, 0x0E], "68040");
         assert_eq!(inst.mnemonic, "fbeq");
         assert_eq!(inst.target_address, Some(0x1010));
+    }
+
+    /// Reference bytes for FMOVE.P k-factor decoding, verified against
+    /// real `vasm -m68881` output. Previously `FMOVE.P FPn,<ea>{...}`
+    /// with any nonzero k-factor decoded as "unknown FPU arithmetic
+    /// opclass/opmode" — bits 6-0 hold a k-factor rather than an
+    /// arithmetic opclass for this store-direction packed-decimal form,
+    /// which the generic `fpu_arith_name` lookup didn't know about.
+    #[test]
+    fn test_decode_fmove_p_static_kfactor_matches_vasm() {
+        // vasm: fmove.p fp0,(a0){#5} -> f2106c05
+        let inst = decode_one(&[0xF2, 0x10, 0x6C, 0x05], "68020");
+        assert_eq!(inst.mnemonic, "fmove.p");
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[0].format(&labels), "fp0");
+        assert_eq!(inst.operands[1].format(&labels), "(a0){#5}");
+    }
+
+    #[test]
+    fn test_decode_fmove_p_static_negative_kfactor_matches_vasm() {
+        // vasm: fmove.p fp0,(a0){#-5} -> f2106c7b
+        let inst = decode_one(&[0xF2, 0x10, 0x6C, 0x7B], "68020");
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[1].format(&labels), "(a0){#-5}");
+    }
+
+    #[test]
+    fn test_decode_fmove_p_static_kfactor_extremes_match_vasm() {
+        // vasm: {#63} -> f2106c3f ; {#-64} -> f2106c40
+        let labels = HashMap::new();
+        let inst = decode_one(&[0xF2, 0x10, 0x6C, 0x3F], "68020");
+        assert_eq!(inst.operands[1].format(&labels), "(a0){#63}");
+        let inst = decode_one(&[0xF2, 0x10, 0x6C, 0x40], "68020");
+        assert_eq!(inst.operands[1].format(&labels), "(a0){#-64}");
+    }
+
+    #[test]
+    fn test_decode_fmove_p_dynamic_kfactor_matches_vasm() {
+        // vasm: fmove.p fp0,(a0){d3} -> f2107c30
+        let inst = decode_one(&[0xF2, 0x10, 0x7C, 0x30], "68020");
+        assert_eq!(inst.mnemonic, "fmove.p");
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[1].format(&labels), "(a0){d3}");
+    }
+
+    #[test]
+    fn test_decode_fmove_p_no_kfactor_defaults_to_zero() {
+        // fmove.p fp0,(a0) with no {...} at all -> f2106c00, same bit
+        // pattern as an explicit {#0}.
+        let inst = decode_one(&[0xF2, 0x10, 0x6C, 0x00], "68020");
+        let labels = HashMap::new();
+        assert_eq!(inst.operands[1].format(&labels), "(a0){#0}");
     }
 
     /// Fuzzing regression (cargo-fuzz `disassemble` target): FBcc's target

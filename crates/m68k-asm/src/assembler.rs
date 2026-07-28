@@ -268,6 +268,58 @@ pub struct BranchInfo {
 }
 
 // ---------------------------------------------------------------------------
+// FMOVE.P k-factor parsing (`FMOVE.P FPn,<ea>{#k}` / `{Dn}`)
+// ---------------------------------------------------------------------------
+
+/// Whether `text` ends in a `{...}` suffix that looks like a k-factor
+/// (`{#k}` or `{Dn}`) rather than a bitfield spec (`{offset:width}`,
+/// which always contains a `:`). Both use the same `{...}` syntax on an
+/// EA operand, so the two must be told apart before parsing the operand
+/// as a whole — bitfields are handled generically inside
+/// `parse_operand_text`, but a k-factor needs to be split off *before*
+/// that (it isn't part of the EA operand at all, it's FMOVE's implicit
+/// third operand).
+fn has_kfactor_suffix(text: &str) -> bool {
+    let text = text.trim();
+    text.ends_with('}')
+        && text
+            .rfind('{')
+            .map(|open| !text[open..].contains(':'))
+            .unwrap_or(false)
+}
+
+/// Split `text` (already confirmed via [`has_kfactor_suffix`]) into the
+/// EA portion and the parsed [`crate::enc_fpu::KFactor`].
+fn split_kfactor_suffix(text: &str) -> Result<(&str, crate::enc_fpu::KFactor), String> {
+    use crate::enc_fpu::KFactor;
+    let text = text.trim();
+    let open = text.rfind('{').ok_or("missing '{' in k-factor operand")?;
+    let ea_text = text[..open].trim();
+    let inner = text[open + 1..text.len() - 1].trim();
+
+    if let Some(imm) = inner.strip_prefix('#') {
+        let k: i32 = imm
+            .trim()
+            .parse()
+            .map_err(|_| format!("invalid k-factor: {}", inner))?;
+        if !(-64..=63).contains(&k) {
+            return Err(format!(
+                "k-factor {} out of range (-64..=63, 7-bit two's complement)",
+                k
+            ));
+        }
+        return Ok((ea_text, KFactor::Static(k as i8)));
+    }
+    match parse_register(inner) {
+        Some(Operand::DataReg(n)) => Ok((ea_text, KFactor::Dynamic(n))),
+        _ => Err(format!(
+            "k-factor must be #k (static) or Dn (dynamic register): {}",
+            inner
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Operand parsing helper
 // ---------------------------------------------------------------------------
 
@@ -2707,6 +2759,16 @@ impl Assembler {
                 crate::enc_logic::enc_cas2(&dc1, &dc2, &du1, &du2, &rn1, &rn2, sz)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?
             }
+            "FMOVE" if operand_texts.len() == 2 && has_kfactor_suffix(&operand_texts[1]) => {
+                let (dst_text, kfactor) = split_kfactor_suffix(&operand_texts[1])
+                    .map_err(|e| AsmError::with_line(e, line.line_no))?;
+                let s = parse_operand_text(&operand_texts[0], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
+                let d = parse_operand_text(dst_text, &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
+                crate::enc_fpu::enc_fmove(&s, &d, size, Some(kfactor), pc + 2, &self.cpu)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+            }
             _ => encode_instruction(
                 &mnemonic_upper,
                 size,
@@ -3826,6 +3888,131 @@ start:
     fn test_source_fmove_ea_to_reg() {
         let bytes = assemble_fpu_source("    FMOVE.S D0,FP1\n");
         assert_eq!(bytes, vec![0xF2, 0x00, 0x44, 0x80]);
+    }
+
+    /// FMOVE.P k-factor reference bytes, verified against real
+    /// `vasm -m68881` output (see the commit adding k-factor support for
+    /// the exact byte-level derivation of the static-vs-dynamic format
+    /// code distinction). `(A0)` is address register indirect mode 2 reg 0.
+    #[test]
+    fn test_source_fmove_p_static_kfactor_matches_vasm() {
+        // vasm: fmove.p fp0,(a0){#5} -> f2106c05
+        let bytes = assemble_fpu_source("    FMOVE.P FP0,(A0){#5}\n");
+        assert_eq!(bytes, vec![0xF2, 0x10, 0x6C, 0x05]);
+    }
+
+    #[test]
+    fn test_source_fmove_p_static_negative_kfactor_matches_vasm() {
+        // vasm: fmove.p fp0,(a0){#-5} -> f2106c7b (7-bit two's complement)
+        let bytes = assemble_fpu_source("    FMOVE.P FP0,(A0){#-5}\n");
+        assert_eq!(bytes, vec![0xF2, 0x10, 0x6C, 0x7B]);
+    }
+
+    #[test]
+    fn test_source_fmove_p_static_kfactor_extremes_match_vasm() {
+        // vasm: fmove.p fp0,(a0){#63} -> f2106c3f ; {#-64} -> f2106c40
+        assert_eq!(
+            assemble_fpu_source("    FMOVE.P FP0,(A0){#63}\n"),
+            vec![0xF2, 0x10, 0x6C, 0x3F]
+        );
+        assert_eq!(
+            assemble_fpu_source("    FMOVE.P FP0,(A0){#-64}\n"),
+            vec![0xF2, 0x10, 0x6C, 0x40]
+        );
+    }
+
+    #[test]
+    fn test_source_fmove_p_kfactor_out_of_range_is_error() {
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68020");
+        assert!(asm.assemble("    FMOVE.P FP0,(A0){#64}\n").is_err());
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68020");
+        assert!(asm.assemble("    FMOVE.P FP0,(A0){#-65}\n").is_err());
+    }
+
+    #[test]
+    fn test_source_fmove_p_dynamic_kfactor_matches_vasm() {
+        // vasm: fmove.p fp0,(a0){d3} -> f2107c30 (format code 7, Dn in bits 6-4)
+        let bytes = assemble_fpu_source("    FMOVE.P FP0,(A0){D3}\n");
+        assert_eq!(bytes, vec![0xF2, 0x10, 0x7C, 0x30]);
+    }
+
+    #[test]
+    fn test_source_fmove_p_dynamic_kfactor_all_registers_match_vasm() {
+        // vasm: fmove.p fp0,(a0){dN} for N=0..7 -> f2107c00, 7c10, .., 7c70
+        for (n, expected_ext) in (0u16..8).map(|n| (n, 0x7C00 + (n << 4))) {
+            let bytes = assemble_fpu_source(&format!("    FMOVE.P FP0,(A0){{D{}}}\n", n));
+            let ext = ((bytes[2] as u16) << 8) | bytes[3] as u16;
+            assert_eq!(ext, expected_ext, "d{}", n);
+        }
+    }
+
+    #[test]
+    fn test_source_fmove_p_no_kfactor_defaults_to_static_zero() {
+        // No {...} suffix at all: k-factor field is simply 0 (static,
+        // k=0) since it's the same bit pattern as the pre-k-factor code
+        // already emitted.
+        let bytes = assemble_fpu_source("    FMOVE.P FP0,(A0)\n");
+        assert_eq!(bytes, vec![0xF2, 0x10, 0x6C, 0x00]);
+    }
+
+    #[test]
+    fn test_source_fmove_kfactor_wrong_size_is_error() {
+        // k-factor is only meaningful with .P; on any other size (or the
+        // read direction <ea>,FPn) it must error, not be silently dropped.
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68020");
+        assert!(asm.assemble("    FMOVE.L FP0,(A0){#5}\n").is_err());
+    }
+
+    /// Full encode -> decode -> reformat -> reassemble roundtrip for
+    /// FMOVE.P k-factor forms, the same class of check
+    /// `test_golden_vectors_full_roundtrip` (golden_assembler.rs) does for
+    /// the golden vector set — these instructions aren't in that fixed
+    /// vector file, so this covers the same ground directly. This is what
+    /// caught the disassembler previously not recognizing bits 6-0 as a
+    /// k-factor field (it fell back to "unknown FPU arithmetic
+    /// opclass/opmode" for any k != 0) when this feature was first added.
+    #[test]
+    fn test_fmove_p_kfactor_full_roundtrip() {
+        for src in [
+            "    FMOVE.P FP0,(A0){#5}\n",
+            "    FMOVE.P FP0,(A0){#-5}\n",
+            "    FMOVE.P FP0,(A0){#0}\n",
+            "    FMOVE.P FP0,(A0){D3}\n",
+        ] {
+            let mut asm = Assembler::new(0x1000);
+            asm.set_cpu("68020");
+            let original = asm.assemble_bytes(src).unwrap();
+
+            let mut stream = m68k_core::addressing::InstructionStream::new(&original, 0x1000);
+            let decoded_text = match m68k_disasm::decoder::decode_next(&mut stream, "68020") {
+                Ok((_, m68k_disasm::decoder::DecodeResult::Instruction(inst))) => {
+                    inst.format(&std::collections::HashMap::new())
+                }
+                other => panic!("{}: expected instruction, got {:?}", src, other),
+            };
+
+            let mut asm2 = Assembler::new(0x1000);
+            asm2.set_cpu("68020");
+            let reasm_source = format!("    ORG $1000\n    {}\n", decoded_text);
+            let reencoded = asm2.assemble_bytes(&reasm_source).unwrap_or_else(|e| {
+                panic!(
+                    "{}: decoded '{}' but reassembling it failed: {:?}",
+                    src,
+                    decoded_text.trim(),
+                    e
+                )
+            });
+            assert_eq!(
+                reencoded,
+                original,
+                "{}: decoded '{}' but reencoding it diverged",
+                src,
+                decoded_text.trim()
+            );
+        }
     }
 
     #[test]

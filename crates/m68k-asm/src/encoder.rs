@@ -893,9 +893,16 @@ pub fn encode_instruction(
             }
         }
 
-        // FMOVE: FPn<->FPn, <ea><->FPn, FPU control register<->EA
+        // FMOVE: FPn<->FPn, <ea><->FPn, FPU control register<->EA. A `.P`
+        // k-factor (`FMOVE.P FPn,<ea>{#k}`/`{Dn}`) is not reachable
+        // through this generic two-operand dispatch — it's parsed and
+        // encoded as a 3-operand special case in
+        // `assembler.rs::encode_instruction_line`, analogous to
+        // PACK/UNPK/CAS, since the k-factor is syntactically a third
+        // operand (`{...}` suffix on the destination) that this
+        // dispatcher's `(src, dst)` shape has no slot for.
         "FMOVE" => match (src, dst) {
-            (Some(s), Some(d)) => enc_fmove(s, d, size, pc + 2, cpu),
+            (Some(s), Some(d)) => enc_fmove(s, d, size, None, pc + 2, cpu),
             _ => Err(AsmError::new("FMOVE requires two operands")),
         },
 

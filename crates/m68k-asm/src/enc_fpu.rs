@@ -16,6 +16,28 @@ fn check_fpu_cpu(cpu: &str) -> Result<(), AsmError> {
     }
 }
 
+/// A k-factor for `FMOVE.P FPn,<ea>{...}` (packed-decimal store direction
+/// only — reading `<ea>,FPn` has no k-factor). Selects how many digits of
+/// the binary-to-BCD conversion the FPU produces: a static factor
+/// (`{#k}`, a compile-time constant) or a dynamic one (`{Dn}`, taken from
+/// a data register at runtime).
+///
+/// Encoding (extension word, verified against `vasm -m68881` reference
+/// output — see the encoder below for the exact bit layout): the two
+/// forms are distinguished by the format-code field itself (bits 12-10 =
+/// 3 for static, 7 for dynamic), *not* by a bit within the k-factor field
+/// — bits 6-0 hold the k-factor as a full 7-bit two's-complement value in
+/// the static case (so bit 6 is simply the sign bit, not a mode flag),
+/// while in the dynamic case bits 6-4 hold the register number and bits
+/// 3-0 are zero.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KFactor {
+    /// `{#k}`: k in -64..=63 (7-bit two's complement).
+    Static(i8),
+    /// `{Dn}`: data register 0-7.
+    Dynamic(u8),
+}
+
 /// FPU format code (extension word bits 12-10) for a given size suffix.
 fn fmt_code(size: Option<&str>) -> u16 {
     match size.unwrap_or("w") {
@@ -83,14 +105,32 @@ pub fn enc_fpu_arith(
 ///
 /// Control-register moves additionally allow Dn as the EA operand
 /// (`FMOVE FPIAR,D0` is a valid 68881 instruction).
+///
+/// `kfactor` applies only to the `FPn,<ea>` (store) direction with a `.P`
+/// (packed decimal) size — a `#k`/`Dn` k-factor on any other size/
+/// direction is a caller error (checked here, not silently ignored,
+/// since a k-factor written but dropped would silently change which
+/// digits of the packed-decimal output get produced).
 pub fn enc_fmove(
     src: &Operand,
     dst: &Operand,
     size: Option<&str>,
+    kfactor: Option<KFactor>,
     ext_pc: u32,
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
     check_fpu_cpu(cpu)?;
+
+    if kfactor.is_some() && !matches!((src, dst), (Operand::FpReg(_), _)) {
+        return Err(AsmError::new(
+            "k-factor ({#k} or {Dn}) is only valid on FMOVE.P FPn,<ea> (store direction)",
+        ));
+    }
+    if kfactor.is_some() && size != Some("p") {
+        return Err(AsmError::new(
+            "k-factor ({#k} or {Dn}) requires .P (packed decimal) size",
+        ));
+    }
 
     match (src, dst) {
         // FMOVE FPn,FPm: FPm -> FPn (first operand's register number is the ext word's dest field).
@@ -109,7 +149,18 @@ pub fn enc_fmove(
         (Operand::FpReg(fps), ea_op) => {
             let fmt = size.unwrap_or("w");
             let (mode, reg, ext_words) = encode_ea(ea_op, fmt, ext_pc, ea::DATA_ALT, cpu)?;
-            let ext = (3 << 13) | (fmt_code(size) << 10) | ((*fps as u16) << 7);
+            // Static k-factor uses the same format code as any other .P
+            // move (3); dynamic k-factor uses a distinct format code (7)
+            // instead of a bit within the k-factor field itself — that
+            // field holds the full signed k value (static) or a bare
+            // register number (dynamic) with no room left for a mode
+            // flag. See `KFactor` docs for how this was verified.
+            let (fmt, kbits): (u16, u16) = match kfactor {
+                None => (fmt_code(size), 0),
+                Some(KFactor::Static(k)) => (fmt_code(size), (k as u16) & 0x7F),
+                Some(KFactor::Dynamic(dn)) => (7, ((dn as u16) & 0x7) << 4),
+            };
+            let ext = (3 << 13) | (fmt << 10) | ((*fps as u16) << 7) | kbits;
             let mut words = vec![0xF200 | ((mode as u16) << 3) | (reg as u16), ext];
             words.extend(ext_words);
             Ok(words)
@@ -404,7 +455,7 @@ mod tests {
     fn test_fmove_ea_to_reg_reference_bytes() {
         let src = Operand::DataReg(0);
         let dst = Operand::FpReg(1);
-        let words = enc_fmove(&src, &dst, Some("s"), 0, "68020").unwrap();
+        let words = enc_fmove(&src, &dst, Some("s"), None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF200, 0x4480]);
     }
 
@@ -412,7 +463,7 @@ mod tests {
     fn test_fmove_reg_to_ea_reference_bytes() {
         let src = Operand::FpReg(1);
         let dst = Operand::AddrRegPreDec(0);
-        let words = enc_fmove(&src, &dst, Some("x"), 0, "68020").unwrap();
+        let words = enc_fmove(&src, &dst, Some("x"), None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF220, 0x6880]);
     }
 
@@ -448,7 +499,7 @@ mod tests {
     fn test_fpu_requires_68020_or_later() {
         let fp0 = Operand::FpReg(0);
         assert!(enc_fpu_arith(0x04, &fp0, None, None, 0, "68000").is_err());
-        assert!(enc_fmove(&fp0, &Operand::FpReg(1), None, 0, "68000").is_err());
+        assert!(enc_fmove(&fp0, &Operand::FpReg(1), None, None, 0, "68000").is_err());
     }
 
     #[test]
@@ -457,7 +508,7 @@ mod tests {
         // vasm: fmove fpiar,d0 -> f200a400 (dr=1: ctrl -> EA)
         let src = Operand::FpCtrlList(1); // FPIAR
         let dst = Operand::DataReg(0);
-        let words = enc_fmove(&src, &dst, None, 0, "68020").unwrap();
+        let words = enc_fmove(&src, &dst, None, None, 0, "68020").unwrap();
         assert_eq!(words[0], 0xF200);
         assert_eq!(words[1], (5u16 << 13) | (1 << 10));
     }
@@ -467,7 +518,7 @@ mod tests {
         // fmove fpiar,-(a0) -> f220a400
         let src = Operand::FpCtrlList(1);
         let dst = Operand::AddrRegPreDec(0);
-        let words = enc_fmove(&src, &dst, None, 0, "68020").unwrap();
+        let words = enc_fmove(&src, &dst, None, None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF220, 0xA400]);
     }
 
@@ -476,7 +527,7 @@ mod tests {
         // fmove d0,fpiar -> f2008400 (dr=0: EA -> ctrl)
         let src = Operand::DataReg(0);
         let dst = Operand::FpCtrlList(1);
-        let words = enc_fmove(&src, &dst, None, 0, "68020").unwrap();
+        let words = enc_fmove(&src, &dst, None, None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF200, 0x8400]);
     }
 
