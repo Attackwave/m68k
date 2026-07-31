@@ -330,8 +330,13 @@ pub fn enc_quick(
     let base = if is_add { 0x5000 } else { 0x5100 };
 
     if let Operand::DataReg(dst_reg) = dst {
-        let op =
-            base | ((size_code as u16) << 6) | ((data_enc as u16) << 9) | ((*dst_reg as u16) << 3);
+        // Data-register direct is mode 0 with the register number in
+        // bits 2-0. Shifting the register into bits 5-3 put it in the
+        // *mode* field instead, so e.g. `subq.l #1,d2` encoded as 0x5390
+        // (mode 2 = (a0) indirect, register 0) rather than 0x5382 —
+        // silently writing to memory instead of the register. Verified
+        // against reference encodings.
+        let op = base | ((size_code as u16) << 6) | ((data_enc as u16) << 9) | (*dst_reg as u16);
         return Ok(vec![op]);
     }
 

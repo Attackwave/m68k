@@ -87,7 +87,7 @@ pub fn enc_pmove(
 /// Encode `PTESTR FC,<ea>,#level[,An]` / `PTESTW FC,<ea>,#level[,An]` (68030+).
 ///
 /// Extension word layout (verified against the M68000 PRM and real
-/// `vasm -m68030` output for `ptestr #2,(a0),#3`, `ptestw #2,(a0),#3`, and
+/// reference output for `ptestr #2,(a0),#3`, `ptestw #2,(a0),#3`, and
 /// `ptestr #2,(a0),#3,a1`): bits 15-13 = `100` (fixed group prefix), bits
 /// 12-10 = level, bit 9 = R/W (0 = write/PTESTW, 1 = read/PTESTR), bit 8 =
 /// A (1 if an address register is given), bits 7-5 = that register (0 if
@@ -151,7 +151,7 @@ pub fn enc_pflush(
 
 /// Encode PFLUSHA (68030): flush all ATC entries (mode `001`, no EA/FC/mask).
 ///
-/// Verified against real `vasm -m68030` output: `F000 2400`. The previous
+/// verified against reference output: `F000 2400`. The previous
 /// single-word `0xF010` was wrong on two counts — PFLUSHA needs the
 /// extension word (mode `001` at bits 12-10, group prefix `001` at bits
 /// 15-13), and `0xF010` isn't even a valid opword for it (`0x10` is the EA
@@ -164,7 +164,7 @@ pub fn enc_pflusha(cpu: &str) -> Result<Vec<u16>, AsmError> {
 
 /// Encode PFLUSHAN (68040): flush all except global entries.
 ///
-/// Verified against real `vasm -m68040` output: `F510`. The 68040 PFLUSH
+/// verified against reference output: `F510`. The 68040 PFLUSH
 /// family shares base `0xF500` with a 2-bit opmode at bits 4-3 (`00`
 /// PFLUSHN, `01` PFLUSH, `10` PFLUSHAN, `11` PFLUSHA) and register at bits
 /// 2-0 — the previous `0xF018` didn't match any of these opmodes.
@@ -175,7 +175,7 @@ pub fn enc_pflushan(cpu: &str) -> Result<Vec<u16>, AsmError> {
 
 /// Encode the single-An/(An)-operand MMU instructions: PFLUSHN, PLPAW, PLPAR.
 ///
-/// PFLUSHN's base (0xF500, verified against real `vasm -m68040` output) is
+/// PFLUSHN's base (0xF500, verified against reference output) is
 /// part of the 68040 PFLUSH opmode family — see `enc_pflushan`'s docs.
 /// PLPAW/PLPAR's bases (0xF588/0xF5C8) are unverified against any real
 /// assembler or the PRM; treat them with caution.
@@ -198,7 +198,7 @@ pub fn enc_lpstop(val: i64, cpu: &str) -> Result<Vec<u16>, AsmError> {
 /// Encode a 68040 cache-invalidate/push instruction: `CINVL/P/A` or
 /// `CPUSHL/P/A`.
 ///
-/// Layout (verified against real `vasm -m68040` output for all eight
+/// Layout (verified against reference output for all eight
 /// scope×unit combinations, e.g. `cinvl dc,(a0)`=F448, `cinvp dc,(a0)`
 /// =F450, `cinva dc`=F458, `cpushl dc,(a0)`=F468): opword =
 /// `0xF400 | (scope<<6) | (push<<5) | (unit<<3) | reg`, where scope is 2
@@ -265,7 +265,7 @@ pub fn enc_cpusha(cache: i64, cpu: &str) -> Result<Vec<u16>, AsmError> {
 /// Base opcode 0xF100 (bits 15-6 = `1111000100`), per the M68000 PRM
 /// "PSAVE" instruction format - the previous 0xF080 was off by a full
 /// bit-position shift of the sub-opcode field (couldn't be verified
-/// against real `vasm`, which doesn't support MC68851-specific
+/// against real reference encodings, which doesn't support MC68851-specific
 /// instructions; cross-checked digit-by-digit against the PRM's bit
 /// diagram instead).
 pub fn enc_psave(ea_op: &Operand, ext_pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
@@ -336,8 +336,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ptestr_matches_vasm() {
-        // PTESTR #2,(A0),#3 -- verified against real `vasm -m68030` output:
+    fn test_ptestr_matches_reference() {
+        // PTESTR #2,(A0),#3 -- verified against reference output:
         // F010 8E12.
         let dst = Operand::AddrRegIndirect(0);
         let words = enc_ptest(2, &dst, 3, None, true, 0, "68030").unwrap();
@@ -345,8 +345,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ptestw_matches_vasm() {
-        // PTESTW #2,(A0),#3 -- verified against real `vasm -m68030` output:
+    fn test_ptestw_matches_reference() {
+        // PTESTW #2,(A0),#3 -- verified against reference output:
         // F010 8C12.
         let dst = Operand::AddrRegIndirect(0);
         let words = enc_ptest(2, &dst, 3, None, false, 0, "68030").unwrap();
@@ -354,8 +354,8 @@ mod tests {
     }
 
     #[test]
-    fn test_ptestr_with_an_matches_vasm() {
-        // PTESTR #2,(A0),#3,A1 -- verified against real `vasm -m68030`
+    fn test_ptestr_with_an_matches_reference() {
+        // PTESTR #2,(A0),#3,A1 -- verified against reference encodings
         // output: F010 8F32.
         let dst = Operand::AddrRegIndirect(0);
         let words = enc_ptest(2, &dst, 3, Some(1), true, 0, "68030").unwrap();
@@ -363,8 +363,8 @@ mod tests {
     }
 
     #[test]
-    fn test_pflush_matches_vasm() {
-        // PFLUSH #2,#3,(A0) -- verified against real `vasm -m68030`
+    fn test_pflush_matches_reference() {
+        // PFLUSH #2,#3,(A0) -- verified against reference encodings
         // output: F010 3872.
         let dst = Operand::AddrRegIndirect(0);
         let words = enc_pflush(2, 3, &dst, 0, "68030").unwrap();
@@ -372,20 +372,20 @@ mod tests {
     }
 
     #[test]
-    fn test_pflusha_matches_vasm() {
-        // PFLUSHA -- verified against real `vasm -m68030` output: F000 2400.
+    fn test_pflusha_matches_reference() {
+        // PFLUSHA -- verified against reference output: F000 2400.
         assert_eq!(enc_pflusha("68030").unwrap(), vec![0xF000, 0x2400]);
     }
 
     #[test]
-    fn test_pflushan_matches_vasm() {
-        // PFLUSHAN -- verified against real `vasm -m68040` output: F510.
+    fn test_pflushan_matches_reference() {
+        // PFLUSHAN -- verified against reference output: F510.
         assert_eq!(enc_pflushan("68040").unwrap(), vec![0xF510]);
     }
 
     #[test]
-    fn test_pflushn_matches_vasm() {
-        // PFLUSHN (A0) -- verified against real `vasm -m68040` output: F500.
+    fn test_pflushn_matches_reference() {
+        // PFLUSHN (A0) -- verified against reference output: F500.
         let dst = Operand::AddrRegIndirect(0);
         let words = enc_mmu_single_reg(0xF500, &dst, "68030").unwrap();
         assert_eq!(words, vec![0xF500]);
@@ -412,50 +412,50 @@ mod tests {
     }
 
     // Cache-line op tests below are all verified against real
-    // `vasm -m68040` output for `<cinvl|cinvp|cpushl|cpushp> <bc|ic|dc>,(a0)`
+    // reference output for `<cinvl|cinvp|cpushl|cpushp> <bc|ic|dc>,(a0)`
     // and `<cinva|cpusha> <bc|ic|dc>`. Cache scope: #1=DC, #2=IC, #3=BC.
 
     #[test]
-    fn test_cinvl_dc_matches_vasm() {
+    fn test_cinvl_dc_matches_reference() {
         let a0 = Operand::AddrRegIndirect(0);
         let words = enc_cache_line_op(false, 1, &a0, "68040").unwrap();
         assert_eq!(words, vec![0xF448]);
     }
 
     #[test]
-    fn test_cinvp_dc_matches_vasm() {
+    fn test_cinvp_dc_matches_reference() {
         let a0 = Operand::AddrRegIndirect(0);
         let words = enc_cache_page_op(false, 1, &a0, "68040").unwrap();
         assert_eq!(words, vec![0xF450]);
     }
 
     #[test]
-    fn test_cpushl_dc_matches_vasm() {
+    fn test_cpushl_dc_matches_reference() {
         let a0 = Operand::AddrRegIndirect(0);
         let words = enc_cache_line_op(true, 1, &a0, "68040").unwrap();
         assert_eq!(words, vec![0xF468]);
     }
 
     #[test]
-    fn test_cpushp_dc_matches_vasm() {
+    fn test_cpushp_dc_matches_reference() {
         let a0 = Operand::AddrRegIndirect(0);
         let words = enc_cache_page_op(true, 1, &a0, "68040").unwrap();
         assert_eq!(words, vec![0xF470]);
     }
 
     #[test]
-    fn test_cinva_bc_matches_vasm() {
+    fn test_cinva_bc_matches_reference() {
         assert_eq!(enc_cinva(3, "68040").unwrap(), vec![0xF4D8]);
     }
 
     #[test]
-    fn test_cpusha_bc_matches_vasm() {
+    fn test_cpusha_bc_matches_reference() {
         assert_eq!(enc_cpusha(3, "68040").unwrap(), vec![0xF4F8]);
     }
 
     #[test]
     fn test_psave_reference_bytes() {
-        // Base 0xF100 per PRM bit diagram (not verified against vasm - see
+        // Base 0xF100 per PRM bit diagram (not verified against reference encodings - see
         // enc_psave's doc comment).
         let dst = Operand::AddrRegPreDec(0);
         assert_eq!(enc_psave(&dst, 0, "68030").unwrap(), vec![0xF120]);
@@ -463,7 +463,7 @@ mod tests {
 
     #[test]
     fn test_prestore_reference_bytes() {
-        // Base 0xF140 per PRM bit diagram (not verified against vasm - see
+        // Base 0xF140 per PRM bit diagram (not verified against reference encodings - see
         // enc_prestore's doc comment).
         let src = Operand::AddrRegPostInc(0);
         assert_eq!(enc_prestore(&src, 0, "68030").unwrap(), vec![0xF158]);

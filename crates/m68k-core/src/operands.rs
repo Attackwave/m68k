@@ -24,9 +24,14 @@ pub enum Operand {
     AbsoluteLong(i32),
     /// Program counter with displacement: (d16,PC) or (d32,PC)
     PcRelativeDisp(i32, bool),
-    /// Program counter with index: (d8,PC,Xn*scale). Fields: Xn, disp,
-    /// scale, index size (`true` = `.L`, `false` = `.W`).
-    PcRelativeIndex(u8, i8, u8, bool),
+    /// Program counter with index: (d8,PC,Xn*scale). Fields: Xn, target
+    /// address, scale, index size (`true` = `.L`, `false` = `.W`).
+    ///
+    /// Like [`Operand::PcRelativeDisp`], the second field holds the full
+    /// *target address*, not the encoded displacement — the parser cannot
+    /// subtract the PC because it only sees the operand text. The encoder
+    /// narrows it against the extension word's address.
+    PcRelativeIndex(u8, i32, u8, bool),
     /// Immediate: #expr
     Immediate(i64),
     /// Memory reference (general expression)

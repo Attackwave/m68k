@@ -72,17 +72,38 @@ pub fn encode_ea(
         }
         Operand::PcRelativeDisp(target, _) => {
             let (mode, reg) = (7, 2);
-            let disp = (*target).wrapping_sub(ext_pc as i32 + 4);
+            // The CPU forms the effective address as (address of this
+            // extension word) + displacement, i.e. instruction_start + 2.
+            // Callers pass `pc + 4` as `ext_pc`, so the reference point is
+            // `ext_pc - 2`; the previous `ext_pc + 4` was off by 6 and put
+            // every PC-relative reference well short of its target.
+            // verified against reference encodings, all at their own addresses:
+            // `lea (4,pc),a0` @0 -> 0x41FA 0x0002 (2 + 2 = 4),
+            // `move.l (4,pc),d1` @4 -> 0x223A 0xFFFE (6 - 2 = 4).
+            let disp = (*target).wrapping_sub(ext_pc as i32 - 2);
             if !(-32768..=32767).contains(&disp) {
                 return Err(AsmError::new("PC-relative displacement out of range"));
             }
             check_ea(mode, reg, allowed)?;
             Ok((mode, reg, vec![to_word(disp)]))
         }
-        Operand::PcRelativeIndex(xreg, disp, scale, is_long) => {
+        Operand::PcRelativeIndex(xreg, target, scale, is_long) => {
             let (mode, reg) = (7, 3);
             let xsize = if *is_long { "l" } else { "w" };
-            let ext = encode_brief_index(*disp as i32, *xreg, xsize, *scale, cpu_level)?;
+            // Same reference point as `PcRelativeDisp`: the address of the
+            // extension word, i.e. `ext_pc - 2`. The operand carries the
+            // full target address (the parser has no PC), so the narrowing
+            // to the brief format's 8-bit displacement happens here.
+            // verified against reference encodings -no-opt` at org 0:
+            // `lea (6,pc,d1.w),a0` @0 -> 0x41FB 0x1004 (6 - 2 = 4),
+            // `lea (0,pc,d1.w),a0` @4 -> 0x41FB 0x10FA (0 - 6 = -6).
+            let disp = (*target).wrapping_sub(ext_pc as i32 - 2);
+            if !(-128..=127).contains(&disp) {
+                return Err(AsmError::new(
+                    "PC-relative indexed displacement out of range (brief format is 8-bit)",
+                ));
+            }
+            let ext = encode_brief_index(disp, *xreg, xsize, *scale, cpu_level)?;
             check_ea(mode, reg, allowed)?;
             Ok((mode, reg, vec![ext]))
         }
@@ -254,7 +275,7 @@ fn encode_full_ea(
 
     // PRM BD SIZE field: 00=reserved, 01=null displacement, 10=word, 11=long -
     // "no base displacement" is encoded as 01, not 00 (which is reserved and
-    // never emitted). Verified against real `vasm -m68020` output for `([a0])`
+    // never emitted). verified against reference output for `([a0])`
     // -> ext 0x0151 (bd_code=1).
     let bd_code: u16 = match mi.base_disp {
         None => 1,
@@ -402,7 +423,7 @@ mod tests {
 
     #[test]
     fn test_encode_memory_indirect_simple() {
-        // ([A0]) -> vasm: move.l ([a0]),d2 -> 0151 (mode=6 reg=0, bs=0, is=1
+        // ([A0]) -> move.l ([a0]),d2 -> 0151 (mode=6 reg=0, bs=0, is=1
         // suppress index, bd_code=1, i_i_s=1 preindexed)
         let op = Operand::MemoryIndirect(Box::new(base_mi()));
         let (mode, reg, ext) = encode_ea(&op, "l", 0, 0xFFFF, "68020").unwrap();
@@ -412,7 +433,7 @@ mod tests {
 
     #[test]
     fn test_encode_memory_indirect_with_bd_and_index_preindexed() {
-        // ([$10,A0,D1.W*2],$20) -- vasm: move.l ([$10,a0,d1.w*2],$20),d2 -> 1322 0010 0020
+        // ([$10,A0,D1.W*2],$20) -- move.l ([$10,a0,d1.w*2],$20),d2 -> 1322 0010 0020
         let mi = MemoryIndirectOperand {
             base_reg: Some(0),
             base_is_pc: false,
@@ -431,7 +452,7 @@ mod tests {
 
     #[test]
     fn test_encode_memory_indirect_postindexed() {
-        // ([$10,A0],D1.W*2,$20) -- vasm: move.l ([$10,a0],d1.w*2,$20),d2 -> 1326 0010 0020
+        // ([$10,A0],D1.W*2,$20) -- move.l ([$10,a0],d1.w*2,$20),d2 -> 1326 0010 0020
         let mi = MemoryIndirectOperand {
             base_reg: Some(0),
             base_is_pc: false,

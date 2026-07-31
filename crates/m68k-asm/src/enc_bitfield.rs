@@ -28,7 +28,7 @@ fn is_read_only(mnemonic: &str) -> bool {
 
 /// Build the bitfield extension word's offset/width fields.
 ///
-/// Layout (verified against real `vasm -m68020` output for
+/// Layout (verified against reference output for
 /// `BFEXTU D1{D2:D3},D4` -> ext word `0x48A3`): bit 11 = offset-is-register
 /// flag, bits 10-6 = offset (register number or 5-bit immediate), bit 5 =
 /// width-is-register flag, bits 4-0 = width (register number or immediate,
@@ -166,7 +166,7 @@ mod tests {
 
     #[test]
     fn test_bfextu_dn_offset_width_with_dest_reg() {
-        // BFEXTU D1{D2:D3},D4 -- verified against real `vasm -m68020`
+        // BFEXTU D1{D2:D3},D4 -- verified against reference encodings
         // output: opword 0xE9C1, ext word 0x48A3.
         let bf = Operand::Bitfield(
             Box::new(Operand::DataReg(1)),
@@ -180,7 +180,7 @@ mod tests {
 
     #[test]
     fn test_bfins_dest_reg_uses_bits_14_12() {
-        // BFINS D0,D1{4:8} -- verified against real `vasm -m68020` output:
+        // BFINS D0,D1{4:8} -- verified against reference output:
         // opword 0xEFC1, ext word 0x0108. Destination register always
         // encodes at bits 14-12 of the extension word, regardless of
         // mnemonic (D0 here happens to be 0, so this also checks offset(4)

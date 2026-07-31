@@ -15,12 +15,12 @@ use std::path::PathBuf;
 
 use m68k_core::errors::{AsmError, ErrorCollector};
 use m68k_core::operands::Operand;
-use m68k_core::tokens::split_line;
+use m68k_core::tokens::{is_local_label, split_line};
 
 use crate::directives::{
     SectionManager, handle_align_pass1, handle_align_pass2, handle_equ, handle_even_pass1,
     handle_even_pass2, handle_incbin_pass1, handle_incbin_pass2, handle_section, handle_set,
-    parse_dc_string,
+    parse_dc_string, resolve_include_path_in, strip_quotes,
 };
 use crate::encoder::encode_instruction;
 
@@ -73,11 +73,56 @@ impl SymbolEntry {
 #[derive(Debug, Default)]
 pub struct SymbolTable {
     symbols: HashMap<String, SymbolEntry>,
+    /// Global label currently in scope, for resolving local labels.
+    ///
+    /// Local labels (`.loop`) are stored under a qualified name
+    /// (`draw.loop`). Keeping the scope here rather than at the call sites
+    /// means every lookup path — expression evaluator, operand parser,
+    /// branch relaxation — resolves them the same way without each having
+    /// to know about scoping.
+    local_scope: Option<String>,
+    /// Whether to shorten an absolute address that fits in 16 bits to the
+    /// absolute-short addressing mode.
+    ///
+    /// Off by default, matching what Motorola-syntax assemblers emit
+    /// without optimization: an absolute address is encoded long unless
+    /// the source says `.W`. Turning it on reproduces their optimizing
+    /// mode. Lives here because the operand parser — a free function
+    /// reached from ~27 call sites — already receives the symbol table.
+    optimize_absolute: bool,
 }
 
 impl SymbolTable {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Set the global label that local labels resolve against.
+    pub fn set_local_scope(&mut self, global: Option<String>) {
+        self.local_scope = global;
+    }
+
+    /// Enable/disable shortening of absolute addresses that fit in 16
+    /// bits (see [`Self::optimize_absolute`]).
+    pub fn set_optimize_absolute(&mut self, on: bool) {
+        self.optimize_absolute = on;
+    }
+
+    /// Whether absolute-address shortening is enabled.
+    pub fn optimize_absolute(&self) -> bool {
+        self.optimize_absolute
+    }
+
+    /// Map a name as written in source to its stored name, qualifying
+    /// local labels with the current scope. Non-local names, and local
+    /// names with no enclosing global label, pass through unchanged.
+    pub fn resolve_name(&self, name: &str) -> String {
+        if is_local_label(name)
+            && let Some(global) = &self.local_scope
+        {
+            return qualified_local_name(global, name);
+        }
+        name.to_string()
     }
 
     /// Define or update a symbol. Returns `Err` if redefining an already-defined symbol.
@@ -127,9 +172,10 @@ impl SymbolTable {
         }
     }
 
-    /// Look up a symbol. Returns `Err` if undefined.
+    /// Look up a symbol. Returns `Err` if undefined. Resolves local
+    /// labels against the current scope, like [`Self::get`].
     pub fn resolve(&self, name: &str) -> Result<u32, AsmError> {
-        match self.symbols.get(name) {
+        match self.get(name) {
             Some(entry) if entry.defined => Ok(entry.value),
             Some(entry) => Err(AsmError::with_line(
                 format!("undefined symbol: {}", name),
@@ -139,14 +185,17 @@ impl SymbolTable {
         }
     }
 
-    /// Look up a symbol, returning `None` if undefined (no error).
+    /// Look up a symbol, resolving local labels against the current scope
+    /// (see [`Self::set_local_scope`]).
     pub fn get(&self, name: &str) -> Option<&SymbolEntry> {
-        self.symbols.get(name)
+        self.symbols
+            .get(&self.resolve_name(name))
+            .or_else(|| self.symbols.get(name))
     }
 
     /// Check if a symbol exists (defined or not).
     pub fn contains(&self, name: &str) -> bool {
-        self.symbols.contains_key(name)
+        self.symbols.contains_key(&self.resolve_name(name)) || self.symbols.contains_key(name)
     }
 
     /// Force-set a symbol value (allows redefinition, used by SET directive).
@@ -226,11 +275,17 @@ pub struct AssembledInstruction {
     pub line_no: Option<usize>,
     /// Original source text (for listing generation).
     pub source: Option<String>,
+    /// Exact byte length, when it isn't `words.len() * 2`.
+    ///
+    /// `DC.B` can emit an odd number of bytes, and the following
+    /// directive must start on the very next byte rather than after a
+    /// pad. Instructions leave this `None` — they are always whole words.
+    pub byte_len: Option<usize>,
 }
 
 impl AssembledInstruction {
     pub fn size_bytes(&self) -> usize {
-        self.words.len() * 2
+        self.byte_len.unwrap_or(self.words.len() * 2)
     }
 }
 
@@ -265,6 +320,10 @@ pub struct BranchInfo {
     pub size_hint: BranchSize,
     /// Source line number.
     pub line_no: Option<usize>,
+    /// Global label in scope at this branch, so a local target (`.exit`)
+    /// resolves against the right one during relaxation — by then the
+    /// symbol table's scope has moved to the end of the file.
+    pub local_scope: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -406,23 +465,27 @@ fn parse_operand_text(
     let paren_text = paren_text.as_ref();
 
     // PC-relative with index: (d8,PC,Xn*scale) - before plain PC-relative
-    if let Some((xn, disp, scale, xn_is_long)) = parse_parens_disp_pc_index(paren_text) {
-        return Ok(Operand::PcRelativeIndex(xn, disp, scale, xn_is_long));
+    if let Some((xn, target, scale, xn_is_long)) =
+        parse_parens_disp_pc_index(paren_text, symbols, current_pc)
+    {
+        return Ok(Operand::PcRelativeIndex(xn, target, scale, xn_is_long));
     }
 
     // PC-relative with displacement: (d16,PC) or (d32,PC)
-    if let Some((disp, is_long)) = parse_parens_disp_pc(paren_text) {
-        return Ok(Operand::PcRelativeDisp(disp, is_long));
+    if let Some((target, is_long)) = parse_parens_disp_pc(paren_text, symbols, current_pc) {
+        return Ok(Operand::PcRelativeDisp(target, is_long));
     }
 
     // Addressing with displacement: (d16,An) or (d32,An)
-    if let Some((disp, reg)) = parse_parens_disp_register(paren_text) {
+    if let Some((disp, reg)) = parse_parens_disp_register(paren_text, symbols, current_pc) {
         let is_long = !(-0x8000..=0x7FFF).contains(&disp);
         return Ok(Operand::AddrRegIndirectDisp(reg, disp, is_long));
     }
 
     // Indexed with base register: (d8,An,Xn*scale)
-    if let Some((an, xn, disp, scale, xn_is_long)) = parse_parens_disp_reg_index(paren_text) {
+    if let Some((an, xn, disp, scale, xn_is_long)) =
+        parse_parens_disp_reg_index(paren_text, symbols, current_pc)
+    {
         return Ok(Operand::AddrRegIndirectIndex(
             an, xn, disp, scale, xn_is_long,
         ));
@@ -444,11 +507,19 @@ fn parse_operand_text(
         }
     }
 
-    // Absolute short: $xxxx or number without register
+    // Absolute address: $xxxx or a number/label without a register.
+    //
+    // Encoded long unless shortening is enabled, which is what
+    // Motorola-syntax assemblers do without optimization — `MOVE.W
+    // $1234,D0` is `3039 00001234`, not `3038 1234`. An explicit `.W`
+    // suffix is handled above and always yields the short form, so the
+    // user keeps full control either way. Silently shortening here made
+    // every absolute reference two bytes smaller than the reference
+    // assemblers', shifting everything after it.
     if let Ok(value) = evaluate_expr_str(text, symbols, current_pc) {
         // Check if it looks like an absolute address (no register, no #)
         if !text.contains('(') && !text.contains(')') {
-            if (0..=0xFFFF).contains(&value) {
+            if symbols.optimize_absolute() && (0..=0xFFFF).contains(&value) {
                 return Ok(Operand::AbsoluteShort(value as i32));
             } else {
                 return Ok(Operand::AbsoluteLong(value as i32));
@@ -463,8 +534,13 @@ fn parse_operand_text(
     if text.eq_ignore_ascii_case("SR") {
         return Ok(Operand::Immediate(-2));
     }
+    // USP is a control register, not A7: mapping it to AddrReg(7) made
+    // `move usp,a0` assemble as a plain `move a7,a0` (0x304F) instead of
+    // the privileged 0x4E68 form, and the USP special cases in the MOVE
+    // dispatcher — which look for this marker — never fired. Uses the
+    // same negative/marker-immediate convention as CCR (-1) and SR (-2).
     if text.eq_ignore_ascii_case("USP") {
-        return Ok(Operand::AddrReg(7));
+        return Ok(Operand::Immediate(0x800));
     }
 
     // MOVEC control register names
@@ -497,6 +573,19 @@ fn parse_operand_text(
     // TC/SRP/MMUSR are ambiguous with MOVEC's control registers of the same name, so PMOVE's
     // encoder receives the raw name via Operand::Special and resolves it itself).
     if matches!(text.to_uppercase().as_str(), "TT0" | "TT1" | "CRP") {
+        return Ok(Operand::Special(text.to_uppercase()));
+    }
+
+    // 68040 cache-scope names for CINVA/CPUSHA/CINVL/CINVP/CPUSHL/CPUSHP
+    // (`cinva ic`, `cpushl dc,(a0)`), passed through as Special for the
+    // encoder to resolve — same approach as the PMOVE names above, since
+    // `DC`/`BC`/`IC`/`NC` are only cache scopes in those instructions'
+    // operand position and are otherwise ordinary identifiers. A symbol
+    // of the same name still wins: user labels must not be shadowed by
+    // an instruction-specific keyword.
+    if matches!(text.to_uppercase().as_str(), "NC" | "DC" | "IC" | "BC")
+        && symbols.get(text).is_none()
+    {
         return Ok(Operand::Special(text.to_uppercase()));
     }
 
@@ -745,7 +834,7 @@ fn split_disp_before_paren(text: &str) -> Option<String> {
     Some(format!("({},{})", disp, inner))
 }
 
-fn parse_parens_disp_register(text: &str) -> Option<(i32, u8)> {
+fn parse_parens_disp_register(text: &str, symbols: &SymbolTable, pc: u32) -> Option<(i32, u8)> {
     let trimmed = text.trim();
     if trimmed.starts_with('(') && trimmed.ends_with(')') {
         let inner = &trimmed[1..trimmed.len() - 1];
@@ -758,11 +847,11 @@ fn parse_parens_disp_register(text: &str) -> Option<(i32, u8)> {
             if let Some(dot_pos) = reg_str.find('.') {
                 let reg_part = &reg_str[..dot_pos];
                 if let Some(Operand::AddrReg(n)) = parse_register(reg_part) {
-                    let disp = evaluate_simple_number(disp_str).unwrap_or(0);
+                    let disp = evaluate_displacement(disp_str, symbols, pc);
                     return Some((disp, n));
                 }
             } else if let Some(Operand::AddrReg(n)) = parse_register(reg_str) {
-                let disp = evaluate_simple_number(disp_str).unwrap_or(0);
+                let disp = evaluate_displacement(disp_str, symbols, pc);
                 return Some((disp, n));
             }
         }
@@ -771,7 +860,10 @@ fn parse_parens_disp_register(text: &str) -> Option<(i32, u8)> {
 }
 
 /// Parse (d16,PC) or (d32,PC) - PC-relative with displacement.
-fn parse_parens_disp_pc(text: &str) -> Option<(i32, bool)> {
+///
+/// The returned value is the full target address, not the displacement;
+/// `encode_ea` subtracts the extension word's address.
+fn parse_parens_disp_pc(text: &str, symbols: &SymbolTable, pc: u32) -> Option<(i32, bool)> {
     let trimmed = text.trim();
     if trimmed.starts_with('(') && trimmed.ends_with(')') {
         let inner = &trimmed[1..trimmed.len() - 1];
@@ -779,9 +871,9 @@ fn parse_parens_disp_pc(text: &str) -> Option<(i32, bool)> {
             let disp_str = inner[..pos].trim();
             let reg_str = inner[pos + 1..].trim();
             if reg_str.to_uppercase() == "PC" {
-                let disp = evaluate_simple_number(disp_str).unwrap_or(0);
-                let is_long = !(-0x8000..=0x7FFF).contains(&disp);
-                return Some((disp, is_long));
+                let target = evaluate_pc_target(disp_str, symbols, pc);
+                let is_long = !(-0x8000..=0x7FFF).contains(&target);
+                return Some((target, is_long));
             }
         }
     }
@@ -789,8 +881,16 @@ fn parse_parens_disp_pc(text: &str) -> Option<(i32, bool)> {
 }
 
 /// Parse (d8,PC,Xn*scale) - PC-relative with index register.
-/// Returns (Xn, disp, scale, is_long).
-fn parse_parens_disp_pc_index(text: &str) -> Option<(u8, i8, u8, bool)> {
+///
+/// Returns (Xn, target address, scale, is_long). The second element is the
+/// full target address as written, *not* the encoded displacement: the PC
+/// is not known here, so `encode_ea` performs the subtraction (same split
+/// as the non-indexed `(d,PC)` form).
+fn parse_parens_disp_pc_index(
+    text: &str,
+    symbols: &SymbolTable,
+    pc: u32,
+) -> Option<(u8, i32, u8, bool)> {
     let trimmed = text.trim();
     if trimmed.starts_with('(') && trimmed.ends_with(')') {
         let inner = &trimmed[1..trimmed.len() - 1];
@@ -803,11 +903,10 @@ fn parse_parens_disp_pc_index(text: &str) -> Option<(u8, i8, u8, bool)> {
             if pc_str == "PC" {
                 let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
                 if let Some(reg) = parse_register(&xn_name)
-                    && let Some(reg_num) = reg.reg_num()
+                    && let Some(reg_num) = index_reg_num(&reg)
                 {
-                    let disp = evaluate_simple_number(disp_str).unwrap_or(0);
-                    let disp_i8 = (disp & 0xFF) as i8;
-                    return Some((reg_num, disp_i8, scale, is_long));
+                    let target = evaluate_pc_target(disp_str, symbols, pc);
+                    return Some((reg_num, target, scale, is_long));
                 }
             }
         }
@@ -819,7 +918,11 @@ fn parse_parens_disp_pc_index(text: &str) -> Option<(u8, i8, u8, bool)> {
 /// Supports optional scale: (d8,An,Xn*1), (d8,An,Xn*2), (d8,An,Xn*4), (d8,An,Xn*8)
 /// Supports optional index size: (d8,An,Xn.W), (d8,An,Xn.L)
 /// Returns (An, Xn, disp, scale, is_long).
-fn parse_parens_disp_reg_index(text: &str) -> Option<(u8, u8, i8, u8, bool)> {
+fn parse_parens_disp_reg_index(
+    text: &str,
+    symbols: &SymbolTable,
+    pc: u32,
+) -> Option<(u8, u8, i8, u8, bool)> {
     let trimmed = text.trim();
     if trimmed.starts_with('(') && trimmed.ends_with(')') {
         let inner = &trimmed[1..trimmed.len() - 1];
@@ -832,9 +935,9 @@ fn parse_parens_disp_reg_index(text: &str) -> Option<(u8, u8, i8, u8, bool)> {
             if let Some(Operand::AddrReg(an)) = parse_register(an_str) {
                 let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
                 if let Some(reg) = parse_register(&xn_name)
-                    && let Some(xn) = reg.reg_num()
+                    && let Some(xn) = index_reg_num(&reg)
                 {
-                    let disp = evaluate_simple_number(disp_str).unwrap_or(0);
+                    let disp = evaluate_displacement(disp_str, symbols, pc);
                     let disp_i8 = (disp & 0xFF) as i8;
                     return Some((an, xn, disp_i8, scale, is_long));
                 }
@@ -1036,6 +1139,21 @@ fn parse_index_reg_size_scale(text: &str) -> Option<(String, String, u8)> {
 /// `(register_name, scale, is_long)`; `is_long` is `true` only for an
 /// explicit `.L` suffix (`.B` and a missing suffix both default to the
 /// word-size encoding).
+/// Index-register number as the brief-format extension word encodes it:
+/// data registers stay 0-7, address registers become 8-15 (the encoder
+/// derives the D/A bit from `>= 8`). `Operand::reg_num()` alone can't be
+/// used here because it reports A6 as 6, indistinguishable from D6 —
+/// which made every address-register index assemble as a data register,
+/// e.g. `(a2,a6.w)` encoding an extension word of 0x6000 instead of
+/// 0xE000.
+fn index_reg_num(reg: &Operand) -> Option<u8> {
+    match reg {
+        Operand::DataReg(n) => Some(*n),
+        Operand::AddrReg(n) => Some(n + 8),
+        _ => None,
+    }
+}
+
 fn parse_index_reg_and_scale(text: &str) -> (String, u8, bool) {
     let text = text.trim();
     // Split on '*' to get scale
@@ -1063,16 +1181,72 @@ fn parse_index_reg_and_scale(text: &str) -> (String, u8, bool) {
 /// Evaluate a simple numeric expression ($hex, %bin, decimal).
 fn evaluate_simple_number(text: &str) -> Option<i32> {
     let text = text.trim();
-    if let Some(hex) = text.strip_prefix('$') {
-        return i32::from_str_radix(hex, 16).ok();
+    // A leading sign has to be handled before the radix prefix: `-$6` is
+    // a perfectly ordinary displacement (and is exactly what this
+    // crate's own disassembler emits for negative offsets, e.g.
+    // `jsr -$6(a6)` for an Amiga library call), but stripping only `$`
+    // left "-" attached to the digits and `from_str_radix` rejected it,
+    // so the whole displacement silently became 0 — turning every
+    // negative-offset `d(An)` into `0(An)`.
+    let (negative, body) = match text.strip_prefix('-') {
+        Some(rest) => (true, rest.trim_start()),
+        None => (false, text.strip_prefix('+').unwrap_or(text).trim_start()),
+    };
+    let magnitude = if let Some(hex) = body.strip_prefix('$') {
+        i32::from_str_radix(hex, 16).ok()?
+    } else if let Some(hex) = body.strip_prefix("0x") {
+        i32::from_str_radix(hex, 16).ok()?
+    } else if let Some(bin) = body.strip_prefix('%') {
+        i32::from_str_radix(bin, 2).ok()?
+    } else {
+        body.parse::<i32>().ok()?
+    };
+    Some(if negative {
+        magnitude.checked_neg()?
+    } else {
+        magnitude
+    })
+}
+
+/// Build the scoped name of a local label: `.loop` under global label
+/// `draw` becomes `draw.loop`.
+///
+/// The qualified name keeps a dot so it can never collide with a global
+/// label written in source (a global can't start with a dot, and a name
+/// like `draw.loop` written literally would qualify to the same thing —
+/// which is the behaviour other Motorola assemblers show as well).
+fn qualified_local_name(global: &str, local: &str) -> String {
+    format!("{}{}", global, local)
+}
+
+/// Evaluate a PC-relative operand's target, which may be a bare number or
+/// any expression involving symbols (`(target,PC)`, `(buf+4,PC,D1.W)`).
+///
+/// `evaluate_simple_number` alone only handles literals, so a label in this
+/// position silently became 0 — every `(label,PC)` and `(label,PC,Xn)`
+/// resolved to a displacement measured from address 0 instead of from the
+/// label. Falls back to the full evaluator, and only then to 0, so an
+/// unresolved forward reference in pass 1 still behaves as before.
+fn evaluate_pc_target(text: &str, symbols: &SymbolTable, pc: u32) -> i32 {
+    evaluate_displacement(text, symbols, pc)
+}
+
+/// Evaluate a displacement, which may be a literal (`$96`) or any
+/// expression over symbols (`DMACON-CUSTOM_BASE`).
+///
+/// Amiga sources address the custom chip registers as
+/// `MOVE.W #x,DMACON-CUSTOM_BASE(A6)`, so a displacement that only
+/// accepts literals silently assembles the whole program against offset
+/// 0 — writing to the wrong hardware register every time. Falls back to
+/// 0 for anything unresolvable so pass 1 can still size the instruction
+/// before every symbol is known.
+fn evaluate_displacement(text: &str, symbols: &SymbolTable, pc: u32) -> i32 {
+    if let Some(n) = evaluate_simple_number(text) {
+        return n;
     }
-    if let Some(hex) = text.strip_prefix("0x") {
-        return i32::from_str_radix(hex, 16).ok();
-    }
-    if let Some(bin) = text.strip_prefix('%') {
-        return i32::from_str_radix(bin, 2).ok();
-    }
-    text.parse::<i32>().ok()
+    evaluate_expr_str(text, symbols, pc)
+        .map(|v| v as i32)
+        .unwrap_or(0)
 }
 
 /// Check if text is a valid identifier.
@@ -1178,10 +1352,17 @@ fn is_directive_name(name: &str) -> bool {
             | "ifle"
             | "ifdef"
             | "ifndef"
+            // `IFD`/`IFND` are the Motorola-syntax short spellings, used
+            // by the Amiga system headers for their include guards.
+            | "ifd"
+            | "ifnd"
             | "ifc"
             | "ifnc"
             | "else"
             | "endif"
+            // `ENDC` is the Motorola-syntax spelling of ENDIF, used
+            // throughout the Amiga system headers.
+            | "endc"
             | "end"
             | "fail"
             | "warning"
@@ -1273,10 +1454,23 @@ pub struct Assembler {
     pub rs_counter: u32,
     /// `OPT` directive flag state, updated as `OPT` lines are processed.
     pub opt: OptState,
+    /// Extra directories searched for `INCLUDE` files (the `-I` paths),
+    /// tried after the including file's own directory.
+    pub include_paths: Vec<PathBuf>,
+    /// Files already spliced in, so each is included only once.
+    included_files: std::collections::HashSet<PathBuf>,
+    /// Most recent global (non-local) label, used to scope local labels.
+    ///
+    /// A local label (`.loop`) belongs to the global label above it, so
+    /// the same spelling can repeat in every subroutine. Both passes walk
+    /// the lines in the same order, so tracking the current global label
+    /// while walking is enough to give each local label a unique name —
+    /// see [`Assembler::qualify_label`].
+    current_global_label: Option<String>,
 }
 
 /// Tracks `OPT` directive flags (`OPT flag[n][+-]`, comma-separated,
-/// vasm/Devpac syntax — e.g. `OPT O+,W5-`). Flags are letter-coded,
+/// Devpac-style syntax — e.g. `OPT O+,W5-`). Flags are letter-coded,
 /// optionally followed by a numeric sub-option, followed by `+` (enable)
 /// or `-` (disable). Most OPT flags configure optimizer/listing behavior
 /// this assembler doesn't implement as distinct passes (there's no
@@ -1372,12 +1566,15 @@ impl Assembler {
             pc: origin,
             line_pcs: Vec::new(),
             source_root: PathBuf::from("."),
+            include_paths: Vec::new(),
+            included_files: std::collections::HashSet::new(),
             conditional_stack: Vec::new(),
             macro_definitions: HashMap::new(),
             macro_unique_counter: 0,
             sections: SectionManager::new(origin),
             rs_counter: 0,
             opt: OptState::default(),
+            current_global_label: None,
         }
     }
 
@@ -1393,6 +1590,23 @@ impl Assembler {
         self.sections.set_current_pc(self.pc + size);
     }
 
+    /// Emit a single zero pad byte to restore word alignment.
+    ///
+    /// Recorded as a one-byte instruction (`byte_len = 1`) so the output
+    /// writer places exactly one byte and the location counter stays in
+    /// step with pass 1's estimate.
+    fn emit_alignment_pad(&mut self, line: &ParsedLine) {
+        let pc = self.pc;
+        self.push_instruction(AssembledInstruction {
+            pc,
+            words: vec![0],
+            line_no: Some(line.line_no),
+            source: None,
+            byte_len: Some(1),
+        });
+        self.pc += 1;
+    }
+
     /// Check if the current conditional nesting allows code generation.
     fn is_conditional_active(&self) -> bool {
         self.conditional_stack.last().copied().unwrap_or(true)
@@ -1401,10 +1615,14 @@ impl Assembler {
     /// Evaluate a conditional directive name and its argument.
     fn eval_conditional(&self, name: &str, arg: &str, line_no: usize) -> Result<bool, AsmError> {
         match name {
-            "ifdef" | "ifndef" => {
+            "ifdef" | "ifndef" | "ifd" | "ifnd" => {
                 let sym = arg.trim();
                 let defined = self.symbols.contains(sym);
-                Ok(if name == "ifdef" { defined } else { !defined })
+                Ok(if name == "ifdef" || name == "ifd" {
+                    defined
+                } else {
+                    !defined
+                })
             }
             "ifc" | "ifnc" => {
                 // IFC/IFNC compares two comma-separated strings
@@ -1458,6 +1676,11 @@ impl Assembler {
     }
 
     /// Set the source root directory for INCLUDE/INCBIN resolution.
+    /// Add a directory to the `INCLUDE` search path.
+    pub fn add_include_path(&mut self, path: PathBuf) {
+        self.include_paths.push(path);
+    }
+
     pub fn set_source_root(&mut self, path: PathBuf) {
         self.source_root = path;
     }
@@ -1465,6 +1688,54 @@ impl Assembler {
     /// Set the CPU target.
     pub fn set_cpu(&mut self, cpu: &str) {
         self.cpu = cpu.to_string();
+    }
+
+    /// Location counter after the last assembled line.
+    ///
+    /// Needed to size binary output, since a trailing `DS`/`DCB` only
+    /// advances the PC and emits no instruction to measure.
+    pub fn end_pc(&self) -> u32 {
+        self.pc
+    }
+
+    /// Enable optimizations that change encoding size — currently
+    /// shortening absolute addresses that fit in 16 bits.
+    ///
+    /// Off by default so output matches what Motorola-syntax assemblers
+    /// emit without optimization.
+    pub fn set_optimize(&mut self, on: bool) {
+        self.symbols.set_optimize_absolute(on);
+    }
+
+    /// Resolve a label as written in source to the name stored in the
+    /// symbol table, scoping local labels (`.loop`) to the enclosing
+    /// global label.
+    ///
+    /// Non-local names pass through unchanged. A local label with no
+    /// global label above it also passes through unchanged, so it still
+    /// gets a sensible "undefined symbol" diagnostic rather than being
+    /// silently renamed.
+    fn qualify_label(&self, name: &str) -> String {
+        if is_local_label(name)
+            && let Some(global) = &self.current_global_label
+        {
+            return qualified_local_name(global, name);
+        }
+        name.to_string()
+    }
+
+    /// Note a label definition so later local labels scope to it.
+    ///
+    /// Must be called for every label as each pass walks the lines, in
+    /// source order, so both passes derive the same scope for the same
+    /// line. Also updates the symbol table's scope, which is what every
+    /// lookup path consults.
+    fn track_label_scope(&mut self, name: &str) {
+        if !is_local_label(name) {
+            self.current_global_label = Some(name.to_string());
+            self.symbols
+                .set_local_scope(self.current_global_label.clone());
+        }
     }
 
     /// Assemble source text into bytes.
@@ -1723,17 +1994,28 @@ impl Assembler {
                 let unique_id = self.macro_unique_counter;
 
                 // Build substitution map: \1..\9 from operands1 + \@
+                //
+                // All nine slots are always substituted, with the empty
+                // string for arguments the invocation didn't supply. That
+                // is what makes the standard optional-argument idiom work:
+                //
+                //     LIBINIT   MACRO   * [baseOffset]
+                //               IFC     '\1',''
+                //
+                // Leaving unsupplied slots as a literal `\1` (the previous
+                // behaviour) meant the IFC compared against the raw text,
+                // took the wrong branch, and left `SET \1` in the output —
+                // "invalid SET expression: unexpected character '\'".
                 let mut subs: Vec<(String, String)> = Vec::new();
-                for (idx, actual) in operands1.iter().enumerate() {
-                    if idx < 9 {
-                        subs.push((format!("\\{}", idx + 1), actual.clone()));
-                    }
+                for idx in 0..9 {
+                    let actual = operands1.get(idx).cloned().unwrap_or_default();
+                    subs.push((format!("\\{}", idx + 1), actual));
                 }
-                // Named params: \paramname
+                // Named params: \paramname — same rule, an unsupplied
+                // one substitutes to empty rather than staying literal.
                 for (idx, pname) in def.params.iter().enumerate() {
-                    if let Some(actual) = operands1.get(idx) {
-                        subs.push((format!("\\{}", pname), actual.clone()));
-                    }
+                    let actual = operands1.get(idx).cloned().unwrap_or_default();
+                    subs.push((format!("\\{}", pname), actual));
                 }
                 // \@ → unique number
                 subs.push(("\\@".to_string(), format!("{:04X}", unique_id)));
@@ -1774,7 +2056,12 @@ impl Assembler {
 
     /// Run the two-pass assembly process.
     pub fn assemble(&mut self, source: &str) -> Result<&[AssembledInstruction], AsmError> {
-        let expanded = self.macro_preprocess(source);
+        // INCLUDE is expanded first: an included file may define the
+        // macros, constants and structures the rest of the source uses,
+        // so it has to be in place before macro expansion and parsing.
+        self.included_files.clear();
+        let included = self.expand_includes(source, 0)?;
+        let expanded = self.macro_preprocess(&included);
         let parsed = parse_source(&expanded);
 
         // Pass 1: Build symbol table, calculate sizes
@@ -1789,6 +2076,91 @@ impl Assembler {
         Ok(&self.code)
     }
 
+    /// Test/diagnostic hook: run include + macro expansion only.
+    pub fn debug_expand(&mut self, source: &str) -> Result<String, AsmError> {
+        self.included_files.clear();
+        let included = self.expand_includes(source, 0)?;
+        Ok(self.macro_preprocess(&included))
+    }
+
+    /// Recursively splice `INCLUDE 'file'` directives into the source.
+    ///
+    /// Runs before macro expansion so an included file can define macros.
+    /// `depth` bounds recursion; a file that includes itself (directly or
+    /// through a chain) would otherwise expand forever.
+    ///
+    /// Each file is spliced in **at most once** per assembly. The Amiga
+    /// system headers include their dependencies unconditionally-looking
+    /// but guard the *contents* with `IFND FOO_I` / `ENDC`, relying on the
+    /// symbol being set by the first inclusion. That guard can't work here:
+    /// this expansion runs before pass 1 evaluates any conditional, so the
+    /// text would be spliced in repeatedly and the second copy's `EQU`s
+    /// would collide ("symbol 'LN' already defined"). Including once has
+    /// the same net effect the guards are written to achieve.
+    fn expand_includes(&mut self, source: &str, depth: usize) -> Result<String, AsmError> {
+        const MAX_INCLUDE_DEPTH: usize = 64;
+
+        if !source
+            .lines()
+            .any(|l| matches!(split_line(l).1.as_str(), "include"))
+        {
+            return Ok(source.to_string());
+        }
+        if depth >= MAX_INCLUDE_DEPTH {
+            return Err(AsmError::new(format!(
+                "INCLUDE nested more than {} levels deep (circular include?)",
+                MAX_INCLUDE_DEPTH
+            )));
+        }
+
+        let mut out = String::with_capacity(source.len());
+        for (idx, raw) in source.lines().enumerate() {
+            let (_, mnemonic, size, operands) = split_line(raw);
+            if mnemonic != "include" {
+                out.push_str(raw);
+                out.push('\n');
+                continue;
+            }
+
+            let args = build_directive_args(&None, &size, &operands);
+            let filename = args
+                .first()
+                .map(|a| strip_quotes(a).to_string())
+                .ok_or_else(|| AsmError::with_line("INCLUDE requires a filename", idx + 1))?;
+            let path = resolve_include_path_in(&filename, &self.source_root, &self.include_paths)
+                .map_err(|e| AsmError::with_line(e.message, idx + 1))?;
+
+            // Already pulled in? Drop the directive and move on.
+            let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            if !self.included_files.insert(canonical) {
+                continue;
+            }
+
+            let content = std::fs::read_to_string(&path).map_err(|e| {
+                AsmError::with_line(
+                    format!("cannot read include '{}': {}", path.display(), e),
+                    idx + 1,
+                )
+            })?;
+
+            // Resolve nested includes relative to the including file's own
+            // directory, the way C-style include search works — the Amiga
+            // headers include their siblings by bare name.
+            let saved_root = self.source_root.clone();
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                self.source_root = parent.to_path_buf();
+            }
+            let nested = self.expand_includes(&content, depth + 1);
+            self.source_root = saved_root;
+
+            out.push_str(&nested?);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+        Ok(out)
+    }
+
     // -----------------------------------------------------------------------
     // Pass 1: Symbol collection and size calculation
     // -----------------------------------------------------------------------
@@ -1798,9 +2170,18 @@ impl Assembler {
         self.pc = self.origin;
         self.line_pcs.clear();
         self.conditional_stack.clear();
+        self.current_global_label = None;
+        self.symbols.set_local_scope(None);
 
         for line in lines {
             self.line_pcs.push((line.line_no, self.pc));
+
+            // Establish the label scope before the conditional handling
+            // below can `continue` past it, mirroring pass 2 so both
+            // passes resolve a given line's local labels identically.
+            if let Some(ref label) = line.label {
+                self.track_label_scope(label);
+            }
 
             // Handle IF/ELSE/ENDIF always (manage conditional stack)
             if let LineType::Directive { name, args } = &line.line_type {
@@ -1811,9 +2192,10 @@ impl Assembler {
                         let active = self.is_conditional_active() && result;
                         self.conditional_stack.push(active);
                         if let Some(ref label) = line.label {
+                            let name = self.qualify_label(label);
                             let section = self.sections.current_section().map(|s| s.kind.name());
                             self.symbols.define_in_section(
-                                label,
+                                &name,
                                 self.pc,
                                 Some(line.line_no),
                                 section,
@@ -1822,15 +2204,16 @@ impl Assembler {
                         continue;
                     }
                     "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef"
-                    | "ifndef" => {
+                    | "ifndef" | "ifd" | "ifnd" => {
                         let arg = args.first().map(|s| s.as_str()).unwrap_or("");
                         let result = self.eval_conditional(name, arg, line.line_no)?;
                         let active = self.is_conditional_active() && result;
                         self.conditional_stack.push(active);
                         if let Some(ref label) = line.label {
+                            let name = self.qualify_label(label);
                             let section = self.sections.current_section().map(|s| s.kind.name());
                             self.symbols.define_in_section(
-                                label,
+                                &name,
                                 self.pc,
                                 Some(line.line_no),
                                 section,
@@ -1845,9 +2228,10 @@ impl Assembler {
                             return Err(AsmError::with_line("ELSE without IF", line.line_no));
                         }
                         if let Some(ref label) = line.label {
+                            let name = self.qualify_label(label);
                             let section = self.sections.current_section().map(|s| s.kind.name());
                             self.symbols.define_in_section(
-                                label,
+                                &name,
                                 self.pc,
                                 Some(line.line_no),
                                 section,
@@ -1855,14 +2239,15 @@ impl Assembler {
                         }
                         continue;
                     }
-                    "endif" => {
+                    "endif" | "endc" => {
                         if self.conditional_stack.pop().is_none() {
                             return Err(AsmError::with_line("ENDIF without IF", line.line_no));
                         }
                         if let Some(ref label) = line.label {
+                            let name = self.qualify_label(label);
                             let section = self.sections.current_section().map(|s| s.kind.name());
                             self.symbols.define_in_section(
-                                label,
+                                &name,
                                 self.pc,
                                 Some(line.line_no),
                                 section,
@@ -1886,9 +2271,10 @@ impl Assembler {
                     if name == "equ" || name == "set"
                 );
                 if !is_equ_or_set {
+                    let name = self.qualify_label(label);
                     let section = self.sections.current_section().map(|s| s.kind.name());
                     self.symbols
-                        .define_in_section(label, self.pc, Some(line.line_no), section)?;
+                        .define_in_section(&name, self.pc, Some(line.line_no), section)?;
                 }
             }
 
@@ -1914,6 +2300,12 @@ impl Assembler {
                 size,
                 operand_texts,
             } => {
+                // Mirror encode_instruction_line's alignment pad: an
+                // instruction after an odd-length DC.B gets a pad byte, so
+                // pass 1 must charge for it too or every following label
+                // is one byte off.
+                let pad = if self.pc.is_multiple_of(2) { 0 } else { 1 };
+
                 // For branch instructions, record them for relaxation
                 let is_branch = is_branch_mnemonic(mnemonic);
                 if is_branch {
@@ -1927,19 +2319,37 @@ impl Assembler {
                     } else {
                         operand_texts.first().cloned()
                     };
+                    // An explicit size suffix pins the branch form and
+                    // must survive into relaxation: `BRA.S loop` stays
+                    // short even with optimization off, and `BRA.W loop`
+                    // stays word even when the target is in short range.
+                    // Dropping it here made every suffix advisory.
+                    let size_hint = match size.as_deref() {
+                        Some("s") | Some("b") => BranchSize::Short,
+                        Some("w") => BranchSize::Word,
+                        Some("l") => BranchSize::Long,
+                        _ => BranchSize::Any,
+                    };
+                    let estimated_size = if size_hint == BranchSize::Any {
+                        estimated_size
+                    } else {
+                        branch_size_bytes(mnemonic, &size_hint)
+                    };
                     self.branches.push(BranchInfo {
                         instr_index: self.code.len(),
                         mnemonic: mnemonic.clone(),
                         target_text,
-                        size_hint: BranchSize::Any,
+                        size_hint,
                         line_no: Some(line.line_no),
+                        local_scope: self.current_global_label.clone(),
                     });
-                    return Ok(estimated_size);
+                    return Ok(estimated_size + pad);
                 }
 
                 // For other instructions, try to encode with dummy values
                 // to estimate size
                 self.estimate_instruction_size_from_texts(mnemonic, size.as_deref(), operand_texts)
+                    .map(|n| n + pad)
             }
         }
     }
@@ -2004,8 +2414,14 @@ impl Assembler {
                         total = total.saturating_add(element_size);
                     }
                 }
-                // Align to word boundary
-                Ok(total.saturating_add(1) & !1)
+                // No rounding: `encode_dc` advances the PC by the exact
+                // byte count, so this estimate must too. Rounding up to a
+                // word made consecutive `DC.B`s each start on an even
+                // address — `dc.b $5 / dc.b $EE` assembled to `05 00 EE 00`
+                // instead of `05 EE`, and every label after a byte-sized
+                // DC drifted. (The `ds` arm below had the same bug fixed
+                // earlier; DC kept it.)
+                Ok(total)
             }
             "ds" => {
                 // DS.B/W/L - reserve space. Must match encode_ds exactly:
@@ -2130,9 +2546,11 @@ impl Assembler {
                 Ok(0)
             }
             "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef" | "ifndef"
-            | "ifc" | "ifnc" | "else" | "endif" | "macro" | "endm" | "rept" | "irp" | "irpc"
-            | "endr" | "xref" | "xdef" | "public" | "extern" | "opt" | "mexit" | "exitm"
-            | "print" | "printt" | "printv" | "list" | "nolist" | "page" | "title" => Ok(0),
+            | "ifc" | "ifnc" | "else" | "endif" | "endc" | "macro" | "endm" | "rept" | "irp"
+            | "irpc" | "endr" | "xref" | "xdef" | "public" | "extern" | "opt" | "mexit"
+            | "exitm" | "print" | "printt" | "printv" | "list" | "nolist" | "page" | "title" => {
+                Ok(0)
+            }
             "cnop" => {
                 // CNOP offset,align → aligns to (PC + offset) % align == 0
                 if args.len() < 2 {
@@ -2155,11 +2573,7 @@ impl Assembler {
                 } else {
                     alignment - (target % alignment)
                 };
-                let bytes = if padding % 2 != 0 {
-                    padding + 1
-                } else {
-                    padding
-                };
+                let bytes = padding;
                 if bytes > 0 {
                     self.pc += bytes;
                 }
@@ -2260,16 +2674,23 @@ impl Assembler {
 
             // Check each branch (use index to avoid borrow conflicts)
             for i in 0..self.branches.len() {
-                let (mnemonic, line_no, size_hint, target_text) = {
+                let (mnemonic, line_no, size_hint, target_text, scope) = {
                     let b = &self.branches[i];
                     (
                         b.mnemonic.clone(),
                         b.line_no,
                         b.size_hint,
                         b.target_text.clone(),
+                        b.local_scope.clone(),
                     )
                 };
                 let branch_pc = self.get_pc_for_line(line_no)?;
+                // Resolve the target in the scope the branch was written
+                // in; `recalculate_pcs` above left the scope at the last
+                // label in the file, which is the wrong one for a local
+                // target and made every `BRA .local` fall back to a
+                // stale/absent address.
+                self.symbols.set_local_scope(scope);
                 let target_addr = target_text
                     .as_deref()
                     .and_then(|t| evaluate_expr_str(t, &self.symbols, branch_pc).ok())
@@ -2300,9 +2721,15 @@ impl Assembler {
         self.line_pcs.clear();
         self.pc = self.origin;
         let mut cond_stack: Vec<bool> = Vec::new();
+        // Rebuild the local-label scope from the top, as both passes do.
+        self.current_global_label = None;
+        self.symbols.set_local_scope(None);
 
         for line in lines {
             self.line_pcs.push((line.line_no, self.pc));
+            if let Some(ref label) = line.label {
+                self.track_label_scope(label);
+            }
 
             // Handle conditional directives
             let mut skip = false;
@@ -2318,7 +2745,7 @@ impl Assembler {
                         skip = true;
                     }
                     "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef"
-                    | "ifndef" => {
+                    | "ifndef" | "ifd" | "ifnd" => {
                         let arg = args.first().map(|s| s.as_str()).unwrap_or("");
                         let active = cond_stack.last().copied().unwrap_or(true);
                         let result = self
@@ -2333,7 +2760,7 @@ impl Assembler {
                         }
                         skip = true;
                     }
-                    "endif" => {
+                    "endif" | "endc" => {
                         cond_stack.pop();
                         skip = true;
                     }
@@ -2342,7 +2769,20 @@ impl Assembler {
             }
 
             if !skip && cond_stack.last().copied().unwrap_or(true) {
-                if let Some(ref label) = line.label {
+                // EQU/SET name a *value*, not a location, so they must be
+                // left alone here — overwriting them with the current PC
+                // turned every constant into its own address. Pass 1 has
+                // the same exemption; this loop was missing it, so any
+                // source with an `EQU` (i.e. essentially every real Amiga
+                // program, which equates the hardware registers) silently
+                // got zeroes wherever it used one.
+                let is_equ_or_set = matches!(&line.line_type,
+                    LineType::Directive { name, .. }
+                    if name == "equ" || name == "set"
+                );
+                if let Some(ref label) = line.label
+                    && !is_equ_or_set
+                {
                     // Each relaxation iteration recomputes PCs from scratch,
                     // so re-defining an already-defined symbol here must
                     // overwrite it rather than error out (define() would
@@ -2350,9 +2790,13 @@ impl Assembler {
                     // its iteration-1 value even as branch sizes change).
                     // Section must be preserved too (ELF/IEEE-695 output
                     // rely on it), so use the section-aware overwrite.
+                    // Local labels must be qualified the same way pass 1
+                    // qualified them, or this writes a second, unscoped
+                    // entry (`.loop`) that later lookups find first.
+                    let name = self.qualify_label(label);
                     let section = self.sections.current_section().map(|s| s.kind.name());
                     self.symbols
-                        .force_set_in_section(label, self.pc, Some(line.line_no), section);
+                        .force_set_in_section(&name, self.pc, Some(line.line_no), section);
                 }
                 // estimate_line_size_with_branches (via estimate_line_size)
                 // updates self.pc directly for directives like ORG/SECTION
@@ -2415,7 +2859,10 @@ impl Assembler {
             return BranchSize::Word;
         }
 
-        if hint == BranchSize::Word || hint == BranchSize::Long {
+        // An explicit suffix wins over both the range check and the
+        // optimization setting — including Short, which the user asked
+        // for by writing `.S`/`.B`.
+        if hint != BranchSize::Any {
             return hint;
         }
 
@@ -2426,7 +2873,16 @@ impl Assembler {
         // size estimate must agree.
         let disp = target as i32 - branch_pc as i32 - 2;
 
-        if (-128..=127).contains(&disp) && disp != 0 && disp != -1 {
+        // Shrinking a branch to its 8-bit form is an optimization, so it
+        // only happens when optimization is on — without it, Motorola-
+        // syntax assemblers emit the word form for an unsuffixed branch
+        // (`BRA label` -> 6000 fffc, not 60fc). An explicit `.S`/`.B`
+        // suffix arrives here as a Short hint and is honoured either way.
+        if self.symbols.optimize_absolute()
+            && (-128..=127).contains(&disp)
+            && disp != 0
+            && disp != -1
+        {
             BranchSize::Short
         } else if (-32768..=32767).contains(&disp) {
             BranchSize::Word
@@ -2457,8 +2913,21 @@ impl Assembler {
         self.pc = self.origin;
         self.code.clear();
         self.conditional_stack.clear();
+        // Local labels resolve against the enclosing global label, so the
+        // scope has to be rebuilt from the start of the source, exactly as
+        // pass 1 built it.
+        self.current_global_label = None;
+        self.symbols.set_local_scope(None);
 
         for line in lines {
+            // Track the label scope before anything can `continue` past
+            // it: a local label referenced on this line must resolve
+            // against the global label above it, and the conditional
+            // branches below skip the rest of the loop body.
+            if let Some(ref label) = line.label {
+                self.track_label_scope(label);
+            }
+
             // Handle IF/ELSE/ENDIF always (manage conditional stack)
             if let LineType::Directive { name, args } = &line.line_type {
                 match name.as_str() {
@@ -2470,7 +2939,7 @@ impl Assembler {
                         continue;
                     }
                     "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef"
-                    | "ifndef" => {
+                    | "ifndef" | "ifd" | "ifnd" => {
                         let arg = args.first().map(|s| s.as_str()).unwrap_or("");
                         let result = self.eval_conditional(name, arg, line.line_no)?;
                         let active = self.is_conditional_active() && result;
@@ -2485,7 +2954,7 @@ impl Assembler {
                         }
                         continue;
                     }
-                    "endif" => {
+                    "endif" | "endc" => {
                         if self.conditional_stack.pop().is_none() {
                             return Err(AsmError::with_line("ENDIF without IF", line.line_no));
                         }
@@ -2534,6 +3003,13 @@ impl Assembler {
         operand_texts: &[String],
         line: &ParsedLine,
     ) -> Result<(), AsmError> {
+        // Instructions must start on a word boundary — the 68000 faults on
+        // a misaligned instruction fetch. An odd-length `DC.B` run leaves
+        // the location counter odd, so emit the pad byte other Motorola
+        // assemblers insert here rather than encoding at an odd address.
+        if !self.pc.is_multiple_of(2) {
+            self.emit_alignment_pad(line);
+        }
         let pc = self.pc;
 
         // Central CPU-gating check, before any mnemonic-specific dispatch:
@@ -2786,6 +3262,7 @@ impl Assembler {
             words,
             line_no: Some(line.line_no),
             source: Some(line.raw.clone()),
+            byte_len: None,
         });
 
         self.pc += (word_count * 2) as u32;
@@ -2830,9 +3307,13 @@ impl Assembler {
             "bra" => self.encode_bra(disp, size_hint)?,
             "bsr" => self.encode_bsr(disp, size_hint)?,
             _ => {
-                // Bcc family - delegate to enc_flow
+                // Bcc family - delegate to enc_flow. The short form is
+                // only chosen when the source asked for it (`.S`/`.B`) or
+                // optimization is on, matching BRA/BSR above.
                 let cond = branch_condition(mnemonic)?;
-                crate::enc_flow::enc_bcc(&cond, target as i32, pc + 2, &self.cpu)
+                let allow_short = size_hint == BranchSize::Short
+                    || (size_hint == BranchSize::Any && self.symbols.optimize_absolute());
+                crate::enc_flow::enc_bcc_sized(&cond, target as i32, pc + 2, &self.cpu, allow_short)
                     .map_err(|e| AsmError::with_line(e.message.clone(), line.line_no))?
             }
         };
@@ -2843,6 +3324,7 @@ impl Assembler {
             words,
             line_no: Some(line.line_no),
             source: Some(line.raw.clone()),
+            byte_len: None,
         });
 
         self.pc += (word_count * 2) as u32;
@@ -2885,6 +3367,7 @@ impl Assembler {
             words,
             line_no: Some(line.line_no),
             source: Some(line.raw.clone()),
+            byte_len: None,
         });
 
         self.pc += (word_count * 2) as u32;
@@ -2914,7 +3397,7 @@ impl Assembler {
         // 68020+ long displacement: low byte 0xFF marks the 32-bit form
         // (0x00 marks the 16-bit form above), immediately followed by the
         // 32-bit displacement - no extra padding word. Verified against
-        // real `vasm -m68020` output for `bra.l far`.
+        // reference output for `bra.l far`.
         if self.cpu != "68000" {
             let op = 0x60FF;
             return Ok(vec![
@@ -3075,9 +3558,9 @@ impl Assembler {
                 Ok(())
             }
             "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef" | "ifndef"
-            | "ifc" | "ifnc" | "else" | "endif" | "macro" | "endm" | "rept" | "irp" | "irpc"
-            | "endr" | "xref" | "xdef" | "public" | "extern" | "mexit" | "exitm" | "list"
-            | "nolist" | "page" | "title" => Ok(()),
+            | "ifc" | "ifnc" | "else" | "endif" | "endc" | "macro" | "endm" | "rept" | "irp"
+            | "irpc" | "endr" | "xref" | "xdef" | "public" | "extern" | "mexit" | "exitm"
+            | "list" | "nolist" | "page" | "title" => Ok(()),
             "opt" => {
                 for msg in self.opt.apply(args) {
                     self.errors.warning(msg, Some(line.line_no));
@@ -3127,21 +3610,41 @@ impl Assembler {
                 } else {
                     alignment - (target % alignment)
                 };
-                let bytes = if padding % 2 != 0 {
-                    padding + 1
-                } else {
-                    padding
-                };
-                if bytes > 0 {
-                    let word_count = (bytes / 2) as usize;
-                    let words = vec![0x4E71u16; word_count];
+                if padding > 0 {
+                    // An odd PC is squared up with a single zero byte
+                    // first; only whole words after that become NOPs.
+                    // Rounding the byte count up to an even number and
+                    // filling it all with 0x4E71 both overshot the target
+                    // address and wrote a NOP at an odd offset.
+                    // Build the byte sequence, then pack it into words:
+                    // the leading zero byte occupies half a word, so the
+                    // NOPs that follow straddle word boundaries and can't
+                    // simply be pushed as 0x4E71 words.
+                    let mut pad_bytes: Vec<u8> = Vec::new();
+                    if !self.pc.is_multiple_of(2) {
+                        pad_bytes.push(0x00);
+                    }
+                    while (pad_bytes.len() as u32) + 1 < padding {
+                        pad_bytes.push(0x4E);
+                        pad_bytes.push(0x71);
+                    }
+                    while (pad_bytes.len() as u32) < padding {
+                        pad_bytes.push(0x00);
+                    }
+                    let mut words = Vec::new();
+                    for chunk in pad_bytes.chunks(2) {
+                        let hi = chunk[0] as u16;
+                        let lo = chunk.get(1).copied().unwrap_or(0) as u16;
+                        words.push((hi << 8) | lo);
+                    }
                     self.push_instruction(AssembledInstruction {
                         pc: self.pc,
                         words,
                         line_no: Some(line.line_no),
                         source: Some(line.raw.clone()),
+                        byte_len: Some(padding as usize),
                     });
-                    self.pc += bytes;
+                    self.pc += padding;
                 }
                 Ok(())
             }
@@ -3259,15 +3762,17 @@ impl Assembler {
             }
         }
 
-        // Round up to even
-        if !total_bytes.is_multiple_of(2) {
-            total_bytes += 1;
-            if words.is_empty() {
-                words.push(0);
-            } else {
-                let last = words.last_mut().unwrap();
-                *last &= 0xFF00; // Clear low byte (already has high byte)
-            }
+        // An odd byte count is kept as-is: `byte_len` below records the
+        // true length and the output writer stops there, so the next
+        // directive starts on the very next byte. Padding to an even
+        // length here is what made `dc.b $5 / dc.b $EE` emit
+        // `05 00 EE 00` rather than the `05 EE` other Motorola
+        // assemblers produce. The trailing half-word still needs its low
+        // byte cleared so nothing stale leaks into the image.
+        if !total_bytes.is_multiple_of(2)
+            && let Some(last) = words.last_mut()
+        {
+            *last &= 0xFF00;
         }
 
         let start_pc = self.pc;
@@ -3276,6 +3781,11 @@ impl Assembler {
             words,
             line_no: Some(line.line_no),
             source: Some(line.raw.clone()),
+            // DC.B may emit an odd byte count; record it so the next
+            // directive lands on the following byte instead of being
+            // pushed to the next word boundary. Motorola assemblers pack
+            // consecutive DC.B directives tightly.
+            byte_len: Some(total_bytes),
         });
 
         self.pc += total_bytes as u32;
@@ -3396,6 +3906,7 @@ impl Assembler {
             words,
             line_no: Some(line.line_no),
             source: Some(line.raw.clone()),
+            byte_len: None,
         });
 
         let total_bytes = element_size * count;
@@ -3593,7 +4104,7 @@ fn u128_to_96bit_words(val: u128) -> Vec<u16> {
 /// Convert an `f64` to the 96-bit (6-word) Motorola DC.X representation:
 /// IEEE-754 80-bit extended precision (1 sign + 15 exponent bits, then an
 /// explicit-integer-bit 64-bit mantissa) padded to 96 bits with a reserved
-/// zero word after the sign/exponent word, matching vasm/Devpac's DC.X
+/// zero word after the sign/exponent word, matching Devpac's DC.X
 /// layout (word0 = sign+exp, word1 = reserved, words 2-5 = mantissa).
 ///
 /// Unlike the double -> extended conversion previously removed from
@@ -3891,26 +4402,26 @@ start:
     }
 
     /// FMOVE.P k-factor reference bytes, verified against real
-    /// `vasm -m68881` output (see the commit adding k-factor support for
+    /// reference output (see the commit adding k-factor support for
     /// the exact byte-level derivation of the static-vs-dynamic format
     /// code distinction). `(A0)` is address register indirect mode 2 reg 0.
     #[test]
-    fn test_source_fmove_p_static_kfactor_matches_vasm() {
-        // vasm: fmove.p fp0,(a0){#5} -> f2106c05
+    fn test_source_fmove_p_static_kfactor_matches_reference() {
+        // Reference encoding: fmove.p fp0,(a0){#5} -> f2106c05
         let bytes = assemble_fpu_source("    FMOVE.P FP0,(A0){#5}\n");
         assert_eq!(bytes, vec![0xF2, 0x10, 0x6C, 0x05]);
     }
 
     #[test]
-    fn test_source_fmove_p_static_negative_kfactor_matches_vasm() {
-        // vasm: fmove.p fp0,(a0){#-5} -> f2106c7b (7-bit two's complement)
+    fn test_source_fmove_p_static_negative_kfactor_matches_reference() {
+        // Reference encoding: fmove.p fp0,(a0){#-5} -> f2106c7b (7-bit two's complement)
         let bytes = assemble_fpu_source("    FMOVE.P FP0,(A0){#-5}\n");
         assert_eq!(bytes, vec![0xF2, 0x10, 0x6C, 0x7B]);
     }
 
     #[test]
-    fn test_source_fmove_p_static_kfactor_extremes_match_vasm() {
-        // vasm: fmove.p fp0,(a0){#63} -> f2106c3f ; {#-64} -> f2106c40
+    fn test_source_fmove_p_static_kfactor_extremes_match_reference() {
+        // Reference encoding: fmove.p fp0,(a0){#63} -> f2106c3f ; {#-64} -> f2106c40
         assert_eq!(
             assemble_fpu_source("    FMOVE.P FP0,(A0){#63}\n"),
             vec![0xF2, 0x10, 0x6C, 0x3F]
@@ -3932,15 +4443,15 @@ start:
     }
 
     #[test]
-    fn test_source_fmove_p_dynamic_kfactor_matches_vasm() {
-        // vasm: fmove.p fp0,(a0){d3} -> f2107c30 (format code 7, Dn in bits 6-4)
+    fn test_source_fmove_p_dynamic_kfactor_matches_reference() {
+        // Reference encoding: fmove.p fp0,(a0){d3} -> f2107c30 (format code 7, Dn in bits 6-4)
         let bytes = assemble_fpu_source("    FMOVE.P FP0,(A0){D3}\n");
         assert_eq!(bytes, vec![0xF2, 0x10, 0x7C, 0x30]);
     }
 
     #[test]
-    fn test_source_fmove_p_dynamic_kfactor_all_registers_match_vasm() {
-        // vasm: fmove.p fp0,(a0){dN} for N=0..7 -> f2107c00, 7c10, .., 7c70
+    fn test_source_fmove_p_dynamic_kfactor_all_registers_match_reference() {
+        // Reference encoding: fmove.p fp0,(a0){dN} for N=0..7 -> f2107c00, 7c10, .., 7c70
         for (n, expected_ext) in (0u16..8).map(|n| (n, 0x7C00 + (n << 4))) {
             let bytes = assemble_fpu_source(&format!("    FMOVE.P FP0,(A0){{D{}}}\n", n));
             let ext = ((bytes[2] as u16) << 8) | bytes[3] as u16;
@@ -4018,7 +4529,7 @@ start:
     #[test]
     fn test_source_fmovem_range_without_slash_bugfix() {
         // fmovem fp0-fp3,-(a7): a pure range without a '/' must parse as a register list.
-        // vasm: fmovem fp0-fp3,-(a7) -> f227e00f
+        // Reference encoding: fmovem fp0-fp3,-(a7) -> f227e00f
         let bytes = assemble_fpu_source("    FMOVEM FP0-FP3,-(A7)\n");
         assert_eq!(bytes, vec![0xF2, 0x27, 0xE0, 0x0F]);
     }
@@ -4027,7 +4538,7 @@ start:
     fn test_source_fmovem_ctrl_list() {
         // fmovem fpcr/fpsr,-(a0): the "/" check must not misidentify this as an FP
         // data-register list before checking control registers.
-        // vasm: fmovem fpcr/fpsr,-(a0) -> f220b800
+        // Reference encoding: fmovem fpcr/fpsr,-(a0) -> f220b800
         let bytes = assemble_fpu_source("    FMOVEM FPCR/FPSR,-(A0)\n");
         assert_eq!(bytes, vec![0xF2, 0x20, 0xB8, 0x00]);
     }
@@ -4087,8 +4598,8 @@ start:
     }
 
     #[test]
-    fn test_encode_bra_long_displacement_matches_vasm() {
-        // vasm -m68020 `bra.l` for a displacement outside the 16-bit range uses
+    fn test_encode_bra_long_displacement_matches_reference() {
+        // On 68020, `bra.l` for a displacement outside the 16-bit range uses
         // opword 0x60FF (low byte 0xFF marks the 32-bit form) immediately followed
         // by the 32-bit displacement, with no padding word - regression test for a
         // bug where this duplicated (and originally also broken) BRA/BSR encoder
@@ -4101,7 +4612,7 @@ start:
     }
 
     #[test]
-    fn test_encode_bsr_long_displacement_matches_vasm() {
+    fn test_encode_bsr_long_displacement_matches_reference() {
         let mut asm = Assembler::new(0);
         asm.set_cpu("68020");
         let disp = 0x20000i32;
@@ -4141,88 +4652,97 @@ start:
 
     #[test]
     fn test_parse_parens_disp_pc() {
+        let st = SymbolTable::new();
         assert!(matches!(
-            parse_parens_disp_pc("($10,PC)"),
+            parse_parens_disp_pc("($10,PC)", &st, 0),
             Some((16, false))
         ));
         assert!(matches!(
-            parse_parens_disp_pc("($1000,PC)"),
+            parse_parens_disp_pc("($1000,PC)", &st, 0),
             Some((4096, false))
         ));
         assert!(matches!(
-            parse_parens_disp_pc("($10000,PC)"),
+            parse_parens_disp_pc("($10000,PC)", &st, 0),
             Some((65536, true))
         ));
         assert!(matches!(
-            parse_parens_disp_pc("(-10,PC)"),
+            parse_parens_disp_pc("(-10,PC)", &st, 0),
             Some((-10, false))
         ));
-        assert!(matches!(parse_parens_disp_pc("(0,PC)"), Some((0, false))));
-        assert!(parse_parens_disp_pc("(A0)").is_none());
+        assert!(matches!(
+            parse_parens_disp_pc("(0,PC)", &st, 0),
+            Some((0, false))
+        ));
+        assert!(parse_parens_disp_pc("(A0)", &st, 0).is_none());
     }
 
     #[test]
     fn test_parse_parens_disp_pc_index() {
+        let st = SymbolTable::new();
         assert!(matches!(
-            parse_parens_disp_pc_index("($10,PC,D0)"),
+            parse_parens_disp_pc_index("($10,PC,D0)", &st, 0),
             Some((0, 16, _, false))
         ));
         assert!(matches!(
-            parse_parens_disp_pc_index("(0,PC,D1)"),
+            parse_parens_disp_pc_index("(0,PC,D1)", &st, 0),
             Some((1, 0, _, false))
         ));
+        // An index register that is an *address* register is reported as
+        // 8 + n, the numbering the brief-format extension word uses to
+        // derive its D/A bit — so A2 is 10, not 2 (which would be D2).
         assert!(matches!(
-            parse_parens_disp_pc_index("($20,PC,A2)"),
-            Some((2, 32, _, false))
+            parse_parens_disp_pc_index("($20,PC,A2)", &st, 0),
+            Some((10, 32, _, false))
         ));
         assert!(matches!(
-            parse_parens_disp_pc_index("($10,PC,D3.W)"),
+            parse_parens_disp_pc_index("($10,PC,D3.W)", &st, 0),
             Some((3, 16, _, false))
         ));
         assert!(matches!(
-            parse_parens_disp_pc_index("($10,PC,D3.L)"),
+            parse_parens_disp_pc_index("($10,PC,D3.L)", &st, 0),
             Some((3, 16, _, true))
         ));
-        assert!(parse_parens_disp_pc_index("(A0)").is_none());
-        assert!(parse_parens_disp_pc_index("($10,PC)").is_none());
+        assert!(parse_parens_disp_pc_index("(A0)", &st, 0).is_none());
+        assert!(parse_parens_disp_pc_index("($10,PC)", &st, 0).is_none());
     }
 
     #[test]
     fn test_parse_parens_disp_reg_index() {
+        let st = SymbolTable::new();
         assert!(matches!(
-            parse_parens_disp_reg_index("($10,A0,D1)"),
+            parse_parens_disp_reg_index("($10,A0,D1)", &st, 0),
             Some((0, 1, 16, _, false))
         ));
         assert!(matches!(
-            parse_parens_disp_reg_index("(0,A1,D0)"),
+            parse_parens_disp_reg_index("(0,A1,D0)", &st, 0),
             Some((1, 0, 0, _, false))
         ));
         assert!(matches!(
-            parse_parens_disp_reg_index("($20,A2,D3.W)"),
+            parse_parens_disp_reg_index("($20,A2,D3.W)", &st, 0),
             Some((2, 3, 32, _, false))
         ));
         assert!(matches!(
-            parse_parens_disp_reg_index("($10,A3,D4.L)"),
+            parse_parens_disp_reg_index("($10,A3,D4.L)", &st, 0),
             Some((3, 4, 16, _, true))
         ));
         assert!(matches!(
-            parse_parens_disp_reg_index("(0,A0,D0*1)"),
+            parse_parens_disp_reg_index("(0,A0,D0*1)", &st, 0),
             Some((0, 0, 0, 1, false))
         ));
         assert!(matches!(
-            parse_parens_disp_reg_index("(0,A0,D0*2)"),
+            parse_parens_disp_reg_index("(0,A0,D0*2)", &st, 0),
             Some((0, 0, 0, 2, false))
         ));
         assert!(matches!(
-            parse_parens_disp_reg_index("(0,A0,D0*4)"),
+            parse_parens_disp_reg_index("(0,A0,D0*4)", &st, 0),
             Some((0, 0, 0, 4, false))
         ));
         assert!(matches!(
-            parse_parens_disp_reg_index("(0,A0,D0*8)"),
+            parse_parens_disp_reg_index("(0,A0,D0*8)", &st, 0),
             Some((0, 0, 0, 8, false))
         ));
-        assert!(parse_parens_disp_reg_index("(A0)").is_none());
-        assert!(parse_parens_disp_reg_index("($10,A0)").is_none());
+        assert!(parse_parens_disp_reg_index("(A0)", &st, 0).is_none());
+        assert!(parse_parens_disp_reg_index("($10,A0)", &st, 0).is_none());
     }
 
     #[test]
@@ -4349,6 +4869,141 @@ MYDEF EQU 42
         assert!(result.is_ok(), "assembly failed: {:?}", result.err());
         assert_eq!(asm.code.len(), 1);
         assert_eq!(asm.code[0].words, vec![0x4E75]);
+    }
+
+    /// Local labels (`.loop`) are scoped to the preceding global label, so
+    /// the same spelling may repeat once per subroutine.
+    ///
+    /// Reference encoding for this source: 7000 5240 66FC 4E75 7205 5341
+    /// 66FC 4E75 — both `BNE.S` reach their own `.loop`.
+    #[test]
+    fn test_local_labels_are_scoped_per_global_label() {
+        let mut asm = Assembler::new(0x1000);
+        asm.set_optimize(true);
+        let bytes = asm
+            .assemble_bytes(concat!(
+                "routine_a:\n",
+                "\tMOVEQ\t#0,D0\n",
+                ".loop:\n",
+                "\tADDQ.W\t#1,D0\n",
+                "\tBNE.S\t.loop\n",
+                "\tRTS\n",
+                "routine_b:\n",
+                "\tMOVEQ\t#5,D1\n",
+                ".loop:\n",
+                "\tSUBQ.W\t#1,D1\n",
+                "\tBNE.S\t.loop\n",
+                "\tRTS\n",
+            ))
+            .expect("duplicate local labels in separate scopes must assemble");
+        assert_eq!(
+            bytes,
+            vec![
+                0x70, 0x00, 0x52, 0x40, 0x66, 0xFC, 0x4E, 0x75, 0x72, 0x05, 0x53, 0x41, 0x66, 0xFC,
+                0x4E, 0x75
+            ]
+        );
+        // Stored under qualified names, so neither shadows the other.
+        assert_eq!(asm.symbols.resolve("routine_a.loop").unwrap(), 0x1002);
+        assert_eq!(asm.symbols.resolve("routine_b.loop").unwrap(), 0x100A);
+    }
+
+    /// `IFD`/`IFND`/`ENDC` are the Motorola spellings of
+    /// `IFDEF`/`IFNDEF`/`ENDIF`, used by every Amiga header's include
+    /// guard. Without them the guard never closed and the rest of the
+    /// file was silently skipped.
+    #[test]
+    fn test_motorola_conditional_spellings() {
+        let mut asm = Assembler::new(0x1000);
+        let bytes = asm
+            .assemble_bytes(concat!(
+                "\tIFND\tGUARD\n",
+                "GUARD\tSET\t1\n",
+                "VAL\tEQU\t7\n",
+                "\tENDC\n",
+                "\tIFD\tGUARD\n",
+                "\tMOVE.W\t#VAL,D0\n",
+                "\tENDC\n",
+            ))
+            .expect("IFND/IFD/ENDC must be recognised");
+        assert_eq!(bytes, vec![0x30, 0x3C, 0x00, 0x07]);
+    }
+
+    /// Regression: an argument the invocation didn't supply must
+    /// substitute to the empty string, not stay a literal `\1`.
+    ///
+    /// This is what the standard optional-argument idiom relies on —
+    /// `IFC '\1',''` picks the default branch. Leaving `\1` in place made
+    /// the comparison take the wrong branch and emitted `SET \1`, failing
+    /// with "invalid SET expression: unexpected character '\'". The Amiga
+    /// `exec/libraries.i` header uses exactly this shape for `LIBINIT`.
+    #[test]
+    fn test_macro_unsupplied_argument_substitutes_empty() {
+        let mut asm = Assembler::new(0x1000);
+        let src = concat!(
+            "LIBINIT     MACRO   * [baseOffset]\n",
+            "            IFC     '\\1',''\n",
+            "COUNT       SET     100\n",
+            "            ENDC\n",
+            "            IFNC    '\\1',''\n",
+            "COUNT       SET     \\1\n",
+            "            ENDC\n",
+            "            ENDM\n",
+            "    LIBINIT\n",
+            "    MOVE.W  #COUNT,D0\n",
+        );
+        let bytes = asm.assemble_bytes(src).expect("assembly should succeed");
+        // Default branch taken: COUNT = 100 = $64.
+        assert_eq!(bytes, vec![0x30, 0x3C, 0x00, 0x64]);
+
+        // And with an argument, the other branch wins.
+        let mut asm = Assembler::new(0x1000);
+        let bytes = asm
+            .assemble_bytes(&src.replace("    LIBINIT\n", "    LIBINIT 7\n"))
+            .expect("assembly should succeed");
+        assert_eq!(bytes, vec![0x30, 0x3C, 0x00, 0x07]);
+    }
+
+    /// `* [text]` after a mnemonic is a comment, not an operand.
+    ///
+    /// The star-comment rule keyed on a following *letter*, so the Amiga
+    /// headers' `MACRO   * [baseOffset]` parameter documentation parsed as
+    /// a macro parameter list and broke `\1` substitution.
+    #[test]
+    fn test_star_comment_before_bracket_is_a_comment() {
+        let (label, mnemonic, _, operands) =
+            m68k_core::tokens::split_line("LIBINIT\t    MACRO   * [baseOffset]");
+        assert_eq!(label.as_deref(), Some("LIBINIT"));
+        assert_eq!(mnemonic, "macro");
+        assert!(
+            operands.is_empty(),
+            "the `* [...]` comment must not become a macro parameter, got {:?}",
+            operands
+        );
+    }
+
+    /// A file is spliced in only once, however many times it is included.
+    ///
+    /// The Amiga headers include their dependencies and guard the contents
+    /// with `IFND FOO_I`/`ENDC`. Include expansion runs before pass 1
+    /// evaluates conditionals, so without include-once the text lands in
+    /// the stream twice and the second copy's `EQU`s collide.
+    #[test]
+    fn test_include_is_spliced_only_once() {
+        let dir = std::env::temp_dir().join(format!("m68k_inc_once_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("defs.i"), "VAL\tEQU\t9\n").unwrap();
+        std::fs::write(dir.join("mid.i"), "\tinclude 'defs.i'\n").unwrap();
+
+        let mut asm = Assembler::new(0x1000);
+        asm.add_include_path(dir.clone());
+        // Both paths reach defs.i; a second splice would redefine VAL.
+        let bytes = asm
+            .assemble_bytes("\tinclude 'defs.i'\n\tinclude 'mid.i'\n\tMOVE.W\t#VAL,D0\n")
+            .expect("duplicate include must not redefine symbols");
+        assert_eq!(bytes, vec![0x30, 0x3C, 0x00, 0x09]);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -4592,11 +5247,14 @@ loop REPT 2
 ",
         );
         assert!(result.is_ok(), "assembly failed: {:?}", result.err());
-        assert_eq!(asm.code.len(), 4);
-        // DC.B $01 = 0x0100, DC.B $02 = 0x0200, DC.B $03 = 0x0300
+        // Three DC.B from the IRP, then RTS. The odd byte count means an
+        // alignment pad sits between them, so compare the bytes rather
+        // than instruction indices.
         assert_eq!(asm.code[0].words, vec![0x0100]);
         assert_eq!(asm.code[1].words, vec![0x0200]);
         assert_eq!(asm.code[2].words, vec![0x0300]);
+        let (bytes, _) = crate::output::generate_binary(&asm.code).unwrap();
+        assert_eq!(bytes, vec![0x01, 0x02, 0x03, 0x00, 0x4E, 0x75]);
     }
 
     #[test]
@@ -4612,11 +5270,12 @@ loop REPT 2
 ",
         );
         assert!(result.is_ok(), "assembly failed: {:?}", result.err());
-        assert_eq!(asm.code.len(), 4);
-        // DC.B "A" = 0x4100, DC.B "B" = 0x4200, DC.B "C" = 0x4300
         assert_eq!(asm.code[0].words, vec![0x4100]);
         assert_eq!(asm.code[1].words, vec![0x4200]);
         assert_eq!(asm.code[2].words, vec![0x4300]);
+        // "ABC" is odd-length, so a pad byte precedes the RTS.
+        let (bytes, _) = crate::output::generate_binary(&asm.code).unwrap();
+        assert_eq!(bytes, vec![0x41, 0x42, 0x43, 0x00, 0x4E, 0x75]);
     }
 
     #[test]
@@ -4643,6 +5302,8 @@ loop REPT 2
     #[test]
     fn test_assemble_bra_with_relaxation() {
         let mut asm = Assembler::new(0x1000);
+        // Shrinking to the short form is an optimization, off by default.
+        asm.set_optimize(true);
         // Short branch (target within 127 bytes)
         let result = asm.assemble(
             "
@@ -4732,8 +5393,16 @@ after:
 ",
         );
         assert!(result.is_ok(), "assemble failed: {:?}", result.err());
-        assert_eq!(asm.symbols.resolve("after").unwrap(), 0x1006);
-        assert_eq!(asm.code[1].pc, 0x1006);
+        // "HELLO" is 5 bytes, so `after` lands on the odd address $1005.
+        // The label is *not* rounded up to a word boundary — a DC.B of
+        // odd length leaves the location counter odd, and only the
+        // following instruction gets a pad byte. Matches the reference
+        // assembler, which also reports `after = $1005`.
+        assert_eq!(asm.symbols.resolve("after").unwrap(), 0x1005);
+        // code[1] is the one-byte alignment pad inserted before the NOP,
+        // which therefore starts at $1006.
+        assert_eq!(asm.code[1].pc, 0x1005);
+        assert_eq!(asm.code[2].pc, 0x1006);
     }
 
     /// DS.L/DCB.L with a huge count must return a clean error instead of
@@ -4932,20 +5601,27 @@ faraway:
     /// runs). +127/-129/+128 pin the rest of the boundary.
     #[test]
     fn test_bra_short_range_boundaries() {
+        // These boundaries only apply when the assembler is allowed to
+        // pick the short form; without optimization every unsuffixed
+        // branch is word-sized.
         let mut asm = Assembler::new(0x1000);
+        asm.set_optimize(true);
         // disp = target - (pc + 2). BRA opcode is 2 bytes.
         asm.assemble("    BRA $1081\n").unwrap();
         assert_eq!(asm.code[0].words.len(), 1, "disp=127 should be short");
 
         let mut asm = Assembler::new(0x1000);
+        asm.set_optimize(true);
         asm.assemble("    BRA $1082\n").unwrap();
         assert_eq!(asm.code[0].words.len(), 2, "disp=128 should be word");
 
         let mut asm = Assembler::new(0x1000);
+        asm.set_optimize(true);
         asm.assemble("    BRA $0F82\n").unwrap();
         assert_eq!(asm.code[0].words.len(), 1, "disp=-128 should be short");
 
         let mut asm = Assembler::new(0x1000);
+        asm.set_optimize(true);
         asm.assemble("    BRA $0F81\n").unwrap();
         assert_eq!(asm.code[0].words.len(), 2, "disp=-129 should be word");
     }
@@ -5018,8 +5694,15 @@ far:
 ",
         );
         assert!(result.is_ok());
-        // DC.B $12 should be padded to even, so next DC.W should be at 0x1002
-        assert_eq!(asm.code[1].pc, 0x1002);
+        // EVEN emits a single pad byte at $1001 (code[1]); the DC.W then
+        // starts at $1002. Emitting a whole 0x4E71 NOP word here, as this
+        // previously did, both over-advanced by a byte and put executable
+        // bytes inside a data block.
+        assert_eq!(asm.code[1].pc, 0x1001);
+        assert_eq!(asm.code[1].size_bytes(), 1);
+        assert_eq!(asm.code[2].pc, 0x1002);
+        let (bytes, _) = crate::output::generate_binary(&asm.code).unwrap();
+        assert_eq!(bytes, vec![0x12, 0x00, 0x34, 0x56]);
     }
 
     #[test]
@@ -5433,28 +6116,28 @@ mymexc MACRO
     #[test]
     fn test_source_pmove_tc() {
         // TC is the destination (memory-to-register, R/W=0). Verified
-        // against real `vasm -m68030` output: F010 4000.
+        // against reference output: F010 4000.
         let bytes = assemble_source_with_cpu("    PMOVE (A0),TC\n", "68030");
         assert_eq!(bytes, vec![0xF0, 0x10, 0x40, 0x00]);
     }
 
     #[test]
     fn test_source_ptestr() {
-        // Verified against real `vasm -m68030` output: F010 8E12.
+        // verified against reference output: F010 8E12.
         let bytes = assemble_source_with_cpu("    PTESTR #2,(A0),#3\n", "68030");
         assert_eq!(bytes, vec![0xF0, 0x10, 0x8E, 0x12]);
     }
 
     #[test]
     fn test_source_pflusha() {
-        // Verified against real `vasm -m68030` output: F000 2400.
+        // verified against reference output: F000 2400.
         let bytes = assemble_source_with_cpu("    PFLUSHA\n", "68030");
         assert_eq!(bytes, vec![0xF0, 0x00, 0x24, 0x00]);
     }
 
     #[test]
     fn test_source_pflushn() {
-        // Verified against real `vasm -m68040` output: F500.
+        // verified against reference output: F500.
         let bytes = assemble_source_with_cpu("    PFLUSHN (A0)\n", "68040");
         assert_eq!(bytes, vec![0xF5, 0x00]);
     }
@@ -5468,14 +6151,14 @@ mymexc MACRO
     #[test]
     fn test_source_cinva() {
         // CINVA #3 (BC, both caches) -- verified against real
-        // `vasm -m68040` output for `cinva bc`: F4D8.
+        // reference output for `cinva bc`: F4D8.
         let bytes = assemble_source_with_cpu("    CINVA #3\n", "68040");
         assert_eq!(bytes, vec![0xF4, 0xD8]);
     }
 
     #[test]
     fn test_source_psave() {
-        // Base 0xF100 per PRM bit diagram (not verified against vasm - see
+        // Base 0xF100 per PRM bit diagram (not verified against reference encodings - see
         // enc_psave's doc comment in enc_mmu.rs).
         let bytes = assemble_source_with_cpu("    PSAVE -(A0)\n", "68030");
         assert_eq!(bytes, vec![0xF1, 0x20]);
@@ -5573,14 +6256,14 @@ mymexc MACRO
 
     #[test]
     fn test_source_memory_indirect_simple() {
-        // vasm: move.l ([a0]),d2 -> 2430 0151
+        // Reference encoding: move.l ([a0]),d2 -> 2430 0151
         let bytes = assemble_source_with_cpu("    MOVE.L ([A0]),D2\n", "68020");
         assert_eq!(bytes, vec![0x24, 0x30, 0x01, 0x51]);
     }
 
     #[test]
     fn test_source_memory_indirect_with_bd() {
-        // vasm: move.l ([$10,a0]),d2 -> 2430 0161 0010
+        // Reference encoding: move.l ([$10,a0]),d2 -> 2430 0161 0010
         let bytes = assemble_source_with_cpu("    MOVE.L ([$10,A0]),D2\n", "68020");
         assert_eq!(bytes, vec![0x24, 0x30, 0x01, 0x61, 0x00, 0x10]);
     }
@@ -5588,7 +6271,7 @@ mymexc MACRO
     #[test]
     fn test_source_memory_indirect_long_bd() {
         // Base displacement outside 16-bit signed range forces bd_code=3 (long).
-        // vasm: move.l ([$100000,a0]),d2 -> 2430 0171 0010 0000
+        // Reference encoding: move.l ([$100000,a0]),d2 -> 2430 0171 0010 0000
         let bytes = assemble_source_with_cpu("    MOVE.L ([$100000,A0]),D2\n", "68020");
         assert_eq!(bytes, vec![0x24, 0x30, 0x01, 0x71, 0x00, 0x10, 0x00, 0x00]);
     }
@@ -5596,7 +6279,7 @@ mymexc MACRO
     #[test]
     fn test_source_memory_indirect_preindexed() {
         // Index inside the brackets: ([bd,An,Xn],od)
-        // vasm: move.l ([$10,a0,d1.w*2],$20),d2 -> 2430 1322 0010 0020
+        // Reference encoding: move.l ([$10,a0,d1.w*2],$20),d2 -> 2430 1322 0010 0020
         let bytes = assemble_source_with_cpu("    MOVE.L ([$10,A0,D1.W*2],$20),D2\n", "68020");
         assert_eq!(bytes, vec![0x24, 0x30, 0x13, 0x22, 0x00, 0x10, 0x00, 0x20]);
     }
@@ -5604,7 +6287,7 @@ mymexc MACRO
     #[test]
     fn test_source_memory_indirect_postindexed() {
         // Index outside the brackets: ([bd,An],Xn,od)
-        // vasm: move.l ([$10,a0],d1.w*2,$20),d2 -> 2430 1326 0010 0020
+        // Reference encoding: move.l ([$10,a0],d1.w*2,$20),d2 -> 2430 1326 0010 0020
         let bytes = assemble_source_with_cpu("    MOVE.L ([$10,A0],D1.W*2,$20),D2\n", "68020");
         assert_eq!(bytes, vec![0x24, 0x30, 0x13, 0x26, 0x00, 0x10, 0x00, 0x20]);
     }
@@ -5719,12 +6402,54 @@ mymexc MACRO
 
     #[test]
     fn test_pc_relative_index_l_suffix_sets_long_bit() {
-        // Xn=D2 -> bits14-12=0x2000, disp=4.
+        // Xn=D2 -> bits14-12=0x2000.
+        //
+        // For `(d,PC,Xn)` the number is a target *address*, encoded
+        // relative to the extension word (instruction start + 2), exactly
+        // like the non-indexed `(d,PC)` form. The instruction sits at 0
+        // here, so target $4 becomes displacement 4 - 2 = 2.
+        // Reference encoding: 203B 2002.
         let bytes_l = assemble_source_with_cpu("    MOVE.L ($4,PC,D2.L),D0\n", "68000");
         let bytes_w = assemble_source_with_cpu("    MOVE.L ($4,PC,D2.W),D0\n", "68000");
-        assert_eq!(bytes_w, vec![0x20, 0x3B, 0x20, 0x04]);
+        assert_eq!(bytes_w, vec![0x20, 0x3B, 0x20, 0x02]);
         // Only the extension word's long bit (0x0800) should differ.
-        assert_eq!(bytes_l, vec![0x20, 0x3B, 0x28, 0x04]);
+        assert_eq!(bytes_l, vec![0x20, 0x3B, 0x28, 0x02]);
+    }
+
+    /// Regression: a *label* in either PC-relative form resolved to 0.
+    ///
+    /// Both parsers only ran `evaluate_simple_number`, which understands
+    /// literals but not symbols, and fell back to 0 — so `(target,PC)`
+    /// measured its displacement from address 0 instead of from `target`,
+    /// and `(target,PC,Xn)` encoded a displacement byte of 0. Neither was
+    /// covered, because every existing case used a numeric displacement.
+    ///
+    /// Reference encoding for this source: 41FA 0006 43FB 1002 4E71.
+    #[test]
+    fn test_pc_relative_forms_resolve_label_targets() {
+        let bytes = assemble_source_with_cpu(
+            "    ORG $1000\n    LEA (target,PC),A0\n    LEA (target,PC,D1.W),A1\ntarget:\n    NOP\n",
+            "68020",
+        );
+        assert_eq!(
+            bytes,
+            vec![0x41, 0xFA, 0x00, 0x06, 0x43, 0xFB, 0x10, 0x02, 0x4E, 0x71]
+        );
+    }
+
+    /// Regression: `(d,PC,Xn)` whose target is too far for the brief
+    /// format's 8-bit displacement must be a clean error, not a silently
+    /// truncated encoding.
+    #[test]
+    fn test_pc_relative_index_out_of_range_is_error() {
+        let mut asm = Assembler::new(0x1000);
+        asm.set_cpu("68000");
+        let err = asm.assemble_bytes("    ORG $1000\n    MOVE.L ($4,PC,D1.W),D2\n");
+        assert!(
+            err.is_err(),
+            "expected out-of-range error, got {:?}",
+            err.map(|b| b.len())
+        );
     }
 
     /// Regression for the ea_encode.rs Xn/disp field-swap bug: the brief

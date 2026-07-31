@@ -7,7 +7,7 @@
 //! `HUNK_SYMBOL` block per hunk for symbols defined in that section.
 //!
 //! Record layout verified by round-tripping through `m68k_core::amiga_hunk`
-//! (this crate's own Hunk reader, itself checked against real `vasm
+//! (this crate's own Hunk reader, itself checked against reference
 //! -Fhunkexe` output) and manually inspected with `hexdump`.
 //!
 //! # Limitations
@@ -154,6 +154,7 @@ mod tests {
                 words: vec![word],
                 line_no: None,
                 source: None,
+                byte_len: None,
             });
         }
         let mut symbols = SymbolTable::new();

@@ -15,6 +15,21 @@ use crate::directives::{Section, SectionKind, SectionManager};
 /// Returns a tuple of `(bytes, base_address)` where `base_address` is the
 /// starting address of the first instruction.
 pub fn generate_binary(instructions: &[AssembledInstruction]) -> Option<(Vec<u8>, u32)> {
+    generate_binary_to(instructions, None)
+}
+
+/// Like [`generate_binary`], but extends the image to `end_pc` if that is
+/// past the last instruction.
+///
+/// `DS`/`DCB` reserve space by advancing the location counter without
+/// emitting anything, so a reservation that ends the program leaves no
+/// instruction to derive the size from — the trailing reservation was
+/// simply dropped from the output. Passing the assembler's final PC keeps
+/// it, matching what other Motorola assemblers write.
+pub fn generate_binary_to(
+    instructions: &[AssembledInstruction],
+    end_pc: Option<u32>,
+) -> Option<(Vec<u8>, u32)> {
     if instructions.is_empty() {
         return None;
     }
@@ -23,6 +38,7 @@ pub fn generate_binary(instructions: &[AssembledInstruction]) -> Option<(Vec<u8>
     let last_addr = instructions
         .iter()
         .map(|i| i.pc + i.size_bytes() as u32)
+        .chain(end_pc.filter(|pc| *pc >= base_addr))
         .max()
         .unwrap_or(base_addr);
 
@@ -31,11 +47,23 @@ pub fn generate_binary(instructions: &[AssembledInstruction]) -> Option<(Vec<u8>
 
     for instr in instructions {
         let offset = (instr.pc - base_addr) as usize;
-        let mut pos = offset;
+        // Write byte-wise and stop at the instruction's real length: a
+        // DC.B emitting an odd number of bytes packs its last byte into
+        // the high half of a word, and writing the whole word would
+        // clobber the first byte of whatever follows.
+        let limit = instr.size_bytes();
+        let mut written = 0usize;
         for word in &instr.words {
-            bytes[pos] = (word >> 8) as u8;
-            bytes[pos + 1] = (word & 0xFF) as u8;
-            pos += 2;
+            for b in [(word >> 8) as u8, (word & 0xFF) as u8] {
+                if written >= limit {
+                    break;
+                }
+                let pos = offset + written;
+                if pos < bytes.len() {
+                    bytes[pos] = b;
+                }
+                written += 1;
+            }
         }
     }
 
@@ -63,11 +91,23 @@ pub fn generate_binary_with_padding(
 
     for instr in instructions {
         let offset = (instr.pc - base_addr) as usize;
-        let mut pos = offset;
+        // Write byte-wise and stop at the instruction's real length: a
+        // DC.B emitting an odd number of bytes packs its last byte into
+        // the high half of a word, and writing the whole word would
+        // clobber the first byte of whatever follows.
+        let limit = instr.size_bytes();
+        let mut written = 0usize;
         for word in &instr.words {
-            bytes[pos] = (word >> 8) as u8;
-            bytes[pos + 1] = (word & 0xFF) as u8;
-            pos += 2;
+            for b in [(word >> 8) as u8, (word & 0xFF) as u8] {
+                if written >= limit {
+                    break;
+                }
+                let pos = offset + written;
+                if pos < bytes.len() {
+                    bytes[pos] = b;
+                }
+                written += 1;
+            }
         }
     }
 
@@ -886,6 +926,7 @@ mod tests {
             words,
             line_no: None,
             source: None,
+            byte_len: None,
         }
     }
 

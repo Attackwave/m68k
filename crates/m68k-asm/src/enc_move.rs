@@ -34,9 +34,18 @@ pub fn enc_move(
         | ((src_mode as u16) << 3)
         | (src_reg as u16);
 
+    // Extension words follow the opword in operand order: source first,
+    // then destination. Emitting them the other way round produced
+    // subtly corrupt code whenever *both* operands carry extensions —
+    // e.g. `move.b #$ff,$8(a2)` came out as 157C 0008 00FF instead of
+    // 157C 00FF 0008, swapping the immediate with the displacement.
+    // Found by reassembling real Kickstart 1.3 ROM code and comparing
+    // against the original bytes; confirmed with reference encodings for
+    // immediate->displacement, absolute->absolute and displacement->
+    // displacement combinations.
     let mut words = vec![op];
-    words.extend(dst_ext);
     words.extend(src_ext);
+    words.extend(dst_ext);
     Ok(words)
 }
 
@@ -48,12 +57,27 @@ pub fn enc_movea(
     pc: u32,
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
-    let sz = if size == "l" { 3 } else { 1 };
-    let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, DATA, cpu)?;
+    // MOVE-family size bits (13-12) are w=3, l=2 — not 1/3. MOVEA has no
+    // byte form. The previous `if l {3} else {1}` emitted .l as 3 (i.e.
+    // MOVE.W) and .w as 1 (MOVE.B), so every MOVEA came out the wrong
+    // size. verified against reference encodings: `movea.l a0,a1` -> 0x2248.
+    let sz: u16 = match size {
+        "l" => 2,
+        "w" => 3,
+        _ => return Err(AsmError::new("MOVEA requires .w or .l size")),
+    };
+    // MOVEA accepts *all* addressing modes as its source, including An
+    // (`MOVEA.L A0,A1` is valid and common). The previous `DATA`
+    // category excludes address registers, so that form was rejected
+    // with "addressing mode not allowed".
+    let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, ALL, cpu)?;
 
-    let op = 0x3000
-        | ((sz as u16) << 12)
+    // Destination mode (bits 8-6) must be 001 = address-register direct;
+    // it was previously left at 000 (data register), so the encoding
+    // named a Dn destination and decoded back as a plain MOVE.
+    let op = (sz << 12)
         | ((dst_reg as u16) << 9)
+        | (0b001 << 6)
         | ((src_mode as u16) << 3)
         | (src_reg as u16);
     let mut words = vec![op];
@@ -162,16 +186,27 @@ pub fn enc_moves(
     if cpu == "68000" {
         return Err(AsmError::new("MOVES requires 68010 or later"));
     }
+    // Size occupies opword bits 7-6 (b=0, w=1, l=2), like most
+    // single-EA instructions — *not* bits 10-9. The previous code both
+    // used the wrong field width (0/1/3, a bits-10-9 style encoding) and
+    // OR'd it at bit 9, where the 0x0E00 base already has bits 11-9 set,
+    // so the shift had no effect at all and every MOVES came out
+    // byte-sized. verified against reference encodings: `moves.w a1,(a0)` is
+    // 0x0E50, `moves.l d0,(a0)` is 0x0E90.
     let size_code = match size {
         "b" => 0u16,
         "w" => 1,
-        "l" => 3,
+        "l" => 2,
         _ => return Err(AsmError::new("invalid size for MOVES")),
     };
+    // Extension word: bit 15 selects An over Dn, bits 14-12 the register
+    // number, and bit 11 the direction (1 = register -> memory). That
+    // direction bit was previously never set, so `MOVES Rn,<ea>` encoded
+    // identically to `MOVES <ea>,Rn` and silently assembled to a load.
     let (reg_word, ea_ast) = if let Operand::DataReg(r) = src {
-        (((*r as u16) << 12), dst)
+        ((1u16 << 11) | ((*r as u16) << 12), dst)
     } else if let Operand::AddrReg(r) = src {
-        ((1u16 << 15) | ((*r as u16) << 12), dst)
+        ((1u16 << 15) | (1u16 << 11) | ((*r as u16) << 12), dst)
     } else if let Operand::DataReg(r) = dst {
         (((*r as u16) << 12), src)
     } else if let Operand::AddrReg(r) = dst {
@@ -183,8 +218,7 @@ pub fn enc_moves(
     };
     let ea_allowed = DREG | AREG_IND | APOSTINC | APREDEC | AREG_DISP | AINDEXED | ABSW | ABSL;
     let (ea_mode, ea_reg, ea_ext) = encode_ea(ea_ast, size, pc, ea_allowed, cpu)?;
-    let base = 0x0E00 | (size_code << 9);
-    let op = base | ((ea_mode as u16) << 3) | (ea_reg as u16);
+    let op = 0x0E00 | (size_code << 6) | ((ea_mode as u16) << 3) | (ea_reg as u16);
     let mut words = vec![op, reg_word];
     words.extend(ea_ext);
     Ok(words)
@@ -269,21 +303,14 @@ mod tests {
             "68010",
         )
         .unwrap();
-        // base 0x0E00 | (3<<9) = 0x0E00 | 0x600 = 0x0E00
-        // Wait: 3 << 9 = 0x600. 0x0E00 | 0x600 = 0x0E00 | 0x0600 = 0x0C00? Let me compute:
-        // 0x0E00 = 0b0000_1110_0000_0000
-        // 0x0600 = 0b0000_0110_0000_0000
-        // OR = 0x0E00 | 0x0600 = 0x0E00 (bit 9 is already set in 0x0E00... no, let me check)
-        // 0x0E00 bit 9 = 0, bit 10 = 1, bit 11 = 1
-        // 0x0600 bit 9 = 1, bit 10 = 1
-        // OR: bit 9 = 1, bit 10 = 1 = 0x0C00... hmm
-        // Actually, 3 << 9 = 0x1800... NO. 3 = 0b11. 3 << 9 = 0b11000000000 = 0x600. Yes, 0x600.
-        // 0x0E00 = 0b0000_1110_0000_0000
-        // 0x0600 = 0b0000_0110_0000_0000
-        // OR     = 0b0000_1110_0000_0000 = 0x0E00 (unchanged, since bit 10 already set)
-        // | (2<<3) | 1 = 0x0E00 | 0x10 | 1 = 0x0E11
-        // ext: (0 << 12) = 0
-        assert_eq!(words, vec![0x0E11, 0x0000]);
+        // Reference encoding: `moves.l d0,(a1)` -> 0e91 0800.
+        // opword: 0x0E00 | (size 2 << 6) | (mode 2 << 3) | reg 1 = 0x0E91
+        // ext:    Dn (bit15=0), reg 0 (bits14-12), direction
+        //         register->memory (bit11=1) = 0x0800
+        // The previous expectation (0x0E11, 0x0000) encoded this as a
+        // *byte*-sized *load* — the size shift landed on already-set bits
+        // of the 0x0E00 base and the direction bit was never emitted.
+        assert_eq!(words, vec![0x0E91, 0x0800]);
     }
 
     #[test]
@@ -296,11 +323,11 @@ mod tests {
             "68010",
         )
         .unwrap();
-        // Dn→mem: reg_word = (1<<15) | (2<<12) = 0x8000 | 0x2000 = 0xA000
-        // Actually: (1 << 15) = 0x8000, (2 << 12) = 0x2000, OR = 0xA000
-        // op = 0x0E00 | (3<<9) | (2<<3) | 1 = 0x0E00 | 0x600 | 0x10 | 1 = 0x0E11
-        // Wait: AREN_IND mode=2, reg=1. So (ea_mode<<3) | ea_reg = (2<<3) | 1 = 0x10 | 1 = 0x11
-        assert_eq!(words, vec![0x0E11, 0xA000]);
+        // Reference encoding: `moves.l (a1),a2` -> 0e91 a000.
+        // opword: same 0x0E91 as the store above (the EA and size are
+        // identical); ext: An (bit15=1) | reg 2 (bits14-12) | direction
+        // memory->register (bit11=0) = 0xA000.
+        assert_eq!(words, vec![0x0E91, 0xA000]);
     }
 
     #[test]

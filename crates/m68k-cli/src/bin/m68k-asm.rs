@@ -7,7 +7,7 @@ use m68k_asm::amiga_hunk_writer::generate_hunk_exe;
 use m68k_asm::assembler::Assembler;
 use m68k_asm::ieee695::generate_ieee695_sections;
 use m68k_asm::output::{
-    OutputFormat, generate_binary, generate_elf_sections, generate_intel_hex, generate_srecord,
+    OutputFormat, generate_binary_to, generate_elf_sections, generate_intel_hex, generate_srecord,
 };
 
 #[derive(Parser, Debug)]
@@ -32,6 +32,18 @@ struct Args {
     /// CPU target
     #[arg(short, long, default_value = "68000")]
     cpu: String,
+
+    /// Add a directory to the INCLUDE search path (repeatable), e.g.
+    /// `-I /path/to/Include` for the Amiga system headers
+    #[arg(short = 'I', long = "include", value_name = "DIR")]
+    include_paths: Vec<PathBuf>,
+
+    /// Enable size-changing optimizations: encode an absolute address
+    /// that fits in 16 bits as absolute-short. Off by default, so output
+    /// matches assemblers running without optimization; an explicit `.W`
+    /// suffix always yields the short form regardless.
+    #[arg(long)]
+    optimize: bool,
 
     /// S-Record header name (used with -f srecord)
     #[arg(long, default_value = "m68k-asm")]
@@ -100,6 +112,10 @@ fn run(args: Args) -> Result<(), String> {
     // Assemble
     let mut asm = Assembler::new(origin);
     asm.set_cpu(&args.cpu);
+    asm.set_optimize(args.optimize);
+    for dir in &args.include_paths {
+        asm.add_include_path(dir.clone());
+    }
     if let Some(parent) = args.input.parent() {
         asm.set_source_root(parent.to_path_buf());
     }
@@ -166,7 +182,9 @@ fn run(args: Args) -> Result<(), String> {
             // reservations. generate_binary fills gaps with zero bytes
             // between the lowest and highest instruction address instead.
             const MAX_BINARY_SIZE: usize = 16 * 1024 * 1024; // 68k address space
-            match generate_binary(&asm.code) {
+            // Pass the final PC so a trailing DS/DCB reservation (which
+            // emits no instruction) still sizes the image.
+            match generate_binary_to(&asm.code, Some(asm.end_pc())) {
                 Some((bytes, _base_addr)) => {
                     if bytes.len() > MAX_BINARY_SIZE {
                         return Err(format!(

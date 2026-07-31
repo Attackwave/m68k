@@ -186,6 +186,68 @@ pub fn tokenize(line: &str) -> Vec<Token> {
     tokens
 }
 
+/// Byte offset of a `*` that starts a comment, if the line has one.
+///
+/// Motorola syntax overloads `*` three ways: comment marker, multiply
+/// operator, and "current PC". They are told apart by position:
+///
+/// * column 1 — always a comment (`* header banner`);
+/// * preceded by whitespace *and* followed by whitespace, or by a word
+///   that can't continue an expression — a trailing comment
+///   (`FOO EQU 0    * for assembler's sake`);
+/// * anywhere else — the operator or the PC symbol (`WIDTH*HEIGHT`,
+///   `BRA *`, `DC.L *+4`).
+///
+/// Quoted text is skipped so a `*` inside a string stays literal.
+fn find_star_comment(line: &str) -> Option<usize> {
+    if line.starts_with('*') {
+        return Some(0);
+    }
+
+    let bytes = line.as_bytes();
+    let mut in_quote = false;
+    let mut quote_char = 0u8;
+    for (i, ch) in line.char_indices() {
+        let b = bytes[i];
+        if in_quote {
+            if b == quote_char {
+                in_quote = false;
+            }
+            continue;
+        }
+        if b == b'"' || b == b'\'' {
+            in_quote = true;
+            quote_char = b;
+            continue;
+        }
+        if ch != '*' || i == 0 {
+            continue;
+        }
+        // Must follow whitespace: `A*2` is a multiply.
+        if !bytes[i - 1].is_ascii_whitespace() {
+            continue;
+        }
+        // Whitespace *before* the star is necessary but not sufficient —
+        // `A * 2` is still a multiply. What follows decides:
+        //
+        //   * a letter or `[`/`_` starts prose — a comment
+        //     (`MACRO   * [baseOffset]`, `EQU 0  * for assembler's sake`);
+        //   * a digit, `$`, `(`, `%` or an operator continues the
+        //     expression (`A * 2`, `SIZE * $10`);
+        //   * end of line is the PC symbol (`BRA *`).
+        //
+        // `[` matters specifically because the Amiga headers document
+        // optional macro parameters as `* [baseOffset]`; treating that as
+        // a parameter list left `\1` unsubstituted in the macro body.
+        let rest = line[i + 1..].trim_start();
+        match rest.chars().next() {
+            Some(c) if c.is_alphabetic() || c == '[' || c == '_' => return Some(i),
+            _ => continue,
+        }
+    }
+    None
+}
+
 /// Split a source line into (label, mnemonic, size, operand_texts).
 pub fn split_line(line: &str) -> (Option<String>, String, String, Vec<String>) {
     let mut line = line.to_string();
@@ -218,6 +280,24 @@ pub fn split_line(line: &str) -> (Option<String>, String, String, Vec<String>) {
         line = line[..pos].to_string();
     }
 
+    // `*` also starts a comment in Motorola syntax, but only where an
+    // operand can't continue: at the start of the line, or after
+    // whitespace that follows a complete operand field. The Amiga system
+    // headers rely on this — `FOO EQU 0    * for assembler's sake`.
+    //
+    // Crucially it must stay a multiply operator when it appears *inside*
+    // an expression (`SIZE EQU WIDTH*HEIGHT`), and `*` alone is also the
+    // "current PC" symbol, so only a `*` preceded by whitespace and
+    // followed by something other than an operand character is treated as
+    // a comment.
+    if let Some(pos) = find_star_comment(&line) {
+        line = line[..pos].to_string();
+    }
+
+    // Whether the source line began flush left, before trimming — used
+    // below to tell a bare label in column 1 from an indented mnemonic.
+    let starts_in_column_1 = line.chars().next().is_some_and(|c| !c.is_whitespace());
+
     let line = line.trim();
     if line.is_empty() {
         return (None, String::new(), String::new(), vec![]);
@@ -244,7 +324,7 @@ pub fn split_line(line: &str) -> (Option<String>, String, String, Vec<String>) {
 
     // Check for label without colon (IDENT followed by directive)
     let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
-    if parts.len() == 2 && is_valid_ident(parts[0]) {
+    if parts.len() == 2 && is_valid_ident(parts[0]) && !takes_cache_scope_operand(parts[0]) {
         let rest = parts[1].trim();
         let rest_parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
         if let Some(first) = rest_parts.first() {
@@ -253,6 +333,18 @@ pub fn split_line(line: &str) -> (Option<String>, String, String, Vec<String>) {
                 return parse_rest_with_label(rest, Some(parts[0].to_string()));
             }
         }
+    }
+
+    // A label alone on its line, without a colon — `.exit` or `START`
+    // written in column 1. Motorola assemblers treat a bare identifier
+    // starting in column 1 as a label definition, colon or not.
+    //
+    // The column-1 test is what keeps this from swallowing operand-less
+    // mnemonics: `RTS` and `NOP` are written indented, so they still parse
+    // as instructions and an indented typo is still reported as an unknown
+    // mnemonic rather than silently becoming a label.
+    if starts_in_column_1 && parts.len() == 1 && is_valid_ident(line) {
+        return (Some(line.to_string()), String::new(), String::new(), vec![]);
     }
 
     parse_rest(line)
@@ -342,12 +434,45 @@ pub fn is_valid_ident(s: &str) -> bool {
     if s.is_empty() {
         return false;
     }
-    let mut chars = s.chars();
+    // A leading '.' marks a *local* label (`.loop`), the convention used by
+    // vasm, Devpac, PhxAss and ASM-One: the name is scoped to the preceding
+    // global label, so the same `.loop` may appear once per subroutine.
+    // Such a name must still have something after the dot.
+    let body = match s.strip_prefix('.') {
+        Some(rest) => {
+            if rest.is_empty() {
+                return false;
+            }
+            rest
+        }
+        None => s,
+    };
+    let mut chars = body.chars();
     let first = chars.next().unwrap();
     if !first.is_alphabetic() && first != '_' {
         return false;
     }
     chars.all(|c| c.is_alphanumeric() || c == '_' || c == '.' || c == '$')
+}
+
+/// Whether `name` is a local label (`.loop`) rather than a global one.
+///
+/// Callers scope these against the most recent global label; see
+/// `Assembler`'s label handling.
+pub fn is_local_label(name: &str) -> bool {
+    name.len() > 1 && name.starts_with('.')
+}
+
+/// The 68040 cache instructions take a cache-scope name as their first
+/// operand, one of which (`DC`) is spelled exactly like the define-constant
+/// directive. Without this exclusion, `CPUSHA DC` parses as "label CPUSHA,
+/// directive DC" and fails with "DC requires size and values" — the
+/// label-without-colon heuristic below can't tell the two apart on its own.
+fn takes_cache_scope_operand(word: &str) -> bool {
+    matches!(
+        word.to_lowercase().as_str(),
+        "cinva" | "cpusha" | "cinvl" | "cinvp" | "cpushl" | "cpushp"
+    )
 }
 
 fn is_directive(s: &str) -> bool {
