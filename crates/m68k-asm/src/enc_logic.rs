@@ -176,6 +176,35 @@ pub fn enc_shift_reg(
     ])
 }
 
+/// Encode the register-count shift/rotate form `<shift>.<size> Dn,Dm`,
+/// where the shift amount comes from a data register at runtime rather
+/// than an immediate. Distinguished from the immediate form by bit 5
+/// (i/r); the count register occupies bits 11-9, exactly where the
+/// immediate count sits in [`enc_shift_reg`]. Verified against
+/// reference encodings: `asr.w d1,d0` -> 0xE260.
+pub fn enc_shift_reg_count(
+    mnemonic: &str,
+    count_reg: u8,
+    dst_reg: u8,
+    size: &str,
+) -> Result<Vec<u16>, AsmError> {
+    let sz = size_code(size)?;
+    let base = match mnemonic {
+        "asl" => 0xE120,
+        "asr" => 0xE020,
+        "lsl" => 0xE128,
+        "lsr" => 0xE028,
+        "rol" => 0xE138,
+        "ror" => 0xE038,
+        "roxl" => 0xE130,
+        "roxr" => 0xE030,
+        _ => return Err(AsmError::new("unknown shift mnemonic")),
+    };
+    Ok(vec![
+        base | ((sz as u16) << 6) | ((count_reg as u16) << 9) | (dst_reg as u16),
+    ])
+}
+
 /// Encode ASL/ASR/LSL/LSR (memory) instruction.
 pub fn enc_shift_mem(
     mnemonic: &str,

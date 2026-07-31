@@ -258,6 +258,68 @@ fn parse_operands(
             operands.push(DecodedOperand::from_ea(dst));
             Ok((format!("{}.{}", name, size), operands, target_addr))
         }
+        ParserType::Lpstop => {
+            // LPSTOP #sr (68060): opword 0xF800, then a fixed 0x01C0
+            // extension word, then the 16-bit status-register value.
+            let ext = stream.read_word()?;
+            if ext != 0x01C0 {
+                return Err("invalid LPSTOP extension word".into());
+            }
+            let sr = stream.read_word()?;
+            operands.push(DecodedOperand::special(format!("#${:x}", sr)));
+            Ok((name, operands, target_addr))
+        }
+        ParserType::Extb => {
+            // EXTB.L Dn (68020+): sign-extend byte to long, always .l.
+            operands.push(DecodedOperand::from_ea(EAOperand::DataReg(
+                (op & 0x7) as u8,
+            )));
+            Ok(("extb.l".into(), operands, target_addr))
+        }
+        ParserType::PackUnpk => {
+            // PACK/UNPK (68020+) Dy,Dx,#adj or -(Ay),-(Ax),#adj: bit 3
+            // selects the predecrement form, Rx is bits 11-9 and Ry bits
+            // 2-0, and a 16-bit adjustment word follows the opword.
+            let is_memory = (op >> 3) & 1 != 0;
+            let rx = ((op >> 9) & 0x7) as u8;
+            let ry = (op & 0x7) as u8;
+            let adjustment = stream.read_word()?;
+            let (src, dst) = if is_memory {
+                (EAOperand::PreDec(ry), EAOperand::PreDec(rx))
+            } else {
+                (EAOperand::DataReg(ry), EAOperand::DataReg(rx))
+            };
+            operands.push(DecodedOperand::from_ea(src));
+            operands.push(DecodedOperand::from_ea(dst));
+            operands.push(DecodedOperand::special(format!("#${:x}", adjustment)));
+            Ok((name, operands, target_addr))
+        }
+        ParserType::AddxSubx => {
+            // ADDX/SUBX have their own operand layout, unlike the generic
+            // register-to-EA shape: Rx (bits 11-9) is the *destination*,
+            // Ry (bits 2-0) the source, and bit 3 (rm) selects the
+            // predecrement-memory form `-(Ay),-(Ax)` over the plain
+            // `Dy,Dx` register form. Decoding these with the RegEa parser
+            // both swapped the operands and rendered the memory form as
+            // two registers. verified against reference encodings:
+            // `addx.w d0,d1` -> 0xD341, `addx.w -(a0),-(a1)` -> 0xD348.
+            let size_code = ((op >> 6) & 0x3) as u8;
+            if size_code >= 3 {
+                return Err("invalid size code".into());
+            }
+            let size = ["b", "w", "l"][size_code as usize];
+            let rx = ((op >> 9) & 0x7) as u8;
+            let ry = (op & 0x7) as u8;
+            let is_memory = (op >> 3) & 1 != 0;
+            let (src, dst) = if is_memory {
+                (EAOperand::PreDec(ry), EAOperand::PreDec(rx))
+            } else {
+                (EAOperand::DataReg(ry), EAOperand::DataReg(rx))
+            };
+            operands.push(DecodedOperand::from_ea(src));
+            operands.push(DecodedOperand::from_ea(dst));
+            Ok((format!("{}.{}", name, size), operands, target_addr))
+        }
         ParserType::RegEa => {
             let size_code = ((op >> 6) & 0x3) as u8;
             if size_code >= 3 {
@@ -274,6 +336,9 @@ fn parse_operands(
             Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Adda => {
+            // The size bit must reach the rendered mnemonic: ADDA.W and
+            // ADDA.L differ only in opword bit 8, so emitting a bare
+            // "adda" made both print identically and reassemble as .w.
             let size_code = ((op >> 8) & 0x1) as u8;
             let size = if size_code == 0 { "w" } else { "l" };
             let src_mode = ((op >> 3) & 0x7) as u8;
@@ -283,7 +348,7 @@ fn parse_operands(
             let dst = EAOperand::AddrReg(dst_reg);
             operands.push(DecodedOperand::from_ea(src));
             operands.push(DecodedOperand::from_ea(dst));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::ImmEa => {
             let size_code = ((op >> 6) & 0x3) as u8;
@@ -335,21 +400,27 @@ fn parse_operands(
                 &format!("b{}", CONDITION_CODES[cc])
             };
             let disp = (op & 0xFF) as i8;
-            let target = if disp == 0 {
+            // The displacement form has to be carried into the mnemonic as
+            // a size suffix. Without it the assembler can't tell which of
+            // the three encodings to rebuild, and since an unsuffixed
+            // branch now assembles to the word form (matching Motorola
+            // assemblers without optimization), a short branch would come
+            // back two bytes longer than it went in.
+            let (target, suffix) = if disp == 0 {
                 let ext_pc = stream.current_pc();
                 let d16 = sign_extend_16(stream.read_word()?);
-                (ext_pc as i32).wrapping_add(d16) as u32
+                ((ext_pc as i32).wrapping_add(d16) as u32, "w")
             } else if disp == -1 {
                 let ext_pc = stream.current_pc();
                 let d32 = stream.read_long()? as i32;
-                (ext_pc as i32).wrapping_add(d32) as u32
+                ((ext_pc as i32).wrapping_add(d32) as u32, "l")
             } else {
                 let ext_pc = stream.current_pc();
-                (ext_pc as i32).wrapping_add(disp as i32) as u32
+                ((ext_pc as i32).wrapping_add(disp as i32) as u32, "s")
             };
             target_addr = Some(target);
             operands.push(DecodedOperand::from_ea(EAOperand::AbsoluteLong(target)));
-            Ok((cc_name.into(), operands, target_addr))
+            Ok((format!("{}.{}", cc_name, suffix), operands, target_addr))
         }
         ParserType::Dbcc => {
             let cc = ((op >> 8) & 0xF) as usize;
@@ -538,16 +609,22 @@ fn parse_operands(
             Ok((name, operands, target_addr))
         }
         ParserType::AbcdSbcd => {
-            let mode = ((op >> 3) & 0x1) as u8;
-            let regx = ((op >> 9) & 0x7) as u8;
-            let regy = (op & 0x7) as u8;
-            if mode == 0 {
-                operands.push(DecodedOperand::from_ea(EAOperand::DataReg(regx)));
-                operands.push(DecodedOperand::from_ea(EAOperand::DataReg(regy)));
+            // Ry (bits 2-0) is the source and Rx (bits 11-9) the
+            // destination, so they must be emitted in that order — the
+            // previous code printed Rx first, reversing every ABCD/SBCD.
+            // The memory form (bit 3 set) is *predecrement*, not
+            // postincrement. verified against reference encodings:
+            // `abcd -(a0),-(a1)` -> 0xC308, `abcd d0,d1` -> 0xC300.
+            let is_memory = (op >> 3) & 1 != 0;
+            let rx = ((op >> 9) & 0x7) as u8;
+            let ry = (op & 0x7) as u8;
+            let (src, dst) = if is_memory {
+                (EAOperand::PreDec(ry), EAOperand::PreDec(rx))
             } else {
-                operands.push(DecodedOperand::from_ea(EAOperand::PostInc(regx)));
-                operands.push(DecodedOperand::from_ea(EAOperand::PostInc(regy)));
-            }
+                (EAOperand::DataReg(ry), EAOperand::DataReg(rx))
+            };
+            operands.push(DecodedOperand::from_ea(src));
+            operands.push(DecodedOperand::from_ea(dst));
             Ok((name, operands, target_addr))
         }
         ParserType::MoveToCcr => {
@@ -703,9 +780,13 @@ fn parse_operands(
             Ok((name, operands, target_addr))
         }
         ParserType::MoveUsp => {
-            let dir = ((op >> 3) & 0x1) as u8;
+            // Bit 3 clear (0x4E60) is An -> USP, set (0x4E68) is USP -> An;
+            // the two were rendered the wrong way round, so a roundtrip
+            // turned `move a0,usp` into `move usp,a0` and back into the
+            // opposite opcode. verified against reference encodings.
+            let usp_to_reg = (op >> 3) & 1 != 0;
             let reg = (op & 0x7) as u8;
-            if dir == 0 {
+            if usp_to_reg {
                 operands.push(DecodedOperand::special("usp"));
                 operands.push(DecodedOperand::from_ea(EAOperand::AddrReg(reg)));
             } else {
@@ -715,6 +796,8 @@ fn parse_operands(
             Ok((name, operands, target_addr))
         }
         ParserType::Cmpa => {
+            // Same size-suffix requirement as Adda above: CMPA.W and
+            // CMPA.L are distinguished only by opword bit 8.
             let size_code = ((op >> 8) & 0x1) as u8;
             let size = if size_code == 0 { "w" } else { "l" };
             let src_mode = ((op >> 3) & 0x7) as u8;
@@ -724,7 +807,7 @@ fn parse_operands(
             let dst = EAOperand::AddrReg(dst_reg);
             operands.push(DecodedOperand::from_ea(src));
             operands.push(DecodedOperand::from_ea(dst));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Cmpi => {
             let size_code = ((op >> 6) & 0x3) as u8;
@@ -838,6 +921,211 @@ fn parse_operands(
             )));
             Ok((name, operands, target_addr))
         }
+        ParserType::MulLong => {
+            // MULU.L/MULS.L (68020+): ext word bit 11 = signed,
+            // bit 10 = 64-bit (Dh:Dl) form, bits 14-12 = Dq, bits 2-0 = Dr.
+            let ext = stream.read_word()?;
+            let dq = (ext >> 12) & 0x7;
+            let signed = (ext >> 11) & 1 != 0;
+            let is_64 = (ext >> 10) & 1 != 0;
+            let dr = ext & 0x7;
+            let mode = ((op >> 3) & 0x7) as u8;
+            let reg = (op & 0x7) as u8;
+            let ea = decode_ea(mode, reg, "l", stream, inst_pc, cpu)?;
+            operands.push(DecodedOperand::from_ea(ea));
+            operands.push(DecodedOperand::special(if is_64 {
+                format!("d{}:d{}", dr, dq)
+            } else {
+                format!("d{}", dq)
+            }));
+            Ok((
+                if signed { "muls.l" } else { "mulu.l" }.into(),
+                operands,
+                target_addr,
+            ))
+        }
+        ParserType::DivLong => {
+            // DIVU.L/DIVS.L/DIVUL.L/DIVSL.L (68020+). Same extension-word
+            // layout as MUL.L, but DIVxL (the 32-bit-dividend form with a
+            // separate remainder register) has no flag of its own: it is
+            // the case where the 64-bit bit is clear yet Dr != Dq. With
+            // both bits clear and Dr == Dq it's a plain DIVx.L.
+            let ext = stream.read_word()?;
+            let dq = (ext >> 12) & 0x7;
+            let signed = (ext >> 11) & 1 != 0;
+            let is_64 = (ext >> 10) & 1 != 0;
+            let dr = ext & 0x7;
+            let mode = ((op >> 3) & 0x7) as u8;
+            let reg = (op & 0x7) as u8;
+            let ea = decode_ea(mode, reg, "l", stream, inst_pc, cpu)?;
+            operands.push(DecodedOperand::from_ea(ea));
+            let mnemonic = if is_64 {
+                operands.push(DecodedOperand::special(format!("d{}:d{}", dr, dq)));
+                if signed { "divs.l" } else { "divu.l" }
+            } else if dr != dq {
+                operands.push(DecodedOperand::special(format!("d{}:d{}", dr, dq)));
+                if signed { "divsl.l" } else { "divul.l" }
+            } else {
+                operands.push(DecodedOperand::special(format!("d{}", dq)));
+                if signed { "divs.l" } else { "divu.l" }
+            };
+            Ok((mnemonic.into(), operands, target_addr))
+        }
+        ParserType::Moves => {
+            // MOVES (68010+): size in opword bits 7-6 (0/1/2 = b/w/l),
+            // ext word bit 15 selects An vs Dn, bits 14-12 the register
+            // number, bit 11 the direction (1 = register -> memory).
+            let size = match (op >> 6) & 0x3 {
+                0 => "b",
+                1 => "w",
+                2 => "l",
+                _ => return Err("invalid size for MOVES".into()),
+            };
+            let ext = stream.read_word()?;
+            let is_addr = (ext >> 15) & 1 != 0;
+            let regnum = (ext >> 12) & 0x7;
+            let to_memory = (ext >> 11) & 1 != 0;
+            let mode = ((op >> 3) & 0x7) as u8;
+            let reg = (op & 0x7) as u8;
+            let ea = decode_ea(mode, reg, size, stream, inst_pc, cpu)?;
+            let reg_text = if is_addr {
+                format!("a{}", regnum)
+            } else {
+                format!("d{}", regnum)
+            };
+            if to_memory {
+                operands.push(DecodedOperand::special(reg_text));
+                operands.push(DecodedOperand::from_ea(ea));
+            } else {
+                operands.push(DecodedOperand::from_ea(ea));
+                operands.push(DecodedOperand::special(reg_text));
+            }
+            Ok((format!("moves.{}", size), operands, target_addr))
+        }
+        ParserType::Cas => {
+            // CAS (68020+): bases 0x0AC0/0x0CC0/0x0EC0 encode b/w/l as
+            // bits 10-9 = 1/2/3 (not 0/1/3 like most size fields — 0
+            // there is BSET's immediate form, not a CAS size).
+            let size = match (op >> 9) & 0x3 {
+                1 => "b",
+                2 => "w",
+                3 => "l",
+                _ => return Err("invalid size for CAS".into()),
+            };
+            let ext = stream.read_word()?;
+            let du = (ext >> 6) & 0x7;
+            let dc = ext & 0x7;
+            let mode = ((op >> 3) & 0x7) as u8;
+            let reg = (op & 0x7) as u8;
+            let ea = decode_ea(mode, reg, size, stream, inst_pc, cpu)?;
+            operands.push(DecodedOperand::special(format!("d{}", dc)));
+            operands.push(DecodedOperand::special(format!("d{}", du)));
+            operands.push(DecodedOperand::from_ea(ea));
+            Ok((format!("cas.{}", size), operands, target_addr))
+        }
+        ParserType::Chk2Cmp2 => {
+            // CHK2/CMP2 (68020+): size in opword bits 10-9, ext word
+            // bit 15 = An vs Dn, bits 14-12 = register, bit 11 selects
+            // CHK2 (1) over CMP2 (0).
+            let size = match (op >> 9) & 0x3 {
+                0 => "b",
+                1 => "w",
+                2 => "l",
+                _ => return Err("invalid size for CHK2/CMP2".into()),
+            };
+            let ext = stream.read_word()?;
+            let is_addr = (ext >> 15) & 1 != 0;
+            let regnum = (ext >> 12) & 0x7;
+            let is_chk2 = (ext >> 11) & 1 != 0;
+            let mode = ((op >> 3) & 0x7) as u8;
+            let reg = (op & 0x7) as u8;
+            let ea = decode_ea(mode, reg, size, stream, inst_pc, cpu)?;
+            operands.push(DecodedOperand::from_ea(ea));
+            operands.push(DecodedOperand::special(if is_addr {
+                format!("a{}", regnum)
+            } else {
+                format!("d{}", regnum)
+            }));
+            Ok((
+                format!("{}.{}", if is_chk2 { "chk2" } else { "cmp2" }, size),
+                operands,
+                target_addr,
+            ))
+        }
+        ParserType::Trapcc => {
+            // TRAPcc (68020+): 0x50F8 | (cc << 8), opword bits 2-0 select
+            // the operand form (2 = word immediate, 3 = long, 4 = none).
+            let cc = ((op >> 8) & 0xF) as usize;
+            let cc_name = if cc == 1 {
+                "trapf".to_string()
+            } else {
+                format!("trap{}", CONDITION_CODES[cc])
+            };
+            match op & 0x7 {
+                2 => {
+                    let imm = stream.read_word()?;
+                    operands.push(DecodedOperand::special(format!("#${:x}", imm)));
+                    Ok((format!("{}.w", cc_name), operands, target_addr))
+                }
+                3 => {
+                    let imm = stream.read_long()?;
+                    operands.push(DecodedOperand::special(format!("#${:x}", imm)));
+                    Ok((format!("{}.l", cc_name), operands, target_addr))
+                }
+                4 => Ok((cc_name, operands, target_addr)),
+                _ => Err("invalid TRAPcc operand mode".into()),
+            }
+        }
+        ParserType::Rtm => {
+            // RTM (68020): 0x06C0 | reg, bit 3 selects An over Dn.
+            let is_addr = (op >> 3) & 1 != 0;
+            let regnum = op & 0x7;
+            operands.push(DecodedOperand::special(if is_addr {
+                format!("a{}", regnum)
+            } else {
+                format!("d{}", regnum)
+            }));
+            Ok((name, operands, target_addr))
+        }
+        ParserType::Callm => {
+            // CALLM (68020): 0x06C0 | ea, followed by a word holding the
+            // argument count in bits 15-8 (matching the encoder's
+            // `arg_val << 8`), not the low byte.
+            let ext = stream.read_word()?;
+            let mode = ((op >> 3) & 0x7) as u8;
+            let reg = (op & 0x7) as u8;
+            let ea = decode_ea(mode, reg, "b", stream, inst_pc, cpu)?;
+            operands.push(DecodedOperand::special(format!(
+                "#${:x}",
+                (ext >> 8) & 0xFF
+            )));
+            operands.push(DecodedOperand::from_ea(ea));
+            Ok((name, operands, target_addr))
+        }
+        ParserType::Move16 => {
+            // MOVE16 (68040+), postincrement-pair form: 0xF620 | Ax,
+            // followed by a word whose bits 14-12 hold Ay.
+            let ax = op & 0x7;
+            let ext = stream.read_word()?;
+            let ay = (ext >> 12) & 0x7;
+            operands.push(DecodedOperand::from_ea(EAOperand::PostInc(ax as u8)));
+            operands.push(DecodedOperand::from_ea(EAOperand::PostInc(ay as u8)));
+            Ok((name, operands, target_addr))
+        }
+        ParserType::PSaveRestore => {
+            // PSAVE (0xF100) / PRESTORE (0xF140), 68030+ MMU state.
+            // Bit 6 distinguishes the two.
+            let is_restore = (op >> 6) & 1 != 0;
+            let mode = ((op >> 3) & 0x7) as u8;
+            let reg = (op & 0x7) as u8;
+            let ea = decode_ea(mode, reg, "b", stream, inst_pc, cpu)?;
+            operands.push(DecodedOperand::from_ea(ea));
+            Ok((
+                if is_restore { "prestore" } else { "psave" }.into(),
+                operands,
+                target_addr,
+            ))
+        }
         ParserType::MovecFromCr => {
             let ext = stream.read_word()?;
             let cr = ext & 0xFFF;
@@ -890,7 +1178,7 @@ fn parse_operands(
         ParserType::Bitfield => {
             // The bitfield extension word precedes any EA extension words
             // (e.g. an absolute address or displacement) — verified against
-            // real `vasm -m68020` output, and matches how the assembler's
+            // reference output, and matches how the assembler's
             // encoder orders them (opword, ext, then EA extension words).
             let ext = stream.read_word()?;
             let ea_mode = ((op >> 3) & 0x7) as u8;
@@ -966,7 +1254,7 @@ fn parse_operands(
             match group_prefix {
                 0b001 => {
                     // PFLUSHA (mode 001, no EA/FC/mask) or PFLUSH FC,MASK,<ea>
-                    // (mode 110). Verified against real `vasm -m68030`
+                    // (mode 110). verified against reference encodings
                     // output for `pflusha` (F000 2400) and
                     // `pflush #2,#3,(a0)` (F010 3872).
                     let mode = (ext >> 10) & 0x7;
@@ -986,7 +1274,7 @@ fn parse_operands(
                 }
                 0b100 => {
                     // PTESTR/PTESTW FC,<ea>,#level[,An]. Verified against
-                    // real `vasm -m68030` output for `ptestr #2,(a0),#3`
+                    // reference output for `ptestr #2,(a0),#3`
                     // (F010 8E12), `ptestw #2,(a0),#3` (F010 8C12), and
                     // `ptestr #2,(a0),#3,a1` (F010 8F32).
                     let level = (ext >> 10) & 0x7;
@@ -1010,7 +1298,7 @@ fn parse_operands(
                 }
                 0b000 | 0b010 | 0b011 => {
                     // PMOVE <ea>,MRn / PMOVE MRn,<ea>. Verified against
-                    // real `vasm -m68030` output for `pmove tc,(a0)`
+                    // reference output for `pmove tc,(a0)`
                     // (F010 4200) and `pmove (a0),tc` (F010 4000).
                     let mmu_field = (ext >> 10) & 0x3F;
                     let reg_name = match (group_prefix, (mmu_field & 0x7)) {
@@ -1058,7 +1346,19 @@ fn parse_operands(
                 _ => return Err("unknown cache operation unit field".into()),
             };
 
-            operands.push(DecodedOperand::special(format!("#{}", scope)));
+            // Render the cache scope by name (nc/dc/ic/bc) rather than as
+            // a bare `#N`, matching how the Motorola manuals
+            // write these — and reassembling the output now yields the
+            // same bytes either way, since the assembler accepts both.
+            operands.push(DecodedOperand::special(
+                match scope {
+                    0 => "nc",
+                    1 => "dc",
+                    2 => "ic",
+                    _ => "bc",
+                }
+                .to_string(),
+            ));
             if unit != 0b11 {
                 operands.push(DecodedOperand::from_ea(EAOperand::AddrIndirect(reg)));
             }
@@ -1078,7 +1378,7 @@ fn parse_operands(
             let reg = (op & 0x7) as u8;
             let cc = stream.read_word()? & 0x3F;
             // Displacement is relative to the PC after the condition word (opword + cc
-            // word), not after the opword alone - verified against real vasm output for
+            // word), not after the opword alone - verified against reference output for
             // `fdbeq d0,$1010` at pc=$1000: pc_after_ext=$1004, disp=$0c, target=$1010.
             let ext_pc = stream.current_pc();
             let disp = sign_extend_16(stream.read_word()?);
@@ -1386,7 +1686,7 @@ fn decode_fpu_cpgen(
                 // FMOVE.P FPn,<ea>{k-factor}: the store direction of packed-decimal
                 // FMOVE reuses bits 6-0 for a k-factor instead of an arithmetic
                 // opclass/opmode (see `enc_fpu.rs::KFactor` for the encoding
-                // derivation, verified against real vasm output) — fmt=3 (0b011) is
+                // derivation, verified against reference output) — fmt=3 (0b011) is
                 // a static k-factor (bits 6-0 = full 7-bit two's complement value),
                 // fmt=7 (0b111) is dynamic (bits 6-4 = Dn, bits 3-0 = 0). Without this
                 // branch, `cmd` (bits 6-0) gets fed to `fpu_arith_name` below, which
@@ -1431,7 +1731,7 @@ fn decode_fpu_cpgen(
             let suffix = fpu_fmt_suffix(fmt);
             let ea = decode_ea(ea_mode, ea_reg, suffix, stream, inst_pc, cpu)?;
             // Only append the size suffix when it isn't the assembler's default (word,
-            // verified against real vasm output for unsuffixed <ea>,FPn arithmetic/FMOVE),
+            // verified against reference output for unsuffixed <ea>,FPn arithmetic/FMOVE),
             // so a plain round-trip doesn't spuriously widen to e.g. `fadd.w`.
             let mnemonic = if suffix == "w" {
                 base_mnemonic.to_string()
@@ -1652,7 +1952,7 @@ mod tests {
         }
     }
 
-    // FPU decoder tests. Reference bytes verified against real `vasm -m68040` output
+    // FPU decoder tests. Reference bytes verified against reference output
     // (see crates/m68k-asm/src/enc_fpu.rs for the matching encoder-side verification).
     fn decode_one(bytes: &[u8], cpu: &str) -> DecodedInstruction {
         let mut stream = InstructionStream::new(bytes, 0x1000);
@@ -1664,21 +1964,21 @@ mod tests {
 
     #[test]
     fn test_decode_fadd_dn_default_word() {
-        // vasm: fadd d0,fp2 -> f2005122 (no suffix -> word specifier, not extended)
+        // Reference encoding: fadd d0,fp2 -> f2005122 (no suffix -> word specifier, not extended)
         let inst = decode_one(&[0xF2, 0x00, 0x51, 0x22], "68040");
         assert_eq!(inst.mnemonic, "fadd");
     }
 
     #[test]
     fn test_decode_fadd_dn_long_suffix_shown() {
-        // vasm: fadd.l d0,fp2 -> f2004122
+        // Reference encoding: fadd.l d0,fp2 -> f2004122
         let inst = decode_one(&[0xF2, 0x00, 0x41, 0x22], "68040");
         assert_eq!(inst.mnemonic, "fadd.l");
     }
 
     #[test]
     fn test_decode_fadd_reg_reg() {
-        // vasm: fadd fp1,fp2 -> f2000522
+        // Reference encoding: fadd fp1,fp2 -> f2000522
         let inst = decode_one(&[0xF2, 0x00, 0x05, 0x22], "68040");
         assert_eq!(inst.mnemonic, "fadd");
         let labels = HashMap::new();
@@ -1688,7 +1988,7 @@ mod tests {
 
     #[test]
     fn test_decode_fmove_ctrl_reg_direction() {
-        // vasm: fmove fpiar,d0 -> f200a400 (ctrl -> EA) vs fmove d0,fpiar -> f2008400 (EA -> ctrl)
+        // Reference encoding: fmove fpiar,d0 -> f200a400 (ctrl -> EA) vs fmove d0,fpiar -> f2008400 (EA -> ctrl)
         let labels = HashMap::new();
         let to_dn = decode_one(&[0xF2, 0x00, 0xA4, 0x00], "68040");
         assert_eq!(to_dn.operands[0].format(&labels), "fpiar");
@@ -1701,7 +2001,7 @@ mod tests {
 
     #[test]
     fn test_decode_fmovem_predec_mask_not_reversed() {
-        // vasm: fmovem fp0/fp1,-(a7) -> f227e003
+        // Reference encoding: fmovem fp0/fp1,-(a7) -> f227e003
         let inst = decode_one(&[0xF2, 0x27, 0xE0, 0x03], "68040");
         assert_eq!(inst.mnemonic, "fmovem");
         let labels = HashMap::new();
@@ -1710,7 +2010,7 @@ mod tests {
 
     #[test]
     fn test_decode_fmovem_nonpredec_mask_reversed() {
-        // vasm: fmovem fp0/fp1,(a0) -> f210f0c0 (postincrement/control: mask stored reversed)
+        // Reference encoding: fmovem fp0/fp1,(a0) -> f210f0c0 (postincrement/control: mask stored reversed)
         let inst = decode_one(&[0xF2, 0x10, 0xF0, 0xC0], "68040");
         assert_eq!(inst.mnemonic, "fmovem");
         let labels = HashMap::new();
@@ -1719,7 +2019,7 @@ mod tests {
 
     #[test]
     fn test_decode_fmovem_mem_to_regs_mask_reversed() {
-        // vasm: fmovem (a0)+,fp0/fp1 -> f218d0c0
+        // Reference encoding: fmovem (a0)+,fp0/fp1 -> f218d0c0
         let inst = decode_one(&[0xF2, 0x18, 0xD0, 0xC0], "68040");
         assert_eq!(inst.mnemonic, "fmovem");
         let labels = HashMap::new();
@@ -1728,14 +2028,14 @@ mod tests {
 
     #[test]
     fn test_decode_fmovecr() {
-        // vasm: fmovecr #0,fp0 -> f2005c00
+        // Reference encoding: fmovecr #0,fp0 -> f2005c00
         let inst = decode_one(&[0xF2, 0x00, 0x5C, 0x00], "68040");
         assert_eq!(inst.mnemonic, "fmovecr");
     }
 
     #[test]
     fn test_decode_fsincos_reg_reg() {
-        // vasm: fsincos fp1,fp2:fp3 -> f20005b2
+        // Reference encoding: fsincos fp1,fp2:fp3 -> f20005b2
         let inst = decode_one(&[0xF2, 0x00, 0x05, 0xB2], "68040");
         assert_eq!(inst.mnemonic, "fsincos");
         let labels = HashMap::new();
@@ -1745,7 +2045,7 @@ mod tests {
 
     #[test]
     fn test_decode_fbeq_word() {
-        // vasm: fbeq $1010 (at pc=$1000) -> f281000e
+        // Reference encoding: fbeq $1010 (at pc=$1000) -> f281000e
         let inst = decode_one(&[0xF2, 0x81, 0x00, 0x0E], "68040");
         assert_eq!(inst.mnemonic, "fbeq");
         assert_eq!(inst.target_address, Some(0x1010));
@@ -1753,21 +2053,21 @@ mod tests {
 
     #[test]
     fn test_decode_fbeq_long() {
-        // vasm: fbeq.l $1010 (at pc=$1000) -> f2c10000000e
+        // Reference encoding: fbeq.l $1010 (at pc=$1000) -> f2c10000000e
         let inst = decode_one(&[0xF2, 0xC1, 0x00, 0x00, 0x00, 0x0E], "68040");
         assert_eq!(inst.mnemonic, "fbeq");
         assert_eq!(inst.target_address, Some(0x1010));
     }
 
     /// Reference bytes for FMOVE.P k-factor decoding, verified against
-    /// real `vasm -m68881` output. Previously `FMOVE.P FPn,<ea>{...}`
+    /// reference output. Previously `FMOVE.P FPn,<ea>{...}`
     /// with any nonzero k-factor decoded as "unknown FPU arithmetic
     /// opclass/opmode" — bits 6-0 hold a k-factor rather than an
     /// arithmetic opclass for this store-direction packed-decimal form,
     /// which the generic `fpu_arith_name` lookup didn't know about.
     #[test]
-    fn test_decode_fmove_p_static_kfactor_matches_vasm() {
-        // vasm: fmove.p fp0,(a0){#5} -> f2106c05
+    fn test_decode_fmove_p_static_kfactor_matches_reference() {
+        // Reference encoding: fmove.p fp0,(a0){#5} -> f2106c05
         let inst = decode_one(&[0xF2, 0x10, 0x6C, 0x05], "68020");
         assert_eq!(inst.mnemonic, "fmove.p");
         let labels = HashMap::new();
@@ -1776,16 +2076,16 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_fmove_p_static_negative_kfactor_matches_vasm() {
-        // vasm: fmove.p fp0,(a0){#-5} -> f2106c7b
+    fn test_decode_fmove_p_static_negative_kfactor_matches_reference() {
+        // Reference encoding: fmove.p fp0,(a0){#-5} -> f2106c7b
         let inst = decode_one(&[0xF2, 0x10, 0x6C, 0x7B], "68020");
         let labels = HashMap::new();
         assert_eq!(inst.operands[1].format(&labels), "(a0){#-5}");
     }
 
     #[test]
-    fn test_decode_fmove_p_static_kfactor_extremes_match_vasm() {
-        // vasm: {#63} -> f2106c3f ; {#-64} -> f2106c40
+    fn test_decode_fmove_p_static_kfactor_extremes_match_reference() {
+        // Reference encoding: {#63} -> f2106c3f ; {#-64} -> f2106c40
         let labels = HashMap::new();
         let inst = decode_one(&[0xF2, 0x10, 0x6C, 0x3F], "68020");
         assert_eq!(inst.operands[1].format(&labels), "(a0){#63}");
@@ -1794,8 +2094,8 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_fmove_p_dynamic_kfactor_matches_vasm() {
-        // vasm: fmove.p fp0,(a0){d3} -> f2107c30
+    fn test_decode_fmove_p_dynamic_kfactor_matches_reference() {
+        // Reference encoding: fmove.p fp0,(a0){d3} -> f2107c30
         let inst = decode_one(&[0xF2, 0x10, 0x7C, 0x30], "68020");
         assert_eq!(inst.mnemonic, "fmove.p");
         let labels = HashMap::new();
@@ -1830,7 +2130,7 @@ mod tests {
 
     #[test]
     fn test_decode_fdbeq() {
-        // vasm: fdbeq d0,$1010 (at pc=$1000) -> f2480001000c
+        // Reference encoding: fdbeq d0,$1010 (at pc=$1000) -> f2480001000c
         let inst = decode_one(&[0xF2, 0x48, 0x00, 0x01, 0x00, 0x0C], "68040");
         assert_eq!(inst.mnemonic, "fdbeq");
         assert_eq!(inst.target_address, Some(0x1010));
@@ -1838,14 +2138,14 @@ mod tests {
 
     #[test]
     fn test_decode_fseq() {
-        // vasm: fseq d0 -> f2400001
+        // Reference encoding: fseq d0 -> f2400001
         let inst = decode_one(&[0xF2, 0x40, 0x00, 0x01], "68040");
         assert_eq!(inst.mnemonic, "fseq");
     }
 
     #[test]
     fn test_decode_ftrapeq_no_operand() {
-        // vasm: ftrapeq -> f27c0001
+        // Reference encoding: ftrapeq -> f27c0001
         let inst = decode_one(&[0xF2, 0x7C, 0x00, 0x01], "68040");
         assert_eq!(inst.mnemonic, "ftrapeq");
         assert!(inst.operands.is_empty());
@@ -1853,35 +2153,35 @@ mod tests {
 
     #[test]
     fn test_decode_ftrapeq_word() {
-        // vasm: ftrapeq.w #1234 -> f27a000104d2
+        // Reference encoding: ftrapeq.w #1234 -> f27a000104d2
         let inst = decode_one(&[0xF2, 0x7A, 0x00, 0x01, 0x04, 0xD2], "68040");
         assert_eq!(inst.mnemonic, "ftrapeq.w");
     }
 
     #[test]
     fn test_decode_ftrapeq_long() {
-        // vasm: ftrapeq.l #12345678 -> f27b000100bc614e
+        // Reference encoding: ftrapeq.l #12345678 -> f27b000100bc614e
         let inst = decode_one(&[0xF2, 0x7B, 0x00, 0x01, 0x00, 0xBC, 0x61, 0x4E], "68040");
         assert_eq!(inst.mnemonic, "ftrapeq.l");
     }
 
     #[test]
     fn test_decode_fnop() {
-        // vasm: fnop -> f2800000 (encoded as fbf with zero displacement)
+        // Reference encoding: fnop -> f2800000 (encoded as fbf with zero displacement)
         let inst = decode_one(&[0xF2, 0x80, 0x00, 0x00], "68040");
         assert_eq!(inst.mnemonic, "fbf");
     }
 
     #[test]
     fn test_decode_fsave() {
-        // vasm: fsave -(a0) -> f320
+        // Reference encoding: fsave -(a0) -> f320
         let inst = decode_one(&[0xF3, 0x20], "68040");
         assert_eq!(inst.mnemonic, "fsave");
     }
 
     #[test]
     fn test_decode_frestore() {
-        // vasm: frestore (a0)+ -> f358
+        // Reference encoding: frestore (a0)+ -> f358
         let inst = decode_one(&[0xF3, 0x58], "68040");
         assert_eq!(inst.mnemonic, "frestore");
     }
@@ -1895,14 +2195,14 @@ mod tests {
         assert!(matches!(result, DecodeResult::DataWord(_)));
     }
 
-    // MOVEP/BKPT decoder tests. Reference bytes verified against real `vasm -m68020`
+    // MOVEP/BKPT decoder tests. Reference bytes verified against reference encodings
     // output. Regression tests for a pattern-ordering/masking bug: MOVEP's original
     // mask only matched the mem->reg/.w opmode and was itself shadowed by BTST's
     // wider mask; BKPT was shadowed by PEA.
 
     #[test]
     fn test_decode_movep_all_opmodes() {
-        // vasm: movep.w 4(a0),d0 / movep.l 4(a0),d0 / movep.w d0,4(a0) / movep.l d0,4(a0)
+        // Reference encoding: movep.w 4(a0),d0 / movep.l 4(a0),d0 / movep.w d0,4(a0) / movep.l d0,4(a0)
         // -> 0108 0004 / 0148 0004 / 0188 0004 / 01c8 0004
         let cases: [(u16, &str); 4] = [
             (0x0108, "movep.w"),
@@ -1919,13 +2219,13 @@ mod tests {
 
     #[test]
     fn test_decode_movep_direction() {
-        // vasm: movep.w 4(a0),d0 -> mem-to-reg (Dn is the destination, i.e. second operand)
+        // Reference encoding: movep.w 4(a0),d0 -> mem-to-reg (Dn is the destination, i.e. second operand)
         let inst = decode_one(&[0x01, 0x08, 0x00, 0x04], "68020");
         let labels = HashMap::new();
         assert_eq!(inst.operands[0].format(&labels), "$4(a0)");
         assert_eq!(inst.operands[1].format(&labels), "d0");
 
-        // vasm: movep.w d0,4(a0) -> reg-to-mem (Dn is the source, i.e. first operand)
+        // Reference encoding: movep.w d0,4(a0) -> reg-to-mem (Dn is the source, i.e. first operand)
         let inst = decode_one(&[0x01, 0x88, 0x00, 0x04], "68020");
         assert_eq!(inst.operands[0].format(&labels), "d0");
         assert_eq!(inst.operands[1].format(&labels), "$4(a0)");
@@ -1933,7 +2233,7 @@ mod tests {
 
     #[test]
     fn test_decode_movep_does_not_shadow_btst_bchg_bclr_bset() {
-        // vasm: btst d0,d1 / bchg d0,d1 / bclr d0,d1 / bset d0,d1 -> 0101/0141/0181/01c1
+        // Reference encoding: btst d0,d1 / bchg d0,d1 / bclr d0,d1 / bset d0,d1 -> 0101/0141/0181/01c1
         let cases: [(u16, &str); 4] = [
             (0x0101, "btst"),
             (0x0141, "bchg"),
@@ -1948,7 +2248,7 @@ mod tests {
 
     #[test]
     fn test_decode_bkpt() {
-        // vasm: bkpt #5 -> 484d
+        // Reference encoding: bkpt #5 -> 484d
         let inst = decode_one(&[0x48, 0x4D], "68020");
         assert_eq!(inst.mnemonic, "bkpt");
         let labels = HashMap::new();
@@ -1957,28 +2257,28 @@ mod tests {
 
     #[test]
     fn test_decode_bkpt_does_not_shadow_pea() {
-        // vasm: pea (a0) -> 4850
+        // Reference encoding: pea (a0) -> 4850
         let inst = decode_one(&[0x48, 0x50], "68020");
         assert_eq!(inst.mnemonic, "pea");
     }
 
     #[test]
     fn test_decode_link_l() {
-        // vasm: LINK.L A5,#$12345678 -> 480D 1234 5678
+        // Reference encoding: LINK.L A5,#$12345678 -> 480D 1234 5678
         let inst = decode_one(&[0x48, 0x0D, 0x12, 0x34, 0x56, 0x78], "68020");
         assert_eq!(inst.mnemonic, "link.l");
     }
 
     #[test]
     fn test_decode_link_l_does_not_shadow_nbcd() {
-        // vasm: nbcd (a0) -> 4810
+        // Reference encoding: nbcd (a0) -> 4810
         let inst = decode_one(&[0x48, 0x10], "68020");
         assert_eq!(inst.mnemonic, "nbcd");
     }
 
     #[test]
     fn test_decode_memory_indirect_preindexed_vs_postindexed() {
-        // vasm: move.l ([$10,a0,d1.w*2],$20),d2 -> 2430 1322 0010 0020 (preindexed)
+        // Reference encoding: move.l ([$10,a0,d1.w*2],$20),d2 -> 2430 1322 0010 0020 (preindexed)
         //       move.l ([$10,a0],d1.w*2,$20),d2 -> 2430 1326 0010 0020 (postindexed)
         // Regression test for a bug where the two forms were swapped.
         let labels = HashMap::new();
@@ -1992,7 +2292,7 @@ mod tests {
 
     #[test]
     fn test_decode_memory_indirect_pc_relative_target_address() {
-        // vasm: move.l ([$1010,pc],d1.w*2),d2 (at pc=$1000) -> 243b 1325 000e
+        // Reference encoding: move.l ([$1010,pc],d1.w*2),d2 (at pc=$1000) -> 243b 1325 000e
         // Regression test for the PC-relative target being off by 2 (the base
         // displacement length was subtracted but not the extension word's own
         // 2 bytes, landing on the position after the ext word instead of at it).
@@ -2008,7 +2308,7 @@ mod tests {
 
     #[test]
     fn test_decode_exg_all_three_forms() {
-        // vasm: exg d0,d1 -> 0xC141, exg a0,a1 -> 0xC149, exg d2,a3 -> 0xC58B.
+        // Reference encoding: exg d0,d1 -> 0xC141, exg a0,a1 -> 0xC149, exg d2,a3 -> 0xC58B.
         // Regression test for the EXG patterns' mask being too narrow (0xF1C0,
         // missing bit 3 of the 5-bit opmode field), which let the three EXG
         // forms collide with each other and let AND's wider mask swallow them.
@@ -2024,7 +2324,7 @@ mod tests {
 
     #[test]
     fn test_decode_exg_does_not_shadow_and() {
-        // vasm: and.l d0,d1 -> c280, and.l d0,(a1) -> c191
+        // Reference encoding: and.l d0,d1 -> c280, and.l d0,(a1) -> c191
         let and1 = decode_one(&[0xC2, 0x80], "68000");
         assert_eq!(and1.mnemonic, "and.l");
 

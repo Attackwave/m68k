@@ -11,6 +11,10 @@ pub enum ParserType {
     MovemMr,
     EaReg,
     RegEa,
+    AddxSubx,
+    Extb,
+    PackUnpk,
+    Lpstop,
     Adda,
     ImmEa,
     Quick,
@@ -66,6 +70,16 @@ pub enum ParserType {
     Eor,
     Rtd,
     Bkpt,
+    MulLong,
+    DivLong,
+    Cas,
+    Chk2Cmp2,
+    Trapcc,
+    Rtm,
+    Callm,
+    Moves,
+    Move16,
+    PSaveRestore,
     MovecFromCr,
     MovecToCr,
     Movep,
@@ -113,7 +127,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             // bits 7-6, otherwise these three EXG forms collide with each
             // other (and, with a mask this narrow, would also fall inside
             // AND's wider 0xF100/0xC100 range). Verified against real
-            // `vasm -m68000` output: exg d0,d1 -> 0xC141, exg a0,a1 ->
+            // reference output: exg d0,d1 -> 0xC141, exg a0,a1 ->
             // 0xC149, exg d2,a3 -> 0xC58B.
             mask: 0xF1F8,
             value: 0xC140,
@@ -171,7 +185,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             src_ea: DREG,
             dst_ea: DREG,
             cpu: "68000",
-            parser: ParserType::RegEa,
+            parser: ParserType::AddxSubx,
             fixed_size: None,
         },
         OpcodePattern {
@@ -391,7 +405,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             // Must precede the BTST/BCHG/BCLR/BSET Dn,<ea> patterns below, whose
             // wider 0xF1C0 mask would otherwise swallow every MOVEP opmode (bits
             // 7-6 are exactly what distinguishes BTST/BCHG/BCLR/BSET from each
-            // other) - verified against real `vasm -m68020` output for all four
+            // other) - verified against reference output for all four
             // MOVEP forms.
             mask: 0xF138,
             value: 0x0108,
@@ -580,6 +594,64 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: ALTERABLE_MEMORY,
             cpu: "68000",
             parser: ParserType::Eor,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // EXTB.L (68020+): 0x49C0 | Dn — a separate opmode (bits 8-6
+            // = 111) from EXT.W/EXT.L, so the EXT pattern below (mask
+            // 0xFFB8, which pins bit 8 to 0) never matches it. Without
+            // this entry `extb.l d0` decoded as `lea d0,a4`.
+            mask: 0xFFF8,
+            value: 0x49C0,
+            mnemonic: "EXTB",
+            src_ea: 0,
+            dst_ea: DREG,
+            cpu: "68020",
+            parser: ParserType::Extb,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // PACK/UNPK (68020+): 0x8140/0x8180 | ... with bit 3 selecting
+            // the predecrement-memory form, followed by a 16-bit
+            // adjustment word. Both must precede the OR patterns
+            // (0x8000/0xF100), which cover this range.
+            mask: 0xF1F8,
+            value: 0x8140,
+            mnemonic: "PACK",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::PackUnpk,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            mask: 0xF1F8,
+            value: 0x8148,
+            mnemonic: "PACK",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::PackUnpk,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            mask: 0xF1F8,
+            value: 0x8180,
+            mnemonic: "UNPK",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::PackUnpk,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            mask: 0xF1F8,
+            value: 0x8188,
+            mnemonic: "UNPK",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::PackUnpk,
             fixed_size: None,
         },
         OpcodePattern {
@@ -777,7 +849,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             // 68040 PFLUSH family: PFLUSHN(An)/PFLUSH(An)/PFLUSHAN/PFLUSHA,
             // sharing base 0xF500 with a 2-bit opmode at bits 4-3 (00/01/
             // 10/11) and register at bits 2-0. Verified against real
-            // `vasm -m68040` output (F500/F508/F510/F518). Placeholder
+            // reference output (F500/F508/F510/F518). Placeholder
             // mnemonic; PflushFamily040 always overrides it.
             mask: 0xFFE0,
             value: 0xF500,
@@ -794,7 +866,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             // (bits 7-6: 01=DC,10=IC,11=BC), push flag (bit 5), 2-bit unit
             // (bits 4-3: 01=Line,10=Page,11=All), and register (bits 2-0,
             // only meaningful for the Line/Page forms). Verified against
-            // real `vasm -m68040` output for all eight scope/unit
+            // reference output for all eight scope/unit
             // combinations. Placeholder mnemonic; CacheOp040 overrides it.
             mask: 0xFC00,
             value: 0xF400,
@@ -846,7 +918,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
         OpcodePattern {
             // FBcc (68020/68881+): base 0xF280, size bit 6 (0=word,1=long displacement),
             // condition in bits 4-0. mask must leave bit 6 free so both size forms match
-            // this one pattern (verified against real `vasm` output for `fbeq.l`, which
+            // this one pattern (verified against reference output for `fbeq.l`, which
             // encodes as 0xF2C1, not 0xF281). Placeholder mnemonic; FpuBcc overrides it.
             mask: 0xFF80,
             value: 0xF280,
@@ -1148,7 +1220,11 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             mnemonic: "BKPT",
             src_ea: 0,
             dst_ea: 0,
-            cpu: "68020",
+            // BKPT is a 68010 addition, not 68020 — with the level set
+            // too high the pattern was filtered out on `--cpu 68010` and
+            // the opcode fell through to PEA (`bkpt #3` -> `pea a3`).
+            // Matches the assembler side, which gates BKPT at 68010.
+            cpu: "68010",
             parser: ParserType::Bkpt,
             fixed_size: None,
         },
@@ -1213,7 +1289,28 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             fixed_size: None,
         },
         OpcodePattern {
-            mask: 0xFFC0,
+            // TRAPcc (68020+): 0x50F8|(cc<<8) with opword bits 2-0 = 4
+            // (no operand), 0x50FA = 2 (word immediate), 0x50FB = 3
+            // (long). Shares the 0x5xxx range with Scc below and must be
+            // listed first — Scc's mask (0xF0C0) also matches these.
+            mask: 0xF0F8,
+            value: 0x50F8,
+            mnemonic: "TRAPcc",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::Trapcc,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // Scc: 0x50C0 | (cc << 8) | ea. The condition occupies bits
+            // 11-8, so the mask must leave those free (0xF0C0) — with the
+            // previous 0xFFC0 it pinned cc to 0, i.e. only `ST` matched
+            // and the other 15 conditions (SF/SEQ/SNE/...) fell through
+            // to the data-word fallback. Must stay *after* the DBcc
+            // pattern (0x50C8/0xF0F8), whose range 0x5xC8-0x5xCF this
+            // one would otherwise swallow: DBcc is Scc's mode-1 encoding.
+            mask: 0xF0C0,
             value: 0x50C0,
             mnemonic: "Scc",
             src_ea: 0,
@@ -1269,7 +1366,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             src_ea: DREG,
             dst_ea: DREG,
             cpu: "68000",
-            parser: ParserType::RegEa,
+            parser: ParserType::AddxSubx,
             fixed_size: None,
         },
         OpcodePattern {
@@ -1310,6 +1407,160 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: 0,
             cpu: "68000",
             parser: ParserType::Trap,
+            fixed_size: None,
+        },
+        // --- 68020+ instructions that previously had no decoder pattern
+        // at all (the assembler emitted them, but disassembling the result
+        // produced `dc.w`). Placed before the generic 0x4Exx/0x4Cxx
+        // patterns they would otherwise be swallowed by.
+        OpcodePattern {
+            // MULU.L/MULS.L: 0x4C00 | ea, extension word carries Dq
+            // (bits 14-12), signed flag (bit 11), 64-bit form (bit 10)
+            // and Dr (bits 2-0).
+            mask: 0xFFC0,
+            value: 0x4C00,
+            mnemonic: "MUL",
+            src_ea: DATA,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::MulLong,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // DIVU.L/DIVS.L/DIVUL.L/DIVSL.L: 0x4C40 | ea. DIVxL (separate
+            // remainder/quotient registers) is distinguished from plain
+            // DIVx.L not by a bit of its own but by Dr != Dq with the
+            // 64-bit bit clear — see the parser.
+            mask: 0xFFC0,
+            value: 0x4C40,
+            mnemonic: "DIV",
+            src_ea: DATA,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::DivLong,
+            fixed_size: None,
+        },
+        // CAS.B/W/L: bases 0x0AC0/0x0CC0/0x0EC0 (size in opword bits
+        // 10-9). One pattern per size rather than a shared mask leaving
+        // bits 10-9 free: BSET's immediate form is 0x08C0, i.e. the same
+        // shape with bits 10-9 = 00, so a size-agnostic CAS mask would
+        // also match BSET (and, being listed later, lose to it anyway).
+        // These must also precede the MOVES pattern below, whose 0xFF00
+        // mask covers CAS.L's 0x0Exx range.
+        OpcodePattern {
+            mask: 0xFFC0,
+            value: 0x0AC0,
+            mnemonic: "CAS",
+            src_ea: 0,
+            dst_ea: ALTERABLE_MEMORY,
+            cpu: "68020",
+            parser: ParserType::Cas,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            mask: 0xFFC0,
+            value: 0x0CC0,
+            mnemonic: "CAS",
+            src_ea: 0,
+            dst_ea: ALTERABLE_MEMORY,
+            cpu: "68020",
+            parser: ParserType::Cas,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            mask: 0xFFC0,
+            value: 0x0EC0,
+            mnemonic: "CAS",
+            src_ea: 0,
+            dst_ea: ALTERABLE_MEMORY,
+            cpu: "68020",
+            parser: ParserType::Cas,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // MOVES: 0x0E00 | (size << 9) | ea, ext word bit 11 =
+            // direction. Listed after CAS.L (0x0EC0), which this mask
+            // would otherwise swallow.
+            mask: 0xFF00,
+            value: 0x0E00,
+            mnemonic: "MOVES",
+            src_ea: 0,
+            dst_ea: ALTERABLE_MEMORY,
+            cpu: "68010",
+            parser: ParserType::Moves,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // CHK2/CMP2: 0x00C0 | (size << 9) | ea; ext word bit 11
+            // selects CHK2 (1) vs CMP2 (0).
+            mask: 0xF9C0,
+            value: 0x00C0,
+            mnemonic: "CMP2",
+            src_ea: CONTROL,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::Chk2Cmp2,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // RTM: 0x06C0 | reg (bit 3 selects Dn vs An).
+            mask: 0xFFF0,
+            value: 0x06C0,
+            mnemonic: "RTM",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::Rtm,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // CALLM: 0x06C0 | ea — same base as RTM but with a mode
+            // field other than 0/1, so RTM (0xFFF0) must come first.
+            mask: 0xFFC0,
+            value: 0x06C0,
+            mnemonic: "CALLM",
+            src_ea: CONTROL,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::Callm,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // MOVE16 (68040+): 0xF620 | reg for the (An)+,(An)+ form.
+            mask: 0xFFE0,
+            value: 0xF620,
+            mnemonic: "MOVE16",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68040",
+            parser: ParserType::Move16,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // LPSTOP #sr (68060): fixed three-word form 0xF800 0x01C0
+            // <sr>. Listed before the PSAVE/FPU patterns in the 0xFxxx
+            // range so its exact opword isn't absorbed by a wider mask.
+            mask: 0xFFFF,
+            value: 0xF800,
+            mnemonic: "LPSTOP",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68060",
+            parser: ParserType::Lpstop,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // PSAVE (0xF100) / PRESTORE (0xF140), 68030+ MMU state
+            // save/restore. Must precede the generic FPU cpGEN pattern
+            // (0xF200/0xFFC0) — different base, but the PMMU group
+            // patterns nearby share the 0xF1xx range.
+            mask: 0xFF80,
+            value: 0xF100,
+            mnemonic: "PSAVE",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68030",
+            parser: ParserType::PSaveRestore,
             fixed_size: None,
         },
         OpcodePattern {

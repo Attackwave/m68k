@@ -1,6 +1,6 @@
 //! Reader for the classic AmigaOS executable "Hunk" format.
 //!
-//! Loads a `HUNK_HEADER`-based executable (as produced by `vasm`/`vlink`/the
+//! Loads a `HUNK_HEADER`-based executable (as produced by reference encodings/`vlink`/the
 //! Amiga linker), applies its 32-bit relocations, and produces a flat memory
 //! image plus per-hunk section info — so the disassembler can work from a
 //! real Amiga program instead of requiring a manually guessed `--org`.
@@ -29,12 +29,12 @@ const HUNK_END: u32 = 0x03F2;
 const HUNK_HEADER: u32 = 0x03F3;
 const HUNK_NAME: u32 = 0x03E8;
 /// Compact form of `HUNK_RELOC32`, with 16-bit counts/hunk references
-/// instead of 32-bit ones. This is what modern linkers (vasm/vlink) emit
+/// instead of 32-bit ones. This is what modern linkers emit
 /// by default, so it's at least as common as the classic `HUNK_RELOC32`.
 ///
 /// The "correct" V39+ id for this is `0x03FC`, but `dos.library`'s
 /// `LoadSeg()` has accepted `0x03F7` (nominally `HUNK_DREL32`) for this
-/// purpose since V37 due to a historical bug, and every linker — vasm/vlink
+/// purpose since V37 due to a historical bug, and every linker
 /// included — still emits `0x03F7` for compatibility. Accept both.
 const HUNK_RELOC32SHORT: u32 = 0x03F7;
 const HUNK_RELOC32SHORT_V39: u32 = 0x03FC;
@@ -415,7 +415,7 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
 mod tests {
     use super::*;
 
-    // vasm -Fhunkexe output for a single CODE hunk with no relocations:
+    // Reference hunk-executable output for a single CODE hunk with no relocations:
     //   moveq #1,d0 ; move.l #$12345678,d1 ; lea msg(pc),a0 ; jsr func ; rts
     //   func: movem.l d0-d7/a0-a6,-(sp) ; movem.l (sp)+,d0-d7/a0-a6 ; rts
     //   msg: dc.b "Hello",0
@@ -430,7 +430,7 @@ mod tests {
         0x00, 0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xf2,
     ];
 
-    // vasm -Fhunkexe output for CODE+DATA hunks, with a HUNK_RELOC32SHORT
+    // Reference hunk-executable output for CODE+DATA hunks, with a HUNK_RELOC32SHORT
     // patching an absolute reference to `value` (in the DATA hunk) into
     // the CODE hunk:
     //   move.l #value,a1 ; move.l (a1),d0 ; rts

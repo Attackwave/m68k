@@ -102,11 +102,23 @@ impl Section {
             .unwrap_or(base_addr);
         let mut bytes = vec![0u8; (last_addr - base_addr) as usize];
         for instr in &self.instructions {
-            let mut pos = (instr.pc - base_addr) as usize;
+            // Byte-wise, bounded by the instruction's real length: a DC.B
+            // run of odd length must not pad into the next entry (see
+            // `AssembledInstruction::byte_len`).
+            let offset = (instr.pc - base_addr) as usize;
+            let limit = instr.size_bytes();
+            let mut written = 0usize;
             for word in &instr.words {
-                bytes[pos] = (word >> 8) as u8;
-                bytes[pos + 1] = (word & 0xFF) as u8;
-                pos += 2;
+                for b in [(word >> 8) as u8, (word & 0xFF) as u8] {
+                    if written >= limit {
+                        break;
+                    }
+                    let pos = offset + written;
+                    if pos < bytes.len() {
+                        bytes[pos] = b;
+                    }
+                    written += 1;
+                }
             }
         }
         bytes
@@ -399,6 +411,7 @@ pub fn handle_align_pass2(
         words,
         line_no: Some(line_no),
         source: Some(source.to_string()),
+        byte_len: None,
     };
 
     Ok((result, Some(instr)))
@@ -407,7 +420,8 @@ pub fn handle_align_pass2(
 /// Handle EVEN directive - pad to word boundary if needed.
 pub fn handle_even_pass1(pc: u32) -> DirectiveResult {
     if !pc.is_multiple_of(2) {
-        DirectiveResult::with_bytes(2)
+        // One pad byte, matching handle_even_pass2.
+        DirectiveResult::with_bytes(1)
     } else {
         DirectiveResult::none()
     }
@@ -420,13 +434,19 @@ pub fn handle_even_pass2(
     source: &str,
 ) -> (DirectiveResult, Option<AssembledInstruction>) {
     if !pc.is_multiple_of(2) {
+        // Exactly one byte is needed to reach the next word boundary, and
+        // it is a zero fill, not a NOP: EVEN aligns data, so the padding
+        // is never executed. Emitting a full 0x4E71 word here both added
+        // a byte too many and put executable bytes in the middle of a
+        // data block.
         let instr = AssembledInstruction {
             pc,
-            words: vec![0x4E71], // NOP padding
+            words: vec![0x0000],
             line_no: Some(line_no),
             source: Some(source.to_string()),
+            byte_len: Some(1),
         };
-        (DirectiveResult::with_bytes(2), Some(instr))
+        (DirectiveResult::with_bytes(1), Some(instr))
     } else {
         (DirectiveResult::none(), None)
     }
@@ -603,6 +623,7 @@ pub fn handle_incbin_pass2(
         words,
         line_no: Some(line_no),
         source: Some(source.to_string()),
+        byte_len: None,
     };
 
     Ok((DirectiveResult::with_bytes(bytes), Some(instr)))
@@ -618,12 +639,24 @@ pub fn handle_include(
     source_root: &Path,
     line_no: usize,
 ) -> Result<String, AsmError> {
+    handle_include_in(args, include_stack, source_root, &[], line_no)
+}
+
+/// Like [`handle_include`], with additional `-I` search directories.
+pub fn handle_include_in(
+    args: &[String],
+    include_stack: &mut IncludeStack,
+    source_root: &Path,
+    include_paths: &[PathBuf],
+    line_no: usize,
+) -> Result<String, AsmError> {
     if args.is_empty() {
         return Err(AsmError::with_line("INCLUDE requires a filename", line_no));
     }
 
     let filename = strip_quotes(&args[0]);
-    let path = resolve_include_path(filename, source_root)?;
+    let path = resolve_include_path_in(filename, source_root, include_paths)
+        .map_err(|e| AsmError::with_line(e.message, line_no))?;
 
     if include_stack.contains(&path) {
         return Err(AsmError::with_line(
@@ -785,9 +818,19 @@ fn tokenize_expr(text: &str, pc: u32) -> Result<Vec<ExprToken>, String> {
             continue;
         }
 
-        // Identifier or keyword
-        if ch.is_alphabetic() || ch == '_' {
+        // Identifier or keyword. A leading '.' starts a local label
+        // (`.loop`), which the symbol table resolves against the enclosing
+        // global label — but only when a name character follows, so that
+        // a bare '.' still falls through to the operator handling below.
+        if ch.is_alphabetic()
+            || ch == '_'
+            || (ch == '.'
+                && chars
+                    .get(i + 1)
+                    .is_some_and(|c| c.is_alphanumeric() || *c == '_'))
+        {
             let start = i;
+            i += 1; // consume the first character, which may be the '.'
             while i < chars.len()
                 && (chars[i].is_alphanumeric()
                     || chars[i] == '_'
@@ -1315,6 +1358,20 @@ pub fn strip_quotes(s: &str) -> &str {
 
 /// Resolve an include file path relative to the source root.
 pub fn resolve_include_path(filename: &str, source_root: &Path) -> Result<PathBuf, AsmError> {
+    resolve_include_path_in(filename, source_root, &[])
+}
+
+/// Like [`resolve_include_path`], but also searches `include_paths` (the
+/// `-I` directories) after the source root.
+///
+/// Amiga sources include the system headers by their logical path
+/// (`include 'exec/types.i'`), which only resolves if the directory
+/// holding `exec/` is on the search path — hence the need for `-I`.
+pub fn resolve_include_path_in(
+    filename: &str,
+    source_root: &Path,
+    include_paths: &[PathBuf],
+) -> Result<PathBuf, AsmError> {
     let path = Path::new(filename);
 
     // If absolute or starts with ./ or ../
@@ -1328,16 +1385,26 @@ pub fn resolve_include_path(filename: &str, source_root: &Path) -> Result<PathBu
         return Ok(full);
     }
 
+    // Then each -I directory, in the order given.
+    for dir in include_paths {
+        let candidate = dir.join(filename);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
     // Try as-is (might be in current working directory)
     let cwd_path = PathBuf::from(filename);
     if cwd_path.exists() {
         return Ok(cwd_path);
     }
 
+    let mut searched = vec![source_root.display().to_string()];
+    searched.extend(include_paths.iter().map(|p| p.display().to_string()));
     Err(AsmError::new(format!(
-        "file not found: '{}' (searched in '{}')",
+        "file not found: '{}' (searched in {})",
         filename,
-        source_root.display()
+        searched.join(", ")
     )))
 }
 
@@ -1571,7 +1638,8 @@ mod tests {
 
     #[test]
     fn test_handle_even() {
-        assert_eq!(handle_even_pass1(0x1001).bytes_emitted, 2);
+        // One pad byte reaches the next word boundary, not two.
+        assert_eq!(handle_even_pass1(0x1001).bytes_emitted, 1);
         assert_eq!(handle_even_pass1(0x1000).bytes_emitted, 0);
         assert_eq!(handle_even_pass1(0x1002).bytes_emitted, 0);
     }

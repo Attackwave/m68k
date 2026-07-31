@@ -109,7 +109,7 @@ fn bytes_to_hex(bytes: &[u8]) -> String {
 /// Systematic encode -> decode -> format -> reassemble -> re-encode
 /// roundtrip over every golden encoder vector (all CPU levels present:
 /// 68000/68020/68040). This is the automated version of the manual ~35-form
-/// vasm roundtrip verification done for B9 (see AGENTS.md); it would have
+/// roundtrip verification done for B9 (see AGENTS.md); it would have
 /// caught 1.2 (brief-format Xn/disp swap), 1.3 (ADDA/SUBA/CMPA size-bit
 /// position), and 1.6 (disassembler dropping scale bits) immediately, since
 /// each of those breaks either the decode step or the re-encode step for

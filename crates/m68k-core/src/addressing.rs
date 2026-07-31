@@ -114,9 +114,12 @@ pub enum EAOperand {
     AbsoluteShort(u16),
     /// Absolute long: xxx.L
     AbsoluteLong(u32),
-    /// PC relative displacement: (xxx).W(PC)
+    /// PC relative displacement: (xxx).W(PC).
+    /// Fields: resolved target address, same address as `u32`.
     PcDisp(i32, u32),
-    /// PC relative index: (d8,PC,Xn.size*scale)
+    /// PC relative index: (d8,PC,Xn.size*scale).
+    /// Fields: resolved target address, raw displacement, index register,
+    /// index size, scale.
     PcIndex(i32, u32, String, String, u8),
     /// Immediate: #value
     Immediate(u64, String),
@@ -434,7 +437,7 @@ pub fn decode_full_ea(
         // the base displacement's byte length must be subtracted, plus the
         // extension word itself (2 bytes), to land on the extension word's
         // own address rather than the position right after it. Verified
-        // against real `vasm -m68020` output for `([target,pc],d1.w*2)`.
+        // against reference output for `([target,pc],d1.w*2)`.
         pc_rel_target = stream
             .current_pc()
             .wrapping_sub(bd_len)
@@ -444,7 +447,7 @@ pub fn decode_full_ea(
 
     let is_indirect = i_i_s > 0;
     // PRM Table 2-2: I/IS 1-3 (with IS=0) is Indirect Preindexed, I/IS 5-7 is
-    // Indirect Postindexed - verified against real `vasm -m68020` output for
+    // Indirect Postindexed - verified against reference output for
     // `([$10,a0,d1.w*2],$20)` (preindexed syntax, ext word 0x1322).
     let is_postindexed = matches!(i_i_s, 4..=7);
 
@@ -532,9 +535,14 @@ pub fn decode_ea(
                 if ext_word & 0x0100 == 0 || level < 2 {
                     let (idx_reg, idx_size, disp, scale) = parse_index_extension(ext_word);
                     let target = (ext_pc as i32 + disp as i32) as u32;
+                    // First field is the resolved target address, second
+                    // the raw displacement — same order as `PcDisp` above,
+                    // which is what `format_with_labels` reads. These were
+                    // swapped, so `(d,PC,Xn)` disassembled to the raw
+                    // displacement and could not be reassembled.
                     Ok(EAOperand::PcIndex(
-                        disp as i32,
-                        target,
+                        target as i32,
+                        disp as u32,
                         idx_reg,
                         idx_size,
                         scale,

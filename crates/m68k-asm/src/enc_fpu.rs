@@ -22,7 +22,7 @@ fn check_fpu_cpu(cpu: &str) -> Result<(), AsmError> {
 /// (`{#k}`, a compile-time constant) or a dynamic one (`{Dn}`, taken from
 /// a data register at runtime).
 ///
-/// Encoding (extension word, verified against `vasm -m68881` reference
+/// Encoding (extension word, verified against reference encodings reference
 /// output — see the encoder below for the exact bit layout): the two
 /// forms are distinguished by the format-code field itself (bits 12-10 =
 /// 3 for static, 7 for dynamic), *not* by a bit within the k-factor field
@@ -71,7 +71,7 @@ pub fn enc_fpu_arith(
             let ext = (*fp as u16) << 10 | (*fp as u16) << 7 | cmd;
             Ok(vec![0xF200, ext])
         }
-        // FPU reg-reg: vasm convention "FADD FPn,FPm" computes FPn op FPm, result in FPn.
+        // FPU reg-reg: by convention "FADD FPn,FPm" computes FPn op FPm, result in FPn.
         // The extension word's dest field takes the first (src) operand's register number.
         (Operand::FpReg(fpd), Some(Operand::FpReg(fps))) => {
             let ext = (*fpd as u16) << 10 | (*fps as u16) << 7 | cmd;
@@ -431,7 +431,7 @@ pub fn enc_fnop() -> Vec<u16> {
 mod tests {
     use super::*;
 
-    // Reference bytes below are verified against real `vasm -m68040` output
+    // Reference bytes below are verified against reference output
     // (see individual test comments for the exact source lines).
 
     #[test]
@@ -474,8 +474,8 @@ mod tests {
     }
 
     #[test]
-    fn test_fsincos_reg_reg_matches_vasm() {
-        // vasm: fsincos fp1,fp2:fp3 -> f20005b2 (src=FP1, cos_dst=FP2, sin_dst=FP3)
+    fn test_fsincos_reg_reg_matches_reference() {
+        // Reference encoding: fsincos fp1,fp2:fp3 -> f20005b2 (src=FP1, cos_dst=FP2, sin_dst=FP3)
         let src = Operand::FpReg(1);
         let words = enc_fsincos(&src, 2, 3, None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF200, 0x05B2]);
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn test_fmove_ctrl_reg_to_dn_bugfix() {
         // FMOVE FPIAR,D0 is a valid instruction (Dn must be allowed as EA).
-        // vasm: fmove fpiar,d0 -> f200a400 (dr=1: ctrl -> EA)
+        // Reference encoding: fmove fpiar,d0 -> f200a400 (dr=1: ctrl -> EA)
         let src = Operand::FpCtrlList(1); // FPIAR
         let dst = Operand::DataReg(0);
         let words = enc_fmove(&src, &dst, None, None, 0, "68020").unwrap();
@@ -514,7 +514,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fmove_ctrl_reg_to_predec_matches_vasm() {
+    fn test_fmove_ctrl_reg_to_predec_matches_reference() {
         // fmove fpiar,-(a0) -> f220a400
         let src = Operand::FpCtrlList(1);
         let dst = Operand::AddrRegPreDec(0);
@@ -523,7 +523,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fmove_dn_to_ctrl_reg_matches_vasm() {
+    fn test_fmove_dn_to_ctrl_reg_matches_reference() {
         // fmove d0,fpiar -> f2008400 (dr=0: EA -> ctrl)
         let src = Operand::DataReg(0);
         let dst = Operand::FpCtrlList(1);
@@ -531,7 +531,7 @@ mod tests {
         assert_eq!(words, vec![0xF200, 0x8400]);
     }
 
-    // Reference bytes for FMOVEM / short-FPU-op tests (source: vasm, `-m68040`):
+    // Reference bytes for FMOVEM / short-FPU-op tests (68040):
     //   fsmove d0,fp1              -> f20050c0
     //   fssqrt d0,fp1              -> f20050c1
     //   fdadd d0,fp2               -> f2005166
@@ -542,51 +542,51 @@ mod tests {
     //   fmovem fp0/fp1,(a0)        -> f210f0c0 (non-predecrement: mask is reversed)
 
     #[test]
-    fn test_fsmove_matches_vasm() {
+    fn test_fsmove_matches_reference() {
         let src = Operand::DataReg(0);
         let words = enc_fpu_short(0x40, &src, 1, None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF200, 0x50C0]);
     }
 
     #[test]
-    fn test_fsmove_reg_reg_matches_vasm() {
-        // vasm: fsmove fp0,fp1 -> f20000c0
+    fn test_fsmove_reg_reg_matches_reference() {
+        // Reference encoding: fsmove fp0,fp1 -> f20000c0
         let src = Operand::FpReg(0);
         let words = enc_fpu_short(0x40, &src, 1, None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF200, 0x00C0]);
     }
 
     #[test]
-    fn test_fdadd_reg_reg_matches_vasm() {
-        // vasm: fdadd fp0,fp2 -> f2000166
+    fn test_fdadd_reg_reg_matches_reference() {
+        // Reference encoding: fdadd fp0,fp2 -> f2000166
         let src = Operand::FpReg(0);
         let words = enc_fpu_short(0x66, &src, 2, None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF200, 0x0166]);
     }
 
     #[test]
-    fn test_fssqrt_matches_vasm() {
+    fn test_fssqrt_matches_reference() {
         let src = Operand::DataReg(0);
         let words = enc_fpu_short(0x41, &src, 1, None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF200, 0x50C1]);
     }
 
     #[test]
-    fn test_fdadd_matches_vasm() {
+    fn test_fdadd_matches_reference() {
         let src = Operand::DataReg(0);
         let words = enc_fpu_short(0x66, &src, 2, None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF200, 0x5166]);
     }
 
     #[test]
-    fn test_fmovem_regs_to_predec_matches_vasm() {
+    fn test_fmovem_regs_to_predec_matches_reference() {
         let dst = Operand::AddrRegPreDec(7);
         let words = enc_fmovem_regs_to_mem(FpRegSet(0b0000_0011), &dst, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF227, 0xE003]);
     }
 
     #[test]
-    fn test_fmovem_regs_range_to_predec_matches_vasm() {
+    fn test_fmovem_regs_range_to_predec_matches_reference() {
         // fp0/fp1/fp3 -> mask 0b1011
         let dst = Operand::AddrRegPreDec(7);
         let words = enc_fmovem_regs_to_mem(FpRegSet(0b0000_1011), &dst, 0, "68020").unwrap();
@@ -594,7 +594,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fmovem_single_reg_to_predec_matches_vasm() {
+    fn test_fmovem_single_reg_to_predec_matches_reference() {
         let dst = Operand::AddrRegPreDec(0);
         let words = enc_fmovem_regs_to_mem(FpRegSet(0b0000_0001), &dst, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF220, 0xE001]);
@@ -609,7 +609,7 @@ mod tests {
     }
 
     #[test]
-    fn test_fmovem_mem_to_ctrl_matches_vasm() {
+    fn test_fmovem_mem_to_ctrl_matches_reference() {
         // fmovem (a0)+,fpcr/fpsr -> f2189800; fpcr=4, fpsr=2, mask=0b110
         let src = Operand::AddrRegPostInc(0);
         let words = enc_fmovem_mem_to_ctrl(&src, 0b110, 0, "68020").unwrap();
@@ -618,7 +618,7 @@ mod tests {
 
     #[test]
     fn test_fmovem_mem_to_regs_reverses_mask() {
-        // vasm: fmovem (a0)+,fp0/fp1 -> f218d0c0: mask 0b011 reversed to 0b11000000.
+        // Reference encoding: fmovem (a0)+,fp0/fp1 -> f218d0c0: mask 0b011 reversed to 0b11000000.
         // The postincrement/control static-list format has FP0 as the mask MSB (opposite
         // of predecrement), so this must be bit-reversed just like the non-predecrement
         // write case.
@@ -628,7 +628,7 @@ mod tests {
     }
 
     // Reference bytes below (`org $1000` then the instruction) are verified against
-    // real `vasm -m68040` output; see individual test comments for exact source lines.
+    // reference output; see individual test comments for exact source lines.
 
     const FEQ: u16 = 1;
 
@@ -646,7 +646,7 @@ mod tests {
 
     #[test]
     fn test_fdbeq_reference_bytes() {
-        // vasm: fdbeq d0,$1010 (at pc=$1000) -> f2480001000c
+        // Reference encoding: fdbeq d0,$1010 (at pc=$1000) -> f2480001000c
         let words = enc_fdbcc(FEQ, 0, 0x1010, 0x1004).unwrap();
         assert_eq!(words, vec![0xF248, 0x0001, 0x000C]);
     }
@@ -666,22 +666,22 @@ mod tests {
     }
 
     #[test]
-    fn test_ftrapeq_no_operand_matches_vasm() {
-        // vasm: ftrapeq -> f27c0001 (mode=100, no operand)
+    fn test_ftrapeq_no_operand_matches_reference() {
+        // Reference encoding: ftrapeq -> f27c0001 (mode=100, no operand)
         let words = enc_ftrapcc(FEQ, None).unwrap();
         assert_eq!(words, vec![0xF27C, 0x0001]);
     }
 
     #[test]
-    fn test_ftrapeq_word_matches_vasm() {
-        // vasm: ftrapeq.w #1234 -> f27a000104d2 (mode=010, word operand)
+    fn test_ftrapeq_word_matches_reference() {
+        // Reference encoding: ftrapeq.w #1234 -> f27a000104d2 (mode=010, word operand)
         let words = enc_ftrapcc(FEQ, Some((0x1234, "w"))).unwrap();
         assert_eq!(words, vec![0xF27A, 0x0001, 0x1234]);
     }
 
     #[test]
-    fn test_ftrapeq_long_matches_vasm() {
-        // vasm: ftrapeq.l #12345678 -> f27b000100bc614e (mode=011, long operand)
+    fn test_ftrapeq_long_matches_reference() {
+        // Reference encoding: ftrapeq.l #12345678 -> f27b000100bc614e (mode=011, long operand)
         let words = enc_ftrapcc(FEQ, Some((12345678, "l"))).unwrap();
         assert_eq!(words, vec![0xF27B, 0x0001, 0x00BC, 0x614E]);
     }

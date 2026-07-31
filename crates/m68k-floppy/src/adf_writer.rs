@@ -336,15 +336,22 @@ mod tests {
             image[off..off + 512].copy_from_slice(&block);
         }
 
-        // File header block: data block pointers stored highest-index-
-        // first (table[high_seq-1] = first data block).
+        // File header block. The data block table is anchored at the *end*
+        // of the block and grows downwards: the last slot (index 71) holds
+        // the first data block, index 70 the second, and so on. This test
+        // previously wrote the pointers to indices `num_data_blocks-1 ..= 0`
+        // at the start of the table, which no real AmigaDOS implementation
+        // reads — it only round-tripped because the reader had the matching
+        // bug. Real disks (checked against the Workbench 3.1 fonts disk)
+        // use the end-anchored layout.
+        const TABLE_ENTRIES: usize = 72;
         let mut header = [0u8; 512];
         header[0..4].copy_from_slice(&(2i32).to_be_bytes()); // type = T_HEADER
         header[4..8].copy_from_slice(&file_header_block_num.to_be_bytes());
         header[8..12].copy_from_slice(&(num_data_blocks as u32).to_be_bytes()); // high_seq
         header[0x10..0x14].copy_from_slice(&data_block_nums[0].to_be_bytes()); // first_data
         for (i, &block_num) in data_block_nums.iter().enumerate() {
-            let table_idx = num_data_blocks - 1 - i;
+            let table_idx = TABLE_ENTRIES - 1 - i;
             let off = 0x018 + table_idx * 4;
             header[off..off + 4].copy_from_slice(&block_num.to_be_bytes());
         }
@@ -387,6 +394,30 @@ mod tests {
 
         let read_back = fs.read_file(file_header_block_num).unwrap();
         assert_eq!(read_back, content);
+
+        // Path-based access must reach the same file, and tolerate the
+        // separator spellings AmigaDOS users type.
+        for spelling in ["hello.txt", "/hello.txt", "//hello.txt"] {
+            assert_eq!(
+                fs.read_file_at_path(spelling).unwrap(),
+                content,
+                "path {:?} should resolve to the same file",
+                spelling
+            );
+        }
+
+        // An empty path is the root directory itself, listable but not
+        // readable as a file.
+        assert_eq!(fs.list_dir_at_path("").unwrap().len(), 1);
+        assert!(fs.read_file_at_path("").is_err());
+        assert!(fs.read_file_at_path("nope.txt").is_err());
+        // Descending through a file must fail rather than silently
+        // resolving to the file itself.
+        assert!(fs.resolve_path("hello.txt/inner").unwrap().is_none());
+
+        let walked = fs.walk("", 8).unwrap();
+        assert_eq!(walked.len(), 1);
+        assert_eq!(walked[0].0, "hello.txt");
     }
 
     #[test]

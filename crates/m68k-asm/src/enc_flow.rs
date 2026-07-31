@@ -36,6 +36,22 @@ fn cond_code(name: &str) -> Result<u8, AsmError> {
 
 /// Encode Bcc instruction.
 pub fn enc_bcc(cond: &str, target: i32, pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
+    enc_bcc_sized(cond, target, pc, cpu, true)
+}
+
+/// Encode a Bcc, choosing the displacement form.
+///
+/// `allow_short` mirrors the assembler's optimization setting: with it
+/// off, a displacement that would fit in 8 bits still uses the word form,
+/// which is what Motorola-syntax assemblers emit for an unsuffixed `Bcc`.
+/// An explicit `.S` suffix reaches this as `allow_short = true`.
+pub fn enc_bcc_sized(
+    cond: &str,
+    target: i32,
+    pc: u32,
+    cpu: &str,
+    allow_short: bool,
+) -> Result<Vec<u16>, AsmError> {
     let cc = cond_code(cond)?;
     let disp = target.wrapping_sub(pc as i32);
 
@@ -44,7 +60,7 @@ pub fn enc_bcc(cond: &str, target: i32, pc: u32, cpu: &str) -> Result<Vec<u16>, 
     // 68020+ 32-bit form, so a genuine short displacement of exactly those
     // values must be promoted to the word form instead of colliding with
     // those markers. Byte range is -128..=127; the low bound is included.
-    if (-128..=127).contains(&disp) && disp != 0 && disp != -1 {
+    if allow_short && (-128..=127).contains(&disp) && disp != 0 && disp != -1 {
         let op = 0x6000 | ((cc as u16) << 8) | ((disp as u8) as u16);
         Ok(vec![op])
     } else if (-32768..=32767).contains(&disp) {
@@ -61,7 +77,7 @@ pub fn enc_bcc(cond: &str, target: i32, pc: u32, cpu: &str) -> Result<Vec<u16>, 
         // 68020+ long displacement: low byte 0xFF marks the 32-bit form (0x00
         // marks the 16-bit form above), immediately followed by the 32-bit
         // displacement - no extra padding word. Verified against real
-        // `vasm -m68020` output for `bra.l far`.
+        // reference output for `bra.l far`.
         let op = 0x6000 | ((cc as u16) << 8) | 0xFF;
         Ok(vec![
             op,
@@ -211,7 +227,7 @@ pub fn enc_link(reg: u8, displacement: i32, size: &str, cpu: &str) -> Result<Vec
             }
             // LINK.L has its own base opcode (0x4808), unrelated to LINK.W's
             // 0x4E50 - the 32-bit displacement follows immediately, with no
-            // padding word. Verified against real `vasm -m68020` output for
+            // padding word. verified against reference output for
             // `LINK.L A5,#$12345678` -> 480D 1234 5678.
             let op = 0x4808 | (reg as u16);
             let hi = ((displacement >> 16) & 0xFFFF) as u16;
@@ -293,7 +309,7 @@ pub fn enc_exg_dd(reg1: u8, reg2: u8) -> Result<Vec<u16>, AsmError> {
 
 /// Encode EXG An,An instruction.
 pub fn enc_exg_aa(reg1: u8, reg2: u8) -> Result<Vec<u16>, AsmError> {
-    // Opmode 01001, not 10001 - verified against real `vasm -m68000` output
+    // Opmode 01001, not 10001 - verified against reference output
     // for `exg a0,a1` -> 0xC149.
     Ok(vec![0xC148 | ((reg1 as u16) << 9) | (reg2 as u16)])
 }
@@ -301,7 +317,7 @@ pub fn enc_exg_aa(reg1: u8, reg2: u8) -> Result<Vec<u16>, AsmError> {
 /// Encode EXG Dn,An instruction.
 pub fn enc_exg_da(dreg: u8, areg: u8) -> Result<Vec<u16>, AsmError> {
     // Opmode 10001, not 01001 (that's AA's opmode) - verified against real
-    // `vasm -m68000` output for `exg d2,a3` -> 0xC58B.
+    // reference output for `exg d2,a3` -> 0xC58B.
     Ok(vec![0xC188 | ((dreg as u16) << 9) | (areg as u16)])
 }
 
@@ -414,7 +430,7 @@ pub fn enc_trapcc(cond: &str, imm: Option<(i64, &str)>, cpu: &str) -> Result<Vec
     let cc = cond_code(cond)?;
     let base = 0x50F8 | ((cc as u16) << 8);
     // Mode field (bits 2-0): 010=word operand, 011=long operand, 100=no operand
-    // (PRM "TRAPcc" instruction format) - verified against real `vasm -m68020`
+    // (PRM "TRAPcc" instruction format) - verified against reference encodings
     // output for `trapeq`/`trapne.w #$1234`/`trapmi.l #$12345678`.
     match imm {
         None => Ok(vec![base | 4]),
@@ -586,9 +602,14 @@ pub fn enc_subi(
     Ok(words)
 }
 
-/// Encode ANDI to CCR/SR.
-pub fn enc_andi_sr(data: u16) -> Result<Vec<u16>, AsmError> {
-    Ok(vec![0x023C, data])
+/// Encode ANDI to CCR (0x023C) or SR (0x027C).
+///
+/// The two destinations differ by opword bit 6; encoding both with a
+/// single opcode (as this did before, always emitting the CCR form)
+/// silently turned `andi #x,sr` into `andi #x,ccr`. Verified against
+/// reference encodings.
+pub fn enc_andi_ccr_sr(data: u16, to_sr: bool) -> Result<Vec<u16>, AsmError> {
+    Ok(vec![if to_sr { 0x027C } else { 0x023C }, data])
 }
 
 /// Encode ANDI instruction.
@@ -620,9 +641,12 @@ pub fn enc_andi(
     Ok(words)
 }
 
-/// Encode ORI to CCR/SR.
-pub fn enc_ori_sr(data: u16) -> Result<Vec<u16>, AsmError> {
-    Ok(vec![0x027C, data])
+/// Encode ORI to CCR (0x003C) or SR (0x007C).
+///
+/// Previously emitted 0x027C for both, which is ANDI-to-SR — so every
+/// `ori #x,sr`/`ori #x,ccr` assembled to the wrong instruction entirely.
+pub fn enc_ori_ccr_sr(data: u16, to_sr: bool) -> Result<Vec<u16>, AsmError> {
+    Ok(vec![if to_sr { 0x007C } else { 0x003C }, data])
 }
 
 /// Encode ORI instruction.
@@ -654,9 +678,9 @@ pub fn enc_ori(
     Ok(words)
 }
 
-/// Encode EORI to CCR/SR.
-pub fn enc_eori_sr(data: u16) -> Result<Vec<u16>, AsmError> {
-    Ok(vec![0x0A3C, data])
+/// Encode EORI to CCR (0x0A3C) or SR (0x0A7C).
+pub fn enc_eori_ccr_sr(data: u16, to_sr: bool) -> Result<Vec<u16>, AsmError> {
+    Ok(vec![if to_sr { 0x0A7C } else { 0x0A3C }, data])
 }
 
 /// Encode EORI instruction.
@@ -920,7 +944,7 @@ pub fn enc_move16(src: &Operand, dst: &Operand, _pc: u32, cpu: &str) -> Result<V
         (true, true, _, _, _, _) => {
             // (An)+,(Am)+: extension word is `1 <Ay> 0000000000000` (PRM "MOVE16"
             // postincrement format) - bit 15 is always set, not just the register
-            // field. Verified against real `vasm -m68040` output for
+            // field. verified against reference output for
             // `MOVE16 (A0)+,(A1)+` -> F620 9000.
             let ext = 0x8000 | ((dst_reg as u16) << 12);
             Ok(vec![base | (src_reg as u16), ext])
@@ -1000,7 +1024,7 @@ mod tests {
 
     #[test]
     fn test_bra_long_displacement() {
-        // vasm: bra.l far (disp32=0x13886 in the corresponding assembler test) uses
+        // Reference encoding: bra.l far (disp32=0x13886 in the corresponding assembler test) uses
         // opword 0x60FF (low byte 0xFF marks the 32-bit form) followed directly by
         // the 32-bit displacement, with no padding word.
         let words = enc_bcc("t", 0x20000, 0x1002, "68020").unwrap();
@@ -1079,7 +1103,7 @@ mod tests {
 
     #[test]
     fn test_link_l() {
-        // vasm: LINK.L A5,#$12345678 -> 480D 1234 5678 (own base opcode 0x4808,
+        // Reference encoding: LINK.L A5,#$12345678 -> 480D 1234 5678 (own base opcode 0x4808,
         // no padding word before the 32-bit displacement)
         let words = enc_link(5, 0x12345678, "l", "68020").unwrap();
         assert_eq!(words, vec![0x480D, 0x1234, 0x5678]);
@@ -1140,21 +1164,21 @@ mod tests {
 
     #[test]
     fn test_trapcc_no_operand() {
-        // vasm: trapeq -> 0x57FC
+        // Reference encoding: trapeq -> 0x57FC
         let words = enc_trapcc("eq", None, "68020").unwrap();
         assert_eq!(words, vec![0x57FC]);
     }
 
     #[test]
     fn test_trapcc_word_imm() {
-        // vasm: trapne.w #$1234 -> 0x56FA, 0x1234
+        // Reference encoding: trapne.w #$1234 -> 0x56FA, 0x1234
         let words = enc_trapcc("ne", Some((0x1234, "w")), "68020").unwrap();
         assert_eq!(words, vec![0x56FA, 0x1234]);
     }
 
     #[test]
     fn test_trapcc_long_imm() {
-        // vasm: trapmi.l #$12345678 -> 0x5BFB, 0x1234, 0x5678
+        // Reference encoding: trapmi.l #$12345678 -> 0x5BFB, 0x1234, 0x5678
         let words = enc_trapcc("mi", Some((0x12345678, "l")), "68020").unwrap();
         assert_eq!(words, vec![0x5BFB, 0x1234, 0x5678]);
     }
@@ -1165,22 +1189,22 @@ mod tests {
     }
 
     #[test]
-    fn test_exg_dd_matches_vasm() {
-        // vasm: exg d0,d1 -> 0xC141
+    fn test_exg_dd_matches_reference() {
+        // Reference encoding: exg d0,d1 -> 0xC141
         let words = enc_exg_dd(0, 1).unwrap();
         assert_eq!(words, vec![0xC141]);
     }
 
     #[test]
-    fn test_exg_aa_matches_vasm() {
-        // vasm: exg a0,a1 -> 0xC149
+    fn test_exg_aa_matches_reference() {
+        // Reference encoding: exg a0,a1 -> 0xC149
         let words = enc_exg_aa(0, 1).unwrap();
         assert_eq!(words, vec![0xC149]);
     }
 
     #[test]
-    fn test_exg_da_matches_vasm() {
-        // vasm: exg d2,a3 -> 0xC58B - regression test for AA/DA opmode swap
+    fn test_exg_da_matches_reference() {
+        // Reference encoding: exg d2,a3 -> 0xC58B - regression test for AA/DA opmode swap
         // (AA and DA previously shared the wrong base opcode).
         let words = enc_exg_da(2, 3).unwrap();
         assert_eq!(words, vec![0xC58B]);
@@ -1294,7 +1318,7 @@ mod tests {
 
     #[test]
     fn test_move16_post_post() {
-        // vasm: MOVE16 (A0)+,(A1)+ -> F620 9000
+        // Reference encoding: MOVE16 (A0)+,(A1)+ -> F620 9000
         let words = enc_move16(
             &Operand::AddrRegPostInc(0),
             &Operand::AddrRegPostInc(1),

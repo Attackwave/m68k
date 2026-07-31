@@ -93,6 +93,35 @@ fn branch_target_address(op: &Operand) -> Option<i64> {
     }
 }
 
+/// Cache-scope operand for the 68040 cache instructions (CINVA/CPUSHA and
+/// the line/page variants): accepts either a plain immediate (`#2`) or one
+/// of the conventional scope names NC/DC/IC/BC (0/1/2/3), which is how
+/// the Motorola manuals write them.
+///
+/// The names can't be handled in the generic operand parser: `DC` is also
+/// the define-constant directive and all four are valid label names, so
+/// they're only unambiguous once the mnemonic is known. A name reaching
+/// here has been parsed as a symbol reference (`Operand::Address`, the
+/// forward-reference placeholder) or `Operand::Special`, depending on
+/// whether it happened to resolve — both are treated as a scope name.
+fn cache_scope(op: Option<&Operand>) -> Option<i64> {
+    match op? {
+        Operand::Immediate(v) => Some(*v),
+        Operand::Special(name) => cache_scope_by_name(name),
+        _ => None,
+    }
+}
+
+fn cache_scope_by_name(name: &str) -> Option<i64> {
+    match name.to_uppercase().as_str() {
+        "NC" => Some(0),
+        "DC" => Some(1),
+        "IC" => Some(2),
+        "BC" => Some(3),
+        _ => None,
+    }
+}
+
 /// FPU condition-code value (0-31), by condition mnemonic suffix (e.g. "EQ", "OGT", "F").
 pub(crate) fn fpu_cc(cond: &str) -> Option<u16> {
     Some(match cond {
@@ -319,6 +348,14 @@ pub fn encode_instruction(
         "ADD" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
+                // `ADD #imm,<ea>` where the destination is not a data
+                // register is the ADDI instruction; the register form is
+                // handled by enc_add itself.
+                (Some(Operand::Immediate(v)), Some(d))
+                    if !matches!(d, Operand::DataReg(_) | Operand::AddrReg(_)) =>
+                {
+                    enc_addi(*v, d, sz, pc + 4, cpu)
+                }
                 (Some(s), Some(d)) => enc_add(s, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("ADD requires two operands")),
             }
@@ -326,6 +363,14 @@ pub fn encode_instruction(
         "SUB" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
+                // `SUB #imm,<ea>` where the destination is not a data
+                // register is the SUBI instruction; the register form is
+                // handled by enc_sub itself.
+                (Some(Operand::Immediate(v)), Some(d))
+                    if !matches!(d, Operand::DataReg(_) | Operand::AddrReg(_)) =>
+                {
+                    enc_subi(*v, d, sz, pc + 4, cpu)
+                }
                 (Some(s), Some(d)) => enc_sub(s, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("SUB requires two operands")),
             }
@@ -431,6 +476,14 @@ pub fn encode_instruction(
         "AND" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
+                // `AND #imm,<ea>` where the destination is not a data
+                // register is the ANDI instruction; the register form is
+                // handled by enc_and itself.
+                (Some(Operand::Immediate(v)), Some(d))
+                    if !matches!(d, Operand::DataReg(_) | Operand::AddrReg(_)) =>
+                {
+                    enc_andi(*v, d, sz, pc + 4, cpu)
+                }
                 (Some(s), Some(d)) => enc_and(s, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("AND requires two operands")),
             }
@@ -438,6 +491,14 @@ pub fn encode_instruction(
         "OR" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
+                // `OR #imm,<ea>` where the destination is not a data
+                // register is the ORI instruction; the register form is
+                // handled by enc_or itself.
+                (Some(Operand::Immediate(v)), Some(d))
+                    if !matches!(d, Operand::DataReg(_) | Operand::AddrReg(_)) =>
+                {
+                    enc_ori(*v, d, sz, pc + 4, cpu)
+                }
                 (Some(s), Some(d)) => enc_or(s, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("OR requires two operands")),
             }
@@ -445,6 +506,10 @@ pub fn encode_instruction(
         "EOR" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
+                // `EOR #imm,<ea>` is EORI — same aliasing as CMP/CMPI
+                // above. EOR proper only takes Dn as its source, so an
+                // immediate would otherwise be rejected outright.
+                (Some(Operand::Immediate(v)), Some(d)) => enc_eori(*v, d, sz, pc + 4, cpu),
                 (Some(Operand::DataReg(rn)), Some(d)) => {
                     let src_op = Operand::DataReg(*rn);
                     enc_eor(&src_op, d, sz, pc + 4, cpu)
@@ -514,15 +579,23 @@ pub fn encode_instruction(
         | "lsr" | "rol" | "ror" | "roxl" | "roxr" => {
             let sz = size.unwrap_or("w");
             let mn = mnemonic.to_lowercase();
-            match dst {
-                Some(Operand::DataReg(rn)) => {
-                    if let Some(Operand::Immediate(n)) = src {
-                        enc_shift_reg(&mn, *n as u8, *rn, sz)
-                    } else {
-                        Err(AsmError::new("Shift requires count and Dn"))
-                    }
+            match (src, dst) {
+                // `<shift> #count,Dn` — immediate shift count.
+                (Some(Operand::Immediate(n)), Some(Operand::DataReg(rn))) => {
+                    enc_shift_reg(&mn, *n as u8, *rn, sz)
                 }
-                Some(d) => enc_shift_mem(&mn, d, "w", pc + 2, cpu),
+                // `<shift> Dm,Dn` — shift count taken from a register.
+                // Previously rejected outright ("Shift requires count and
+                // Dn"), even though it's the form loops use.
+                (Some(Operand::DataReg(count)), Some(Operand::DataReg(rn))) => {
+                    enc_shift_reg_count(&mn, *count, *rn, sz)
+                }
+                // `<shift> <ea>` — single-operand memory shift, always
+                // word-sized and by one. With only one operand the parser
+                // delivers it as `src`, so matching on `dst` alone missed
+                // it and produced "Shift requires destination operand".
+                (Some(d), None) | (None, Some(d)) => enc_shift_mem(&mn, d, "w", pc + 2, cpu),
+                (Some(_), Some(d)) => enc_shift_mem(&mn, d, "w", pc + 2, cpu),
                 _ => Err(AsmError::new("Shift requires destination operand")),
             }
         }
@@ -542,28 +615,68 @@ pub fn encode_instruction(
         // MOVE family
         "MOVE" => {
             let sz = size.unwrap_or("w");
-            // MOVE.W SR, Dn -> from SR
-            if let (Some(Operand::Immediate(-2)), Some(Operand::DataReg(rn))) = (src, dst) {
-                let op = 0x40C0 | (*rn as u16);
-                return Ok(vec![op]);
+            // MOVE SR,<ea> / MOVE <ea>,CCR / MOVE <ea>,SR accept a full
+            // effective address, not just Dn — `move.w sr,-(sp)` (0x40E7)
+            // and `move.w sr,(a0)` (0x40D0) are everywhere in Amiga code.
+            // Restricting these to a data register made every other
+            // destination fall through to the generic MOVE path, which
+            // treated the SR marker as an absolute address and emitted
+            // e.g. 0x3F3C FFFE for `move.w sr,-(sp)`.
+            if let (Some(Operand::Immediate(-2)), Some(d)) = (src, dst) {
+                let (mode, reg, ext) = crate::ea_encode::encode_ea(
+                    d,
+                    "w",
+                    pc + 2,
+                    m68k_core::ea_categories::ea::DATA_ALT,
+                    cpu,
+                )?;
+                let mut words = vec![0x40C0 | ((mode as u16) << 3) | (reg as u16)];
+                words.extend(ext);
+                return Ok(words);
             }
-            // MOVE.W Dn, CCR -> to CCR
-            if let (Some(Operand::DataReg(rn)), Some(Operand::Immediate(-1))) = (src, dst) {
-                let op = 0x44C0 | (*rn as u16);
-                return Ok(vec![op]);
+            if let (Some(s), Some(Operand::Immediate(-1))) = (src, dst) {
+                let (mode, reg, ext) = crate::ea_encode::encode_ea(
+                    s,
+                    "w",
+                    pc + 2,
+                    m68k_core::ea_categories::ea::DATA,
+                    cpu,
+                )?;
+                let mut words = vec![0x44C0 | ((mode as u16) << 3) | (reg as u16)];
+                words.extend(ext);
+                return Ok(words);
             }
-            // MOVE.W Dn, SR -> to SR
-            if let (Some(Operand::DataReg(rn)), Some(Operand::Immediate(-2))) = (src, dst) {
-                let op = 0x46C0 | (*rn as u16);
-                return Ok(vec![op]);
+            if let (Some(s), Some(Operand::Immediate(-2))) = (src, dst) {
+                let (mode, reg, ext) = crate::ea_encode::encode_ea(
+                    s,
+                    "w",
+                    pc + 2,
+                    m68k_core::ea_categories::ea::DATA,
+                    cpu,
+                )?;
+                let mut words = vec![0x46C0 | ((mode as u16) << 3) | (reg as u16)];
+                words.extend(ext);
+                return Ok(words);
+            }
+            // MOVE #imm,SR / MOVE #imm,CCR — the immediate forms, which
+            // are how interrupt levels are set all over Amiga code
+            // (`move.w #$2700,sr`). Without these the generic MOVE path
+            // treated the -1/-2 CCR/SR marker as an ordinary absolute
+            // destination address and emitted `39fc <imm> fffe`.
+            // verified against reference encodings: 0x46FC/0x44FC + immediate.
+            if let (Some(Operand::Immediate(v)), Some(Operand::Immediate(-2))) = (src, dst) {
+                return Ok(vec![0x46FC, *v as u16]);
+            }
+            if let (Some(Operand::Immediate(v)), Some(Operand::Immediate(-1))) = (src, dst) {
+                return Ok(vec![0x44FC, *v as u16]);
             }
             // MOVE.L An, USP -> from USP (0x4E60 | An)
-            // vasm convention: MOVE An,USP = move from USP to An
+            // Assembler convention: MOVE An,USP = move from USP to An
             if let (Some(Operand::AddrReg(rn)), Some(Operand::Immediate(0x800))) = (src, dst) {
                 return Ok(vec![0x4E60 | (*rn as u16)]);
             }
             // MOVE.L USP, An -> to USP (0x4E68 | An)
-            // vasm convention: MOVE USP,An = move An to USP
+            // Assembler convention: MOVE USP,An = move An to USP
             if let (Some(Operand::Immediate(0x800)), Some(Operand::AddrReg(rn))) = (src, dst) {
                 return Ok(vec![0x4E68 | (*rn as u16)]);
             }
@@ -602,6 +715,20 @@ pub fn encode_instruction(
         "CMP" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
+                // `CMP #imm,<ea>` with a non-register destination is the
+                // CMPI instruction. Motorola-syntax assemblers accept the
+                // CMP spelling and select CMPI, so rejecting it here
+                // ("destination must be a data register") failed on
+                // ordinary sources like `CMP.W #150,counter`.
+                //
+                // A data-register destination keeps the CMP encoding
+                // (`B87C xxxx`), which is what those assemblers emit and
+                // is one word shorter than the CMPI form.
+                (Some(Operand::Immediate(v)), Some(d))
+                    if !matches!(d, Operand::DataReg(_) | Operand::AddrReg(_)) =>
+                {
+                    enc_cmpi(*v, d, sz, pc + 4, cpu)
+                }
                 (Some(s), Some(d)) => enc_cmp(s, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("CMP requires two operands")),
             }
@@ -623,8 +750,13 @@ pub fn encode_instruction(
         "CMPM" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
-                (Some(Operand::AddrRegPostInc(rn1)), Some(Operand::AddrRegPostInc(rn2))) => {
-                    enc_cmpm(*rn1, *rn2, sz)
+                // `CMPM (Ay)+,(Ax)+` compares destination against source:
+                // Ax (the *second* operand) goes in opword bits 11-9 and
+                // Ay in bits 2-0, so the pair must be passed destination
+                // first. verified against reference encodings:
+                // `cmpm.w (a0)+,(a1)+` -> 0xB348, not 0xB149.
+                (Some(Operand::AddrRegPostInc(ay)), Some(Operand::AddrRegPostInc(ax))) => {
+                    enc_cmpm(*ax, *ay, sz)
                 }
                 _ => Err(AsmError::new("CMPM requires (An)+ operands")),
             }
@@ -648,9 +780,13 @@ pub fn encode_instruction(
         "ANDI" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
-                (Some(Operand::Immediate(v)), Some(Operand::Immediate(_))) => {
-                    // ANDI to CCR/SR
-                    enc_andi_sr(*v as u16)
+                // -1 marks CCR and -2 marks SR (see parse_operand_text);
+                // matching any immediate meant both used the same opcode.
+                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-1))) => {
+                    enc_andi_ccr_sr(*v as u16, false)
+                }
+                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-2))) => {
+                    enc_andi_ccr_sr(*v as u16, true)
                 }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_andi(*v, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("ANDI requires immediate and destination")),
@@ -659,7 +795,12 @@ pub fn encode_instruction(
         "ORI" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
-                (Some(Operand::Immediate(v)), Some(Operand::Immediate(_))) => enc_ori_sr(*v as u16),
+                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-1))) => {
+                    enc_ori_ccr_sr(*v as u16, false)
+                }
+                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-2))) => {
+                    enc_ori_ccr_sr(*v as u16, true)
+                }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_ori(*v, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("ORI requires immediate and destination")),
             }
@@ -667,8 +808,11 @@ pub fn encode_instruction(
         "EORI" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
-                (Some(Operand::Immediate(v)), Some(Operand::Immediate(_))) => {
-                    enc_eori_sr(*v as u16)
+                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-1))) => {
+                    enc_eori_ccr_sr(*v as u16, false)
+                }
+                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-2))) => {
+                    enc_eori_ccr_sr(*v as u16, true)
                 }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_eori(*v, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("EORI requires immediate and destination")),
@@ -706,18 +850,24 @@ pub fn encode_instruction(
 
         // SBCD/ABCD
         "SBCD" => match (src, dst) {
-            (Some(Operand::DataReg(rn1)), Some(Operand::DataReg(rn2))) => enc_sbcd_reg(*rn1, *rn2),
-            (Some(Operand::AddrRegPostInc(rn1)), Some(Operand::AddrRegPostInc(rn2))) => {
-                enc_sbcd_mem(*rn1, *rn2)
+            (Some(Operand::DataReg(dy)), Some(Operand::DataReg(dx))) => enc_sbcd_reg(*dx, *dy),
+            (Some(Operand::AddrRegPreDec(ay)), Some(Operand::AddrRegPreDec(ax))) => {
+                enc_sbcd_mem(*ax, *ay)
             }
-            _ => Err(AsmError::new("SBCD requires Dn or (An)+ operands")),
+            _ => Err(AsmError::new("SBCD requires Dn,Dn or -(An),-(An) operands")),
         },
+        // ABCD/SBCD take either `Dy,Dx` or the *predecrement* memory form
+        // `-(Ay),-(Ax)` — not postincrement, which was accepted before and
+        // meant `abcd -(a0),-(a1)` was rejected outright. In both forms Rx
+        // (the second operand) occupies opword bits 11-9 and Ry the low
+        // three bits, so the pair is passed destination-first. Verified
+        // against reference encodings: `abcd -(a0),-(a1)` -> 0xC308.
         "ABCD" => match (src, dst) {
-            (Some(Operand::DataReg(rn1)), Some(Operand::DataReg(rn2))) => enc_abcd_reg(*rn1, *rn2),
-            (Some(Operand::AddrRegPostInc(rn1)), Some(Operand::AddrRegPostInc(rn2))) => {
-                enc_abcd_mem(*rn1, *rn2)
+            (Some(Operand::DataReg(dy)), Some(Operand::DataReg(dx))) => enc_abcd_reg(*dx, *dy),
+            (Some(Operand::AddrRegPreDec(ay)), Some(Operand::AddrRegPreDec(ax))) => {
+                enc_abcd_mem(*ax, *ay)
             }
-            _ => Err(AsmError::new("ABCD requires Dn or (An)+ operands")),
+            _ => Err(AsmError::new("ABCD requires Dn,Dn or -(An),-(An) operands")),
         },
 
         // NBCD/TAS
@@ -1022,7 +1172,7 @@ pub fn encode_instruction(
         "PFLUSHA" => enc_pflusha(cpu),
         "PFLUSHAN" => enc_pflushan(cpu),
 
-        // PFLUSHN base verified against real `vasm -m68040` output for
+        // PFLUSHN base verified against reference output for
         // `pflushn (a0)` -> F500 (opmode 00 in the 68040 PFLUSH family's
         // bits 4-3, register in bits 2-0). The previous 0xF518 didn't match
         // any of that family's four opmodes.
@@ -1046,33 +1196,37 @@ pub fn encode_instruction(
         },
 
         // Cache line ops (68040): CINVL/CINVP/CPUSHL/CPUSHP <cache>,(An),
-        // where <cache> is #1 (DC), #2 (IC), or #3 (BC) — matches the
-        // 2-bit scope field in the real encoding (verified against vasm).
-        "CINVL" => match (src, dst) {
-            (Some(Operand::Immediate(cache)), Some(a)) => enc_cache_line_op(false, *cache, a, cpu),
+        // where <cache> is the 2-bit scope field: NC=0, DC=1, IC=2, BC=3.
+        // Both `#1` and the conventional names (`cinvl dc,(a0)`) are
+        // accepted — the Motorola docs use the names, and
+        // they can't be resolved in the generic operand parser because
+        // `DC`/`BC` collide with the DC directive and with ordinary
+        // labels; here the mnemonic makes the context unambiguous.
+        "CINVL" => match (cache_scope(src), dst) {
+            (Some(cache), Some(a)) => enc_cache_line_op(false, cache, a, cpu),
             _ => Err(AsmError::new("CINVL requires #cache,(An)")),
         },
-        "CINVP" => match (src, dst) {
-            (Some(Operand::Immediate(cache)), Some(a)) => enc_cache_page_op(false, *cache, a, cpu),
+        "CINVP" => match (cache_scope(src), dst) {
+            (Some(cache), Some(a)) => enc_cache_page_op(false, cache, a, cpu),
             _ => Err(AsmError::new("CINVP requires #cache,(An)")),
         },
-        "CPUSHL" => match (src, dst) {
-            (Some(Operand::Immediate(cache)), Some(a)) => enc_cache_line_op(true, *cache, a, cpu),
+        "CPUSHL" => match (cache_scope(src), dst) {
+            (Some(cache), Some(a)) => enc_cache_line_op(true, cache, a, cpu),
             _ => Err(AsmError::new("CPUSHL requires #cache,(An)")),
         },
-        "CPUSHP" => match (src, dst) {
-            (Some(Operand::Immediate(cache)), Some(a)) => enc_cache_page_op(true, *cache, a, cpu),
+        "CPUSHP" => match (cache_scope(src), dst) {
+            (Some(cache), Some(a)) => enc_cache_page_op(true, cache, a, cpu),
             _ => Err(AsmError::new("CPUSHP requires #cache,(An)")),
         },
 
         // CINVA/CPUSHA <cache> (no address register — verified against
-        // vasm: `cinva bc`/`cinva ic`/`cinva dc` take only a cache scope).
-        "CINVA" => match src.or(dst) {
-            Some(Operand::Immediate(cache)) => enc_cinva(*cache, cpu),
+        // Reference encoding: `cinva bc`/`cinva ic`/`cinva dc` take only a cache scope).
+        "CINVA" => match cache_scope(src.or(dst)) {
+            Some(cache) => enc_cinva(cache, cpu),
             _ => Err(AsmError::new("CINVA requires #cache")),
         },
-        "CPUSHA" => match src.or(dst) {
-            Some(Operand::Immediate(cache)) => enc_cpusha(*cache, cpu),
+        "CPUSHA" => match cache_scope(src.or(dst)) {
+            Some(cache) => enc_cpusha(cache, cpu),
             _ => Err(AsmError::new("CPUSHA requires #cache")),
         },
 
@@ -1157,8 +1311,8 @@ mod tests {
     }
 
     #[test]
-    fn test_bfextu_matches_vasm_reference() {
-        // Verified against real `vasm -m68020` output for
+    fn test_bfextu_matches_reference() {
+        // verified against reference output for
         // `bfextu d1{d2:d3},d4`.
         let bf = Operand::Bitfield(
             Box::new(Operand::DataReg(1)),
@@ -1205,8 +1359,8 @@ mod tests {
     }
 
     #[test]
-    fn test_bfffo_matches_vasm_reference() {
-        // Verified against real `vasm -m68020` output for
+    fn test_bfffo_matches_reference() {
+        // verified against reference output for
         // `bfffo d2{8:d5},d3`.
         let bf = Operand::Bitfield(
             Box::new(Operand::DataReg(2)),
@@ -1219,8 +1373,8 @@ mod tests {
     }
 
     #[test]
-    fn test_bfchg_matches_vasm_reference() {
-        // Verified against real `vasm -m68020` output for `bfchg d1{d2:16}`.
+    fn test_bfchg_matches_reference() {
+        // verified against reference output for `bfchg d1{d2:16}`.
         let bf = Operand::Bitfield(
             Box::new(Operand::DataReg(1)),
             Box::new(BitfieldSpec::DataReg(2)),
@@ -1320,14 +1474,14 @@ mod tests {
 
     #[test]
     fn test_encode_trapcc_eq() {
-        // vasm: trapeq -> 0x57FC
+        // Reference encoding: trapeq -> 0x57FC
         let words = encode_instruction("TRAPEQ", None, None, None, 0, "68020").unwrap();
         assert_eq!(words, vec![0x57FC]);
     }
 
     #[test]
     fn test_encode_trapcc_ne_word() {
-        // vasm: trapne.w #$1234 -> 0x56FA, 0x1234
+        // Reference encoding: trapne.w #$1234 -> 0x56FA, 0x1234
         let src = Operand::Immediate(0x1234);
         let words = encode_instruction("TRAPNE", Some("w"), Some(&src), None, 0, "68020").unwrap();
         assert_eq!(words, vec![0x56FA, 0x1234]);
@@ -1364,7 +1518,7 @@ mod tests {
         assert!(encode_instruction("EXTB", None, Some(&src), None, 0, "68000").is_err());
     }
 
-    // FPU dispatcher tests. Reference bytes verified against real `vasm -m68040` output
+    // FPU dispatcher tests. Reference bytes verified against reference output
     // unless noted otherwise.
 
     #[test]
@@ -1412,7 +1566,7 @@ mod tests {
     fn test_dispatch_fmovem_range_to_predec_bugfix() {
         // fmovem fp0-fp3,-(a7): a pure range without a '/' - the parser must
         // recognize this form, not just slash-separated lists.
-        // vasm: fmovem fp0-fp3,-(a7) -> f227e00f
+        // Reference encoding: fmovem fp0-fp3,-(a7) -> f227e00f
         let src = Operand::Immediate(0b1111);
         let dst = Operand::AddrRegPreDec(7);
         let words = encode_instruction("FMOVEM", None, Some(&src), Some(&dst), 0, "68020").unwrap();
@@ -1428,7 +1582,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_fdbeq() {
-        // vasm: fdbeq d0,$1010 (at pc=$1000) -> f2480001000c
+        // Reference encoding: fdbeq d0,$1010 (at pc=$1000) -> f2480001000c
         let src = Operand::DataReg(0);
         let dst = Operand::Address(0x1010);
         let words =
@@ -1445,7 +1599,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_ftrapeq_no_operand() {
-        // vasm: ftrapeq -> f27c0001
+        // Reference encoding: ftrapeq -> f27c0001
         let words = encode_instruction("FTRAPEQ", None, None, None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF27C, 0x0001]);
     }
@@ -1476,7 +1630,7 @@ mod tests {
 
     #[test]
     fn test_dispatch_fsincos_via_ex() {
-        // vasm: fsincos fp1,fp2:fp3 -> f20005b2
+        // Reference encoding: fsincos fp1,fp2:fp3 -> f20005b2
         let src = Operand::FpReg(1);
         let cos = Operand::FpReg(2);
         let sin = Operand::FpReg(3);
