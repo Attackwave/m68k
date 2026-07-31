@@ -115,6 +115,46 @@ m68k-asm hello.s -f hunk-exe -o hello         # Amiga Hunk executable (LoadSeg()
 - `-l`/`--listing <file>` — write an address/bytes/source listing.
 - `--sym <file>` — export the resolved symbol table.
 - `--map <file>` — export a memory map (address ranges per instruction).
+- `-I`, `--include <dir>` — add a directory to the `INCLUDE` search path (repeatable). Needed for sources that include the Amiga system headers by their logical path, e.g. `include 'exec/types.i'`.
+- `--optimize` — enable size-changing optimizations (see below). Off by default.
+
+#### Optimization
+
+By default the assembler emits the same encoding a Motorola-syntax
+assembler produces *without* optimization:
+
+- an absolute address is encoded long unless the source writes `.W`;
+- an unsuffixed branch uses the 16-bit displacement form.
+
+`--optimize` shortens both where the value fits — an absolute address
+that fits in 16 bits becomes absolute-short, and a branch in range
+becomes the 8-bit form. An explicit `.W`/`.L` or `.S`/`.B` suffix is
+always honoured and overrides both modes.
+
+```asm
+    MOVE.W  $1234,D0        ; default: 3039 00001234   --optimize: 3038 1234
+    MOVE.W  $1234.W,D0      ; always:  3038 1234
+    BRA     loop            ; default: 6000 fffc       --optimize: 60fc
+    BRA.S   loop            ; always:  60fc
+```
+
+#### Syntax notes
+
+The assembler accepts the conventions shared by vasm, Devpac, PhxAss and
+ASM-One:
+
+- **Local labels** — a label starting with `.` is scoped to the preceding
+  global label, so `.loop` may repeat once per subroutine.
+- **Labels without a colon** when written in column 1.
+- **`*` as a comment marker** where an operand cannot continue, while
+  keeping its meaning as multiply (`WIDTH*HEIGHT`) and as the current PC
+  (`BRA *`, `DC.L *+4`).
+- **`IFD`/`IFND`/`ENDC`** as spellings of `IFDEF`/`IFNDEF`/`ENDIF`.
+- **Optional macro arguments** — an argument the invocation omits
+  substitutes to the empty string, so the usual `IFC '\1',''` idiom works.
+- **Include-once** — a file is spliced in at most once per assembly, which
+  is what the `IFND FOO_I` guards in the Amiga headers are written to
+  achieve.
 
 `m68k-asm -f elf` output has been checked against `readelf -a` for
 structural validity. `m68k-asm -f ieee695` output has been checked against
@@ -173,6 +213,25 @@ m68k-floppy --bootblock roms/game.adf > bootblock.bin
 | Extended ADF | `adf` | Larger images with more sectors per track |
 | UAE-0/1ADF | `uae` | Raw MFM bitstream per track (copy-protected disks) |
 | IPF | `native` | Clean-room IPF parser with MFM bitstream decoding |
+
+### AmigaDOS filesystem (OFS/FFS)
+
+`m68k-floppy` reads the filesystem on a disk image, at any directory
+depth — paths are slash-separated and matched case-insensitively:
+
+```bash
+m68k-floppy disk.adf --list                     # root directory
+m68k-floppy disk.adf --list C                   # one subdirectory
+m68k-floppy disk.adf --list-all                 # whole tree, full paths
+m68k-floppy disk.adf --extract C/List -o List   # one file, by path
+m68k-floppy disk.adf --extract-all ./out        # everything, tree preserved
+m68k-floppy disk.adf --fix-bootblock            # repair bootblock checksum
+```
+
+Verified against all eight Workbench 1.3 and 3.1 disks: 981 files extract
+at their exact recorded length. Writing to a filesystem is not supported —
+`adf_writer` can create empty, mountable OFS/FFS images and repair
+bootblock checksums, but file creation is not implemented.
 
 ---
 
