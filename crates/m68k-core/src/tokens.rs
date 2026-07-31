@@ -204,27 +204,34 @@ fn find_star_comment(line: &str) -> Option<usize> {
         return Some(0);
     }
 
-    let bytes = line.as_bytes();
+    // Iterate by character, tracking the preceding one: a byte-indexed
+    // walk would slice mid-codepoint on non-ASCII input, which real
+    // sources do contain (comments and string literals in Latin-1 or
+    // UTF-8) and which a fuzzer finds immediately.
     let mut in_quote = false;
-    let mut quote_char = 0u8;
+    let mut quote_char = '\0';
+    let mut prev: Option<char> = None;
     for (i, ch) in line.char_indices() {
-        let b = bytes[i];
         if in_quote {
-            if b == quote_char {
+            if ch == quote_char {
                 in_quote = false;
             }
+            prev = Some(ch);
             continue;
         }
-        if b == b'"' || b == b'\'' {
+        if ch == '"' || ch == '\'' {
             in_quote = true;
-            quote_char = b;
+            quote_char = ch;
+            prev = Some(ch);
             continue;
         }
         if ch != '*' || i == 0 {
+            prev = Some(ch);
             continue;
         }
         // Must follow whitespace: `A*2` is a multiply.
-        if !bytes[i - 1].is_ascii_whitespace() {
+        if !prev.is_some_and(|p| p.is_whitespace()) {
+            prev = Some(ch);
             continue;
         }
         // Whitespace *before* the star is necessary but not sufficient —
@@ -239,10 +246,14 @@ fn find_star_comment(line: &str) -> Option<usize> {
         // `[` matters specifically because the Amiga headers document
         // optional macro parameters as `* [baseOffset]`; treating that as
         // a parameter list left `\1` unsubstituted in the macro body.
-        let rest = line[i + 1..].trim_start();
+        // `*` is one byte, so `i + len_utf8()` is a valid boundary.
+        let rest = line[i + ch.len_utf8()..].trim_start();
         match rest.chars().next() {
             Some(c) if c.is_alphabetic() || c == '[' || c == '_' => return Some(i),
-            _ => continue,
+            _ => {
+                prev = Some(ch);
+                continue;
+            }
         }
     }
     None
