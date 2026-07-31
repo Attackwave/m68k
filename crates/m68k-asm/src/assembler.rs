@@ -1539,10 +1539,15 @@ fn parse_opt_flag(entry: &str) -> Option<(char, Option<u32>, bool)> {
         return None;
     }
     let rest: String = chars.collect();
-    let (digits, sign) = rest.split_at(rest.len().checked_sub(1)?);
+    // Split off the final *character*, not the final byte: `rest.len()`
+    // counts bytes, so a multi-byte trailing character (any non-ASCII
+    // input reaches here — `OPT` takes arbitrary source text) made
+    // `split_at` land mid-codepoint and panic.
+    let sign = rest.chars().next_back()?;
+    let digits = &rest[..rest.len() - sign.len_utf8()];
     let enabled = match sign {
-        "+" => true,
-        "-" => false,
+        '+' => true,
+        '-' => false,
         _ => return None,
     };
     let number = if digits.is_empty() {
@@ -5910,6 +5915,61 @@ field2 DS.W 1
         let mut asm = Assembler::new(0x1000);
         asm.assemble("    OPT O+\nOPT O-\n").unwrap();
         assert_eq!(asm.opt.flags.get(&'O'), Some(&false));
+    }
+
+    /// Regression: `parse_opt_flag` split off the trailing *byte* rather
+    /// than the trailing character, so a multi-byte character at the end
+    /// of an `OPT` entry made `split_at` land mid-codepoint and panic.
+    ///
+    /// Found by the `assembler_pipeline` fuzz target. `OPT` takes
+    /// arbitrary source text, so any non-ASCII byte sequence reaches it —
+    /// this must be a clean rejection, never a crash.
+    #[test]
+    fn test_opt_non_ascii_entry_does_not_panic() {
+        for entry in ["Oä", "W5ä", "ä+", "é", "O\u{FFFD}", "\u{1F600}-"] {
+            let mut asm = Assembler::new(0x1000);
+            let result = asm.assemble(&format!("    OPT {}\n", entry));
+            assert!(
+                result.is_ok(),
+                "OPT {:?} should be rejected cleanly, got {:?}",
+                entry,
+                result.err()
+            );
+        }
+
+        // The exact fuzzer-found input, byte for byte.
+        let source = String::from_utf8_lossy(&[
+            111, 112, 116, 13, 112, 116, 13, 38, 70, 55, 255, 255, 255, 255, 255, 83, 1, 0, 0, 0,
+            255, 255,
+        ])
+        .into_owned();
+        let mut asm = Assembler::new(0x1000);
+        asm.set_cpu("68010");
+        let _ = asm.assemble_bytes(&source);
+    }
+
+    /// Regression: the star-comment scan walked the line by byte index
+    /// while iterating characters, so a multi-byte character adjacent to
+    /// a `*` sliced mid-codepoint. Sources legitimately carry non-ASCII
+    /// text in comments and string literals.
+    #[test]
+    fn test_star_comment_scan_handles_non_ascii() {
+        for line in [
+            "    MOVE.W  #1,D0   * Grüße aus Köln",
+            "    DC.B    'äöü'   * comment",
+            "SIZE EQU WIDTH*HÖHE",
+            "    DC.B    \"日本語\"",
+            "* Überschrift",
+        ] {
+            // Must not panic; the exact split is asserted elsewhere.
+            let _ = m68k_core::tokens::split_line(line);
+        }
+
+        // A star comment after non-ASCII text is still recognised.
+        let (_, mnemonic, _, operands) =
+            m68k_core::tokens::split_line("    MOVE.W  #1,D0   * Grüße");
+        assert_eq!(mnemonic, "move");
+        assert_eq!(operands, vec!["#1", "D0"]);
     }
 
     #[test]
