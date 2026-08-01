@@ -39,8 +39,22 @@ pub mod ea {
     pub const CONTROL: u16 = AREG_IND | AREG_DISP | AINDEXED | ABSW | ABSL | PCDISP | PCINDEXED;
     pub const ALTERABLE_MEMORY: u16 =
         AREG_IND | APOSTINC | APREDEC | AREG_DISP | AINDEXED | ABSW | ABSL;
-    /// Control addressing modes plus Dn (used by BFxxx source operands that allow read-modify-write).
-    pub const CONTROL_ALT: u16 = ALTERABLE_MEMORY;
+    /// Control alterable: the control modes minus the non-alterable ones.
+    ///
+    /// Per the PRM this is `Control ∩ Alterable`, i.e. `(An)`, `(d16,An)`,
+    /// `(d8,An,Xn)`, `(xxx).W`, `(xxx).L` — **without** `(An)+` and
+    /// `-(An)`, which are not control modes at all (they have no fixed
+    /// effective address), and without the PC-relative modes, which are
+    /// not alterable.
+    ///
+    /// This used to alias `ALTERABLE_MEMORY`, which does include `(An)+`
+    /// and `-(An)`. That made the bitfield instructions accept e.g.
+    /// `BFCLR (A0)+{0:8}` and emit bytes for it, where a reference
+    /// assembler rejects it — a bitfield has no defined starting point
+    /// under auto-increment/decrement. Callers that legitimately allow
+    /// predecrement on top (FMOVEM/FSAVE/FRESTORE) already OR in
+    /// `APREDEC` explicitly.
+    pub const CONTROL_ALT: u16 = AREG_IND | AREG_DISP | AINDEXED | ABSW | ABSL;
     /// Alterable memory modes plus Dn (used by e.g. CAS).
     pub const MEM_ALT: u16 = ALTERABLE_MEMORY | DREG;
     /// Alterable data addressing modes: Dn plus alterable memory, no PC-relative/immediate
@@ -95,6 +109,42 @@ mod tests {
         assert!(!ea_matches(0b101, 7, ea::ABSW));
         assert!(ea_matches(0b110, 7, ea::AINDEXED));
         assert!(!ea_matches(0b110, 7, ea::ABSL));
+    }
+
+    /// Regression: `CONTROL_ALT` aliased `ALTERABLE_MEMORY` and therefore
+    /// included `(An)+` and `-(An)`. Those are not control modes at all —
+    /// they have no fixed effective address — so "control alterable"
+    /// cannot contain them.
+    ///
+    /// The practical effect: the bitfield instructions accepted
+    /// `BFCLR (A0)+{0:8}` and emitted bytes for it, where a reference
+    /// assembler rejects it.
+    #[test]
+    fn test_control_alt_excludes_autoinc_and_predec() {
+        // Present: the control modes that are also alterable.
+        assert!(ea_matches(0b010, 0, ea::CONTROL_ALT), "(An)");
+        assert!(ea_matches(0b101, 0, ea::CONTROL_ALT), "(d16,An)");
+        assert!(ea_matches(0b110, 0, ea::CONTROL_ALT), "(d8,An,Xn)");
+        assert!(ea_matches(0b111, 0, ea::CONTROL_ALT), "(xxx).W");
+        assert!(ea_matches(0b111, 1, ea::CONTROL_ALT), "(xxx).L");
+
+        // Absent: not control modes.
+        assert!(!ea_matches(0b011, 0, ea::CONTROL_ALT), "(An)+");
+        assert!(!ea_matches(0b100, 0, ea::CONTROL_ALT), "-(An)");
+
+        // Absent: control but not alterable.
+        assert!(!ea_matches(0b111, 2, ea::CONTROL_ALT), "(d16,PC)");
+        assert!(!ea_matches(0b111, 3, ea::CONTROL_ALT), "(d8,PC,Xn)");
+
+        // Absent: registers and immediate.
+        assert!(!ea_matches(0b000, 0, ea::CONTROL_ALT), "Dn");
+        assert!(!ea_matches(0b001, 0, ea::CONTROL_ALT), "An");
+        assert!(!ea_matches(0b111, 4, ea::CONTROL_ALT), "#imm");
+
+        // ALTERABLE_MEMORY keeps them — the two are genuinely different
+        // categories and must not be aliased again.
+        assert!(ea_matches(0b011, 0, ea::ALTERABLE_MEMORY), "(An)+");
+        assert!(ea_matches(0b100, 0, ea::ALTERABLE_MEMORY), "-(An)");
     }
 
     #[test]

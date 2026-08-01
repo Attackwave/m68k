@@ -149,6 +149,24 @@ pub fn enc_pflush(
     Ok(words)
 }
 
+/// Encode the two-operand `PFLUSH #fc,#mask` (68030) — flush by function
+/// code and mask, without an effective address.
+///
+/// Same fields as [`enc_pflush`], but the extension word's mode (bits
+/// 12-10) is `100` rather than `110` and the opword carries no EA. This form was rejected
+/// outright ("PFLUSH requires #fc,#mask,<ea>"), even though it is the
+/// plain "flush these FC entries" spelling.
+///
+/// Reference encodings: `PFLUSH #0,#0` -> F000 3010,
+/// `PFLUSH #2,#0` -> F000 3012, `PFLUSH #0,#4` -> F000 3090,
+/// `PFLUSH #3,#7` -> F000 30F3.
+pub fn enc_pflush_no_ea(fc: i64, mask: i64, cpu: &str) -> Result<Vec<u16>, AsmError> {
+    check_cpu(cpu, "68030")?;
+    let fc_field = 0b10_000 | ((fc as u16) & 0x7);
+    let ext = (0b001 << 13) | (0b100 << 10) | (((mask as u16) & 0x7) << 5) | fc_field;
+    Ok(vec![0xF000, ext])
+}
+
 /// Encode PFLUSHA (68030): flush all ATC entries (mode `001`, no EA/FC/mask).
 ///
 /// verified against reference output: `F000 2400`. The previous
