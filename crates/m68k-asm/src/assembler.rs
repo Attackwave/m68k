@@ -843,6 +843,15 @@ fn parse_parens_disp_register(text: &str, symbols: &SymbolTable, pc: u32) -> Opt
             let disp_str = inner[..pos].trim();
             let reg_str = inner[pos + 1..].trim();
 
+            // `(An,Xn)` — an address register in the *first* position makes
+            // this the indexed form, not a displacement. Falling through to
+            // the dot-notation branch below read `(A0,A1.L)` as base A1 with
+            // displacement "A0" (evaluating to 0), silently dropping the
+            // index register.
+            if matches!(parse_register(disp_str), Some(Operand::AddrReg(_))) {
+                return None;
+            }
+
             // Check for indexed: An.Xn (dot notation)
             if let Some(dot_pos) = reg_str.find('.') {
                 let reg_part = &reg_str[..dot_pos];
@@ -927,20 +936,24 @@ fn parse_parens_disp_reg_index(
     if trimmed.starts_with('(') && trimmed.ends_with(')') {
         let inner = &trimmed[1..trimmed.len() - 1];
         let parts: Vec<&str> = inner.split(',').collect();
-        if parts.len() >= 3 {
-            let disp_str = parts[0].trim();
-            let an_str = parts[1].trim();
-            let xn_full = parts[2].trim();
 
-            if let Some(Operand::AddrReg(an)) = parse_register(an_str) {
-                let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
-                if let Some(reg) = parse_register(&xn_name)
-                    && let Some(xn) = index_reg_num(&reg)
-                {
-                    let disp = evaluate_displacement(disp_str, symbols, pc);
-                    let disp_i8 = (disp & 0xFF) as i8;
-                    return Some((an, xn, disp_i8, scale, is_long));
-                }
+        // `(An,Xn)` — the displacement may be omitted entirely, meaning 0.
+        // This spelling is common in hand-written and generated Amiga code
+        // and was rejected outright; only `(0,An,Xn)` parsed.
+        let (disp_str, an_str, xn_full) = match parts.len() {
+            2 => ("0", parts[0].trim(), parts[1].trim()),
+            n if n >= 3 => (parts[0].trim(), parts[1].trim(), parts[2].trim()),
+            _ => return None,
+        };
+
+        if let Some(Operand::AddrReg(an)) = parse_register(an_str) {
+            let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
+            if let Some(reg) = parse_register(&xn_name)
+                && let Some(xn) = index_reg_num(&reg)
+            {
+                let disp = evaluate_displacement(disp_str, symbols, pc);
+                let disp_i8 = (disp & 0xFF) as i8;
+                return Some((an, xn, disp_i8, scale, is_long));
             }
         }
     }
@@ -4874,6 +4887,54 @@ MYDEF EQU 42
         assert!(result.is_ok(), "assembly failed: {:?}", result.err());
         assert_eq!(asm.code.len(), 1);
         assert_eq!(asm.code[0].words, vec![0x4E75]);
+    }
+
+    /// Regression: `(An,Xn)` without a displacement was rejected — only
+    /// the explicit `(0,An,Xn)` spelling parsed — and `(A0,A1.L)` was
+    /// misread as a displacement form, silently dropping the index
+    /// register.
+    ///
+    /// Reference encodings: `MOVE.W (A4,D2.W),(A1)+` -> 32F4 2000,
+    /// `MOVE.W (A0,A1.L),D0` -> 3030 9800.
+    #[test]
+    fn test_indexed_ea_without_displacement() {
+        let mut asm = Assembler::new(0);
+        let bytes = asm
+            .assemble_bytes("    MOVE.W  (A4,D2.W),(A1)+\n")
+            .expect("(An,Xn) without displacement must parse");
+        assert_eq!(bytes, vec![0x32, 0xF4, 0x20, 0x00]);
+
+        // An address register as the index, with an explicit size.
+        let mut asm = Assembler::new(0);
+        let bytes = asm
+            .assemble_bytes("    MOVE.W  (A0,A1.L),D0\n")
+            .expect("(An,An.L) must keep the index register");
+        assert_eq!(bytes, vec![0x30, 0x30, 0x98, 0x00]);
+
+        // The displacement form is unaffected: MOVE.W (4,A0),D0 -> 3028 0004.
+        let mut asm = Assembler::new(0);
+        let bytes = asm.assemble_bytes("    MOVE.W  (4,A0),D0\n").unwrap();
+        assert_eq!(bytes, vec![0x30, 0x28, 0x00, 0x04]);
+    }
+
+    /// Regression: ADD/SUB/CMP restricted their source EA to `DATA`,
+    /// which excludes address registers — but `An` is a valid source at
+    /// word and long size. `SUB.L A1,D1` failed with "addressing mode not
+    /// allowed". Only the byte forms exclude it.
+    ///
+    /// Reference encodings: SUB.L A1,D1 -> 9289, CMP.W A3,D3 -> B64B,
+    /// ADD.L A2,D2 -> D48A.
+    #[test]
+    fn test_address_register_as_arithmetic_source() {
+        let mut asm = Assembler::new(0);
+        let bytes = asm
+            .assemble_bytes("    SUB.L  A1,D1\n    CMP.W  A3,D3\n    ADD.L  A2,D2\n")
+            .expect("An is a valid word/long source for ADD/SUB/CMP");
+        assert_eq!(bytes, vec![0x92, 0x89, 0xB6, 0x4B, 0xD4, 0x8A]);
+
+        // Byte size still rejects it, as the PRM requires.
+        let mut asm = Assembler::new(0);
+        assert!(asm.assemble_bytes("    ADD.B  A1,D1\n").is_err());
     }
 
     /// Local labels (`.loop`) are scoped to the preceding global label, so

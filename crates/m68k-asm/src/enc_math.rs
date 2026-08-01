@@ -29,7 +29,16 @@ pub fn enc_add(
 
     // EA to Dn form
     if let Operand::DataReg(dst_reg) = dst {
-        let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, DATA, cpu)?;
+        // An is a valid source for ADD/SUB/CMP at word and long size
+        // (only the byte forms exclude it), so the category is ALL with
+        // an explicit size check rather than DATA, which dropped
+        // `SUB.L A1,D1` with "addressing mode not allowed".
+        if size.eq_ignore_ascii_case("b") && matches!(src, Operand::AddrReg(_)) {
+            return Err(AsmError::new(
+                "address register is not a valid byte-size source",
+            ));
+        }
+        let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, ALL, cpu)?;
         let op = 0xD000
             | ((size_code as u16) << 6)
             | ((*dst_reg as u16) << 9)
@@ -83,7 +92,16 @@ pub fn enc_sub(
     }
 
     if let Operand::DataReg(dst_reg) = dst {
-        let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, DATA, cpu)?;
+        // An is a valid source for ADD/SUB/CMP at word and long size
+        // (only the byte forms exclude it), so the category is ALL with
+        // an explicit size check rather than DATA, which dropped
+        // `SUB.L A1,D1` with "addressing mode not allowed".
+        if size.eq_ignore_ascii_case("b") && matches!(src, Operand::AddrReg(_)) {
+            return Err(AsmError::new(
+                "address register is not a valid byte-size source",
+            ));
+        }
+        let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, ALL, cpu)?;
         let op = 0x9000
             | ((size_code as u16) << 6)
             | ((*dst_reg as u16) << 9)

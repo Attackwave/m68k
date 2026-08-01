@@ -42,9 +42,11 @@ pub fn enc_and(
         return Ok(words);
     }
     if let Operand::DataReg(src_reg) = src {
+        // `AND Dn,<ea>`: opmode bit 8, size in bits 7-6 — see enc_or for
+        // the same fix. Base 0xC0C0 set the size bits instead of bit 8.
         let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALTERABLE_MEMORY, cpu)?;
         let mut words = vec![
-            0xC0C0
+            0xC100
                 | ((sz as u16) << 6)
                 | ((*src_reg as u16) << 9)
                 | ((dst_mode as u16) << 3)
@@ -83,9 +85,14 @@ pub fn enc_or(
         return Ok(words);
     }
     if let Operand::DataReg(src_reg) = src {
+        // `OR Dn,<ea>` is the opmode-bit-8 direction: base 0x8100, with
+        // the size in bits 7-6. The previous base 0x80C0 pre-set those
+        // size bits instead of bit 8, so it encoded the *other* direction
+        // at a bogus size — `or.b d0,-(a2)` came out as 0x80E2 rather
+        // than 0x8122. Same shape as ADD/SUB's memory direction.
         let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALTERABLE_MEMORY, cpu)?;
         let mut words = vec![
-            0x80C0
+            0x8100
                 | ((sz as u16) << 6)
                 | ((*src_reg as u16) << 9)
                 | ((dst_mode as u16) << 3)
@@ -109,7 +116,10 @@ pub fn enc_eor(
     let Operand::DataReg(src_reg) = src else {
         return Err(AsmError::new("EOR source must be a data register"));
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DREG, cpu)?;
+    // EOR writes to any alterable data destination, not just a data
+    // register — `EOR.W D1,(A0)` is ordinary code that the DREG-only
+    // category rejected with "addressing mode not allowed".
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALTERABLE_MEMORY | DREG, cpu)?;
     let mut words = vec![
         0xB100
             | ((sz as u16) << 6)
@@ -205,7 +215,21 @@ pub fn enc_shift_reg_count(
     ])
 }
 
-/// Encode ASL/ASR/LSL/LSR (memory) instruction.
+/// Encode the memory form of the shift/rotate instructions,
+/// `<shift> <ea>` — a one-bit shift of a single word in memory.
+///
+/// The opword layout differs from the register forms: the shift *type*
+/// lives in bits 10-9 and the direction in bit 8, giving
+/// `1110 0ttd 11mmmrrr`. There is no size field — the memory form always
+/// operates on a word, which is why bits 7-6 are the fixed `11` that
+/// distinguishes it from the register forms in the first place.
+///
+/// This previously reused the register-form bases (where the type sits in
+/// bits 4-3) and additionally OR'd in `size << 6`, so six of the eight
+/// mnemonics encoded wrongly and `ROXR`/`ROXL` collided with `ASR`/`ASL`.
+/// Reference encodings, all with `(a0)`:
+/// ASR `e0d0`, ASL `e1d0`, LSR `e2d0`, LSL `e3d0`,
+/// ROXR `e4d0`, ROXL `e5d0`, ROR `e6d0`, ROL `e7d0`.
 pub fn enc_shift_mem(
     mnemonic: &str,
     dst: &Operand,
@@ -213,20 +237,28 @@ pub fn enc_shift_mem(
     pc: u32,
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
-    let sz = size_code(size)?;
+    // Only word-sized memory shifts exist. Accept a missing suffix and an
+    // explicit `.w`; reject `.b`/`.l` rather than silently widening.
+    if !size.is_empty() && !size.eq_ignore_ascii_case("w") {
+        return Err(AsmError::new(format!(
+            "{} on memory is word-only (got size '{}')",
+            mnemonic.to_uppercase(),
+            size
+        )));
+    }
     let base = match mnemonic {
-        "asl" => 0xE1C0,
         "asr" => 0xE0C0,
-        "lsl" => 0xE1C8,
-        "lsr" => 0xE0C8,
-        "rol" => 0xE1D8,
-        "ror" => 0xE0D8,
-        "roxl" => 0xE1D0,
-        "roxr" => 0xE0D0,
+        "asl" => 0xE1C0,
+        "lsr" => 0xE2C0,
+        "lsl" => 0xE3C0,
+        "roxr" => 0xE4C0,
+        "roxl" => 0xE5C0,
+        "ror" => 0xE6C0,
+        "rol" => 0xE7C0,
         _ => return Err(AsmError::new("unknown shift mnemonic")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALTERABLE_MEMORY, cpu)?;
-    let mut words = vec![base | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16)];
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, "w", pc, ALTERABLE_MEMORY, cpu)?;
+    let mut words = vec![base | ((dst_mode as u16) << 3) | (dst_reg as u16)];
     words.extend(dst_ext);
     Ok(words)
 }
@@ -414,6 +446,112 @@ fn all_dreg(regs: &[&Operand]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression: the memory shift/rotate forms reused the register
+    /// forms' opcode bases, where the shift type sits in bits 4-3 rather
+    /// than bits 10-9, and additionally OR'd in a size field the memory
+    /// form doesn't have. Six of the eight mnemonics encoded wrongly and
+    /// ROXR/ROXL collided with ASR/ASL.
+    ///
+    /// Reference encodings, all with `(A0)`.
+    #[test]
+    fn test_memory_shifts_use_the_memory_opcode_layout() {
+        for (mnemonic, expected) in [
+            ("asr", 0xE0D0u16),
+            ("asl", 0xE1D0),
+            ("lsr", 0xE2D0),
+            ("lsl", 0xE3D0),
+            ("roxr", 0xE4D0),
+            ("roxl", 0xE5D0),
+            ("ror", 0xE6D0),
+            ("rol", 0xE7D0),
+        ] {
+            let words =
+                enc_shift_mem(mnemonic, &Operand::AddrRegIndirect(0), "w", 0, "68000").unwrap();
+            assert_eq!(
+                words,
+                vec![expected],
+                "{} (a0) should encode as {:04X}",
+                mnemonic,
+                expected
+            );
+        }
+
+        // No size field exists: a missing suffix is fine, .b/.l are not.
+        assert!(enc_shift_mem("lsr", &Operand::AddrRegIndirect(0), "", 0, "68000").is_ok());
+        assert!(enc_shift_mem("lsr", &Operand::AddrRegIndirect(0), "b", 0, "68000").is_err());
+        assert!(enc_shift_mem("lsr", &Operand::AddrRegIndirect(0), "l", 0, "68000").is_err());
+    }
+
+    /// Regression: `AND`/`OR` with a data-register source and a memory
+    /// destination used base 0x80C0/0xC0C0, which pre-sets the size bits
+    /// instead of the direction bit 8 — so the encoding came out as the
+    /// opposite direction at a bogus size. `OR.B D0,-(A2)` produced
+    /// 0x80E2 rather than 0x8122.
+    /// Regression: `AND`/`OR` with a data-register source and a memory
+    /// destination used base 0x80C0/0xC0C0, which pre-sets the size bits
+    /// instead of the direction bit 8 — so the encoding came out as the
+    /// opposite direction at a bogus size. `OR.B D0,-(A2)` produced
+    /// 0x80E2 rather than 0x8122.
+    #[test]
+    fn test_and_or_memory_destination_direction() {
+        // OR.B D0,-(A2) -> 8122
+        let words = enc_or(
+            &Operand::DataReg(0),
+            &Operand::AddrRegPreDec(2),
+            "b",
+            0,
+            "68000",
+        )
+        .unwrap();
+        assert_eq!(words, vec![0x8122]);
+
+        // AND.B D0,(A0) -> C110
+        let words = enc_and(
+            &Operand::DataReg(0),
+            &Operand::AddrRegIndirect(0),
+            "b",
+            0,
+            "68000",
+        )
+        .unwrap();
+        assert_eq!(words, vec![0xC110]);
+
+        // The <ea>,Dn direction is unaffected: OR.W (A0),D1 -> 8250.
+        let words = enc_or(
+            &Operand::AddrRegIndirect(0),
+            &Operand::DataReg(1),
+            "w",
+            0,
+            "68000",
+        )
+        .unwrap();
+        assert_eq!(words, vec![0x8250]);
+    }
+
+    /// Regression: `EOR` restricted its destination to `DREG`, rejecting
+    /// the perfectly ordinary memory forms with "addressing mode not
+    /// allowed". EOR writes to any alterable data destination.
+    #[test]
+    fn test_eor_accepts_memory_destination() {
+        // EOR.W D1,(A0) -> B350
+        let words = enc_eor(
+            &Operand::DataReg(1),
+            &Operand::AddrRegIndirect(0),
+            "w",
+            0,
+            "68000",
+        )
+        .unwrap();
+        assert_eq!(words, vec![0xB350]);
+
+        // Still valid against a data register: EOR.W D1,D2 -> B342
+        let words = enc_eor(&Operand::DataReg(1), &Operand::DataReg(2), "w", 0, "68000").unwrap();
+        assert_eq!(words, vec![0xB342]);
+
+        // An is not a valid EOR destination.
+        assert!(enc_eor(&Operand::DataReg(1), &Operand::AddrReg(0), "w", 0, "68000").is_err());
+    }
 
     /// Regression: BTST/BSET/BCLR/BCHG's memory-form EA category used to
     /// be `ALL` (0xFFFF), which check_ea previously treated as a blanket
