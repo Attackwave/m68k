@@ -423,6 +423,16 @@ fn parse_operand_text(
         return Ok(Operand::RegPair(ra, rb));
     }
 
+    // FPc:FPs register pair — FSINCOS's destination, written
+    // `FSINCOS.X <ea>,FPc:FPs`. Reuses `RegPair`, since the FP register
+    // number occupies the same field width; the mnemonic tells the
+    // encoder which register file the pair refers to.
+    if let Some((a, b)) = text.split_once(':')
+        && let (Some(fa), Some(fb)) = (parse_fp_reg(a.trim()), parse_fp_reg(b.trim()))
+    {
+        return Ok(Operand::RegPair(fa, fb));
+    }
+
     // Registers
     if let Some(reg) = parse_register(text) {
         return Ok(reg);
@@ -3085,9 +3095,12 @@ impl Assembler {
         // Handle 3-operand instructions (CAS, PACK, UNPK, PFLUSH, PTESTR/PTESTW)
         let words = match mnemonic_upper.as_str() {
             "PFLUSH" => {
-                if operand_texts.len() != 3 {
+                // Both spellings are valid: `#fc,#mask` flushes by function
+                // code alone, `#fc,#mask,<ea>` restricts it to one page.
+                // Requiring three operands rejected the shorter form.
+                if operand_texts.len() != 2 && operand_texts.len() != 3 {
                     return Err(AsmError::with_line(
-                        "PFLUSH takes exactly 3 operands: #fc,#mask,<ea>".to_string(),
+                        "PFLUSH takes #fc,#mask or #fc,#mask,<ea>".to_string(),
                         line.line_no,
                     ));
                 }
@@ -3113,10 +3126,15 @@ impl Assembler {
                         ));
                     }
                 };
-                let ea = parse_operand_text(&operand_texts[2], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                crate::enc_mmu::enc_pflush(fc, mask, &ea, pc + 2, &self.cpu)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+                if operand_texts.len() == 2 {
+                    crate::enc_mmu::enc_pflush_no_ea(fc, mask, &self.cpu)
+                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+                } else {
+                    let ea = parse_operand_text(&operand_texts[2], &self.symbols, pc)
+                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
+                    crate::enc_mmu::enc_pflush(fc, mask, &ea, pc + 2, &self.cpu)
+                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+                }
             }
             "PTESTR" | "PTESTW" => {
                 if operand_texts.len() != 3 && operand_texts.len() != 4 {
@@ -4972,6 +4990,49 @@ MYDEF EQU 42
         // Stored under qualified names, so neither shadows the other.
         assert_eq!(asm.symbols.resolve("routine_a.loop").unwrap(), 0x1002);
         assert_eq!(asm.symbols.resolve("routine_b.loop").unwrap(), 0x100A);
+    }
+
+    /// End-to-end regression for the four August-2026 audit fixes, each
+    /// verified against a reference assembler. These go through the full
+    /// parser + two-pass pipeline, not just the encoder, because two of
+    /// them (FSINCOS's `FPc:FPs`, PFLUSH's operand count) were blocked in
+    /// the parser rather than the encoder.
+    #[test]
+    fn test_audit_fixes_end_to_end() {
+        // MOVE from CCR — used to assemble to 303C FFFF (`MOVE.W #-1,D0`).
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68010");
+        let bytes = asm.assemble_bytes("    MOVE.W  CCR,D0\n").unwrap();
+        assert_eq!(bytes, vec![0x42, 0xC0]);
+
+        // FSINCOS with the colon spelling — used to be rejected.
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68040");
+        let bytes = asm.assemble_bytes("    FSINCOS.X  FP0,FP1:FP2\n").unwrap();
+        assert_eq!(bytes, vec![0xF2, 0x00, 0x01, 0x31]);
+
+        // PFLUSH without an EA — used to be rejected.
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68030");
+        let bytes = asm.assemble_bytes("    PFLUSH  #0,#0\n").unwrap();
+        assert_eq!(bytes, vec![0xF0, 0x00, 0x30, 0x10]);
+        // The three-operand form still works.
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68030");
+        let bytes = asm.assemble_bytes("    PFLUSH  #2,#4,(A0)\n").unwrap();
+        assert_eq!(bytes, vec![0xF0, 0x10, 0x38, 0x92]);
+
+        // CONTROL_ALT no longer admits (An)+ / -(An) for bitfields.
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68020");
+        assert!(
+            asm.assemble_bytes("    BFCLR  (A0)+{0:8}\n").is_err(),
+            "auto-increment is not a valid bitfield destination"
+        );
+        // The ordinary control form is unaffected.
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68020");
+        assert!(asm.assemble_bytes("    BFCLR  (A0){0:8}\n").is_ok());
     }
 
     /// `IFD`/`IFND`/`ENDC` are the Motorola spellings of

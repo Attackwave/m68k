@@ -634,6 +634,29 @@ pub fn encode_instruction(
                 words.extend(ext);
                 return Ok(words);
             }
+            // MOVE CCR,<ea> — the read direction (68010+). Must be tested
+            // before the `to CCR` arm below, since both match on the -1
+            // marker and only the operand position tells them apart.
+            //
+            // Without this arm the CCR marker fell through to the generic
+            // MOVE path, which treated `Immediate(-1)` as an ordinary
+            // immediate: `MOVE.W CCR,D0` silently assembled to 303C FFFF
+            // (`MOVE.W #-1,D0`) instead of 42C0.
+            if let (Some(Operand::Immediate(-1)), Some(d)) = (src, dst) {
+                if cpu == "68000" {
+                    return Err(AsmError::new("MOVE from CCR requires 68010 or later"));
+                }
+                let (mode, reg, ext) = crate::ea_encode::encode_ea(
+                    d,
+                    "w",
+                    pc + 2,
+                    m68k_core::ea_categories::ea::DATA_ALT,
+                    cpu,
+                )?;
+                let mut words = vec![0x42C0 | ((mode as u16) << 3) | (reg as u16)];
+                words.extend(ext);
+                return Ok(words);
+            }
             if let (Some(s), Some(Operand::Immediate(-1))) = (src, dst) {
                 let (mode, reg, ext) = crate::ea_encode::encode_ea(
                     s,
@@ -1242,12 +1265,27 @@ pub fn encode_instruction(
 
         // FSINCOS/PFLUSH/CAS/PACK/UNPK take 3 operands and must go through
         // encode_instruction_ex instead, since this function only carries two.
-        "FSINCOS" => Err(AsmError::new(
-            "FSINCOS requires 3 operands (src,FPcos,FPsin); use encode_instruction_ex",
-        )),
-        "PFLUSH" => Err(AsmError::new(
-            "PFLUSH requires 3 operands (#fc,#mask,<ea>); use encode_instruction_ex",
-        )),
+        // `FSINCOS.X <ea>,FPc:FPs` — the colon spelling every Motorola
+        // assembler uses. It arrives here as two operands (the pair is a
+        // single `RegPair`), so it is handled directly rather than being
+        // pushed to the 3-operand path, which only sees `src,FPc,FPs`.
+        "FSINCOS" => match (src, dst) {
+            (Some(s), Some(Operand::RegPair(cos_dst, sin_dst))) => {
+                enc_fsincos(s, *cos_dst, *sin_dst, size, pc + 2, cpu)
+            }
+            _ => Err(AsmError::new(
+                "FSINCOS requires src,FPc:FPs (or src,FPcos,FPsin)",
+            )),
+        },
+        // `PFLUSH #fc,#mask` — the two-operand form, without an EA.
+        // The three-operand `#fc,#mask,<ea>` spelling goes through
+        // encode_instruction_ex instead.
+        "PFLUSH" => match (src, dst) {
+            (Some(Operand::Immediate(fc)), Some(Operand::Immediate(mask))) => {
+                enc_pflush_no_ea(*fc, *mask, cpu)
+            }
+            _ => Err(AsmError::new("PFLUSH requires #fc,#mask or #fc,#mask,<ea>")),
+        },
         // CAS/CAS2/PACK/UNPK (68020+) are handled directly in assembler.rs's pass-2 dispatch
         // (they need raw operand text, or 3+ operands not representable by this signature).
 
@@ -1280,7 +1318,11 @@ pub fn encode_instruction_ex(
             (Some(Operand::Immediate(fc)), Some(Operand::Immediate(mask)), Some(ea_op)) => {
                 enc_pflush(*fc, *mask, ea_op, pc + 2, cpu)
             }
-            _ => Err(AsmError::new("PFLUSH requires #fc,#mask,<ea>")),
+            // Two operands: the no-EA form.
+            (Some(Operand::Immediate(fc)), Some(Operand::Immediate(mask)), None) => {
+                enc_pflush_no_ea(*fc, *mask, cpu)
+            }
+            _ => Err(AsmError::new("PFLUSH requires #fc,#mask or #fc,#mask,<ea>")),
         };
     }
     encode_instruction(mnemonic, size, src, dst, pc, cpu)
@@ -1297,6 +1339,131 @@ mod tests {
             .flat_map(|w| w.to_be_bytes())
             .map(|b| format!("{:02x}", b))
             .collect()
+    }
+
+    /// Regression: `MOVE from CCR` had no dispatch arm, so the CCR marker
+    /// (`Immediate(-1)`) fell through to the generic MOVE path, which
+    /// treated it as an ordinary immediate. `MOVE.W CCR,D0` silently
+    /// assembled to 303C FFFF (`MOVE.W #-1,D0`) instead of 42C0 — a
+    /// completely different instruction, with no error.
+    ///
+    /// Reference encodings: `MOVE.W CCR,D0` -> 42C0,
+    /// `MOVE.W CCR,(A0)` -> 42D0, `MOVE.W D0,CCR` -> 44C0.
+    #[test]
+    fn test_move_from_ccr() {
+        const CCR: Operand = Operand::Immediate(-1);
+
+        let words = encode_instruction(
+            "MOVE",
+            Some("w"),
+            Some(&CCR),
+            Some(&Operand::DataReg(0)),
+            0,
+            "68010",
+        )
+        .unwrap();
+        assert_eq!(words_to_bytes(&words), "42c0");
+
+        let words = encode_instruction(
+            "MOVE",
+            Some("w"),
+            Some(&CCR),
+            Some(&Operand::AddrRegIndirect(0)),
+            0,
+            "68010",
+        )
+        .unwrap();
+        assert_eq!(words_to_bytes(&words), "42d0");
+
+        // The write direction must keep working — both arms match on the
+        // same marker and are told apart only by operand position.
+        let words = encode_instruction(
+            "MOVE",
+            Some("w"),
+            Some(&Operand::DataReg(0)),
+            Some(&CCR),
+            0,
+            "68010",
+        )
+        .unwrap();
+        assert_eq!(words_to_bytes(&words), "44c0");
+
+        // MOVE from CCR is 68010+; on a 68000 it must be rejected rather
+        // than silently encoded.
+        assert!(
+            encode_instruction(
+                "MOVE",
+                Some("w"),
+                Some(&CCR),
+                Some(&Operand::DataReg(0)),
+                0,
+                "68000"
+            )
+            .is_err()
+        );
+    }
+
+    /// Regression: `FSINCOS <ea>,FPc:FPs` — the colon spelling every
+    /// Motorola assembler uses — was rejected outright; only a
+    /// three-operand `src,FPc,FPs` form existed, which no assembler
+    /// writes that way.
+    ///
+    /// Reference encoding: `FSINCOS.X FP0,FP1:FP2` -> F200 0131.
+    #[test]
+    fn test_fsincos_register_pair_syntax() {
+        let words = encode_instruction(
+            "FSINCOS",
+            Some("x"),
+            Some(&Operand::FpReg(0)),
+            // FPc:FPs arrives as a RegPair — cos in .0, sin in .1.
+            Some(&Operand::RegPair(1, 2)),
+            0,
+            "68040",
+        )
+        .unwrap();
+        assert_eq!(words_to_bytes(&words), "f2000131");
+    }
+
+    /// Regression: `PFLUSH #fc,#mask` (no EA) was rejected — only the
+    /// three-operand `#fc,#mask,<ea>` form existed. The two-operand form
+    /// has a different extension word: mode `100` at bits 12-10 rather
+    /// than `110`, and the opword carries no EA field.
+    ///
+    /// Reference encodings: `PFLUSH #0,#0` -> F000 3010,
+    /// `PFLUSH #2,#0` -> F000 3012, `PFLUSH #0,#4` -> F000 3090,
+    /// `PFLUSH #3,#7` -> F000 30F3.
+    #[test]
+    fn test_pflush_without_effective_address() {
+        for (fc, mask, expected) in [
+            (0i64, 0i64, "f0003010"),
+            (2, 0, "f0003012"),
+            (0, 4, "f0003090"),
+            (3, 7, "f00030f3"),
+        ] {
+            let words = encode_instruction(
+                "PFLUSH",
+                None,
+                Some(&Operand::Immediate(fc)),
+                Some(&Operand::Immediate(mask)),
+                0,
+                "68030",
+            )
+            .unwrap();
+            assert_eq!(words_to_bytes(&words), expected, "PFLUSH #{},#{}", fc, mask);
+        }
+
+        // 68030+ only.
+        assert!(
+            encode_instruction(
+                "PFLUSH",
+                None,
+                Some(&Operand::Immediate(0)),
+                Some(&Operand::Immediate(0)),
+                0,
+                "68020"
+            )
+            .is_err()
+        );
     }
 
     #[test]
