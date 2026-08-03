@@ -77,13 +77,14 @@ jobs:
         # the same class of bug that a 60s local run already found twice
         # while setting this up (a UTF-8 char-boundary panic in
         # tokens.rs, an OOM from an unbounded allocation in
-        # amiga_hunk.rs's Reader::bytes). ASAN_OPTIONS=symbolize=0 avoids
+        # amiga_hunk.rs's Reader::bytes; a 4 GB allocation and two
+        # unbounded pointer chains in amigados.rs). ASAN_OPTIONS=symbolize=0 avoids
         # a slow/blocking external symbolizer call on every newly
         # discovered coverage edge.
         env:
           ASAN_OPTIONS: symbolize=0
         run: |
-          for target in disassemble amiga_hunk_parse assembler_pipeline floppy_adf floppy_uae floppy_ipf; do
+          for target in disassemble amiga_hunk_parse assembler_pipeline floppy_adf floppy_uae floppy_ipf floppy_amigados; do
             echo "::group::fuzz $target"
             cargo fuzz run "$target" -- -max_total_time=60 -timeout=10
             echo "::endgroup::"
