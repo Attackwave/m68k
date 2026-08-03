@@ -28,14 +28,17 @@ m68k-disasm <binary-file> [options]
 
 ### Options
 
-- `file`: Path to the input binary file (use `-` for standard input).
-- `--org`/`--address`: Set origin base execution address (e.g. `0x1000`, `$1000`, or `4096`). Default is `0`.
-- `-x`, `--hex`/`--raw`: Include raw instruction hexadecimal bytes in the output.
-- `-a`, `--addr`: Include the absolute memory address column in the output.
-- `-u`, `--upper`: Force formatting of mnemonics and operands in uppercase.
-- `-s`, `--symbols`: Path to a custom symbol text file.
-- `-c`, `--cpu`: Target CPU limit for decoding (`68000`, `68010`, `68020`, `68030`, `68040`, `68060`). Default is `68060`.
-- `-out`, `--output`: Path to write the disassembly output (defaults to standard output).
+- `input`: Path to the input binary file. Use `-` to read the image from standard input.
+- `-a`, `--address`: Set the origin base execution address (e.g. `0x1000`, `$1000`, or `4096`). Default is `0`.
+- `-r`, `--raw`: Include raw instruction hexadecimal bytes in the output.
+- `-c`, `--cpu`: Target CPU limit for decoding (`68000`, `68010`, `68020`, `68030`, `68040`, `68060`). Default is `68000`.
+
+The disassembly is always written to standard output; the address column is
+always included. Redirect or pipe stdout to capture it:
+
+```bash
+m68k-asm hello.s -o - | m68k-disasm - --cpu 68020
+```
 
 ### Amiga Hunk executables
 
@@ -107,9 +110,9 @@ m68k-asm hello.s -f hunk-exe -o hello         # Amiga Hunk executable (LoadSeg()
 
 ### Options
 
-- `input`: Path to the input source file (use `-` for stdin).
-- `-o`, `--output`: Path to output binary file (required).
-- `-c`, `--cpu`: Target CPU model (`68000`, `68010`, `68020`, `68030`, `68040`, `68060`). Default is `68060`.
+- `input`: Path to the input source file. Use `-` to read the source from standard input; `-o` is then required, since there is no filename to derive an output path from. Relative `INCLUDE` paths resolve against the current directory in that case — pass `-I` for anything else.
+- `-o`, `--output`: Path to the output file. Use `-` to write to standard output (works for every format, including the binary ones). Defaults to the input name with a format-specific extension.
+- `-c`, `--cpu`: Target CPU model (`68000`, `68010`, `68020`, `68030`, `68040`, `68060`). Default is `68000`.
 - `--origin <addr>` — default origin if the source has no `ORG` (hex with `$` or `0x` prefix, or decimal).
 - `-f`, `--format`: Output format (`binary`, `srecord`, `intel-hex`, `elf`, `ieee695`, `hunk-exe`). Default is `binary`.
 - `-l`/`--listing <file>` — write an address/bytes/source listing.
