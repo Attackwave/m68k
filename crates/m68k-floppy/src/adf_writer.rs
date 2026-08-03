@@ -211,6 +211,76 @@ mod tests {
         }
     }
 
+    /// Regression: `read_file` sized its output buffer straight from the
+    /// header's byte_size field. A corrupt header claiming 0xFF000000
+    /// made it ask for 4 GB from a 901 KB image — found by the
+    /// `floppy_amigados` fuzz target as an OOM.
+    #[test]
+    fn test_read_file_rejects_size_larger_than_disk() {
+        let mut image = format_empty_ofs_disk("TEST").unwrap();
+        let total_blocks = image.len() / SECTOR_SIZE;
+
+        // Plant a file header claiming a preposterous size.
+        let hdr = 4usize;
+        let off = hdr * SECTOR_SIZE;
+        image[off..off + 4].copy_from_slice(&2i32.to_be_bytes()); // T_HEADER
+        image[off + 0x1FC..off + 0x200].copy_from_slice(&(-3i32).to_be_bytes()); // ST_FILE
+        image[off + 0x144..off + 0x148].copy_from_slice(&0xFF00_0000u32.to_be_bytes());
+
+        let mut reader = MemImage { data: image };
+        let mut fs = AmigaFs::mount(&mut reader, DD_TRACKS as u32).unwrap();
+        let err = fs.read_file(hdr as u32);
+        assert!(
+            err.is_err(),
+            "a file larger than the {}-block disk must be rejected, not allocated",
+            total_blocks
+        );
+    }
+
+    /// Regression: the directory hash chain was followed without a bound,
+    /// so a block whose hash_chain pointer refers back to itself looped
+    /// forever. Same shape as the file extension-block chain.
+    #[test]
+    fn test_cyclic_hash_chain_terminates() {
+        let mut image = format_empty_ofs_disk("TEST").unwrap();
+        let root_off = (image.len() / SECTOR_SIZE / 2) * SECTOR_SIZE;
+
+        // A directory header that points its hash chain at itself.
+        let hdr = 4u32;
+        let off = hdr as usize * SECTOR_SIZE;
+        image[off..off + 4].copy_from_slice(&2i32.to_be_bytes()); // T_HEADER
+        image[off + 0x1FC..off + 0x200].copy_from_slice(&2i32.to_be_bytes()); // ST_USERDIR
+        image[off + 0x1B0] = 1;
+        image[off + 0x1B1] = b'X';
+        image[off + 0x1F0..off + 0x1F4].copy_from_slice(&hdr.to_be_bytes()); // self-loop
+
+        // Hang it off the root's first bucket.
+        image[root_off + 0x018..root_off + 0x01C].copy_from_slice(&hdr.to_be_bytes());
+
+        let mut reader = MemImage { data: image };
+        let mut fs = AmigaFs::mount(&mut reader, DD_TRACKS as u32).unwrap();
+        // Must return (either Ok or Err) rather than spin forever.
+        let _ = fs.list_dir(fs.root_block_num());
+        let _ = fs.find_entry(fs.root_block_num(), "X");
+    }
+
+    /// Regression: the file extension-block chain had no bound either — a
+    /// header whose extension pointer refers to itself looped forever.
+    #[test]
+    fn test_cyclic_extension_chain_terminates() {
+        let mut image = format_empty_ofs_disk("TEST").unwrap();
+        let hdr = 4u32;
+        let off = hdr as usize * SECTOR_SIZE;
+        image[off..off + 4].copy_from_slice(&2i32.to_be_bytes()); // T_HEADER
+        image[off + 0x1FC..off + 0x200].copy_from_slice(&(-3i32).to_be_bytes()); // ST_FILE
+        image[off + 0x144..off + 0x148].copy_from_slice(&16u32.to_be_bytes()); // small size
+        image[off + 0x1F8..off + 0x1FC].copy_from_slice(&hdr.to_be_bytes()); // self-loop
+
+        let mut reader = MemImage { data: image };
+        let mut fs = AmigaFs::mount(&mut reader, DD_TRACKS as u32).unwrap();
+        let _ = fs.read_file(hdr);
+    }
+
     #[test]
     fn test_create_blank_image_rejects_non_sector_multiple() {
         assert!(create_blank_image(100, 0).is_err());

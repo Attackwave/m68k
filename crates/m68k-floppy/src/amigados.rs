@@ -175,12 +175,25 @@ impl<'a> AmigaFs<'a> {
         }
 
         let mut entries = Vec::new();
+        // The hash chain is a pointer read out of the image, so a corrupt
+        // one can point back at itself and loop forever. A chain cannot
+        // legitimately be longer than the disk has blocks — every entry
+        // in it occupies a distinct block.
+        let max_chain = self.total_blocks() as usize;
         for i in 0..HASH_TABLE_SIZE {
             let mut current = read_u32(&block, 0x018 + i * 4);
+            let mut hops = 0usize;
             while current != 0 {
                 let header = self.read_block(current)?;
                 if let Some(entry) = Self::dir_entry_from_header(&header, current)? {
                     entries.push(entry);
+                }
+                hops += 1;
+                if hops > max_chain {
+                    return Err(FloppyError::new(format!(
+                        "hash chain in bucket {} is cyclic or longer than the disk",
+                        i
+                    )));
                 }
                 current = read_u32(&header, 0x1F0); // hash_chain
             }
@@ -191,6 +204,16 @@ impl<'a> AmigaFs<'a> {
     /// Root directory's own block number, for [`AmigaFs::list_dir`].
     pub fn root_block_num(&self) -> u32 {
         self.root_block
+    }
+
+    /// Total number of blocks on the mounted disk.
+    ///
+    /// Derived from the root block, which `mount` places at
+    /// `total_blocks / 2` — the standard AmigaDOS convention. Used to
+    /// bound sizes and chain lengths read out of the image, none of
+    /// which can legitimately exceed the disk itself.
+    fn total_blocks(&self) -> u32 {
+        self.root_block.saturating_mul(2)
     }
 
     /// Build a [`DirEntry`] from a file/directory header block.
@@ -240,12 +263,20 @@ impl<'a> AmigaFs<'a> {
         let block = self.read_block(dir_block)?;
         let idx = amiga_hash(name.as_bytes()) as usize;
         let mut current = read_u32(&block, 0x018 + idx * 4);
+        // Bounded for the same reason as in `list_dir`: a corrupt image
+        // can make this chain cyclic.
+        let max_chain = self.total_blocks() as usize;
+        let mut hops = 0usize;
         while current != 0 {
             let header = self.read_block(current)?;
             if let Some(entry) = Self::dir_entry_from_header(&header, current)?
                 && entry.name.eq_ignore_ascii_case(name)
             {
                 return Ok(Some(entry));
+            }
+            hops += 1;
+            if hops > max_chain {
+                break;
             }
             current = read_u32(&header, 0x1F0);
         }
@@ -377,8 +408,27 @@ impl<'a> AmigaFs<'a> {
         // When a file needs more blocks than one table holds, `extension`
         // points to a File Extension Block with the same shape plus its
         // own `extension` link.
+        // A file cannot be larger than the disk it sits on. `byte_size`
+        // comes straight out of the header, so on a corrupt image it can
+        // claim anything — a fuzzer found a header declaring 0xFF000000,
+        // which made the `Vec::with_capacity` below ask for 4 GB from a
+        // 901 KB file.
+        let disk_capacity = self.total_blocks() as usize * BLOCK_SIZE;
+        if byte_size > disk_capacity {
+            return Err(FloppyError::new(format!(
+                "file header claims {} bytes, larger than the {}-byte disk",
+                byte_size, disk_capacity
+            )));
+        }
+
         let mut data_blocks = Vec::new();
         let mut current_table_block = header.clone();
+        // Bound the extension-block walk: the chain is a pointer read out
+        // of the image, so a corrupt (or malicious) one can point back at
+        // itself and loop forever. No real file needs more extension
+        // blocks than the disk has blocks.
+        let mut extensions_followed = 0usize;
+        let max_extensions = self.total_blocks() as usize;
         loop {
             let high_seq = read_u32(&current_table_block, 0x008) as usize;
             let used = high_seq.min(BLOCK_TABLE_ENTRIES);
@@ -391,6 +441,12 @@ impl<'a> AmigaFs<'a> {
             let extension = read_u32(&current_table_block, 0x1F8);
             if extension == 0 {
                 break;
+            }
+            extensions_followed += 1;
+            if extensions_followed > max_extensions {
+                return Err(FloppyError::new(
+                    "file extension block chain is cyclic or longer than the disk",
+                ));
             }
             current_table_block = self.read_block(extension)?;
         }
