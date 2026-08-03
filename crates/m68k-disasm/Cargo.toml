@@ -3,6 +3,7 @@ name = "m68k-disasm"
 description = "Motorola 68000 disassembler with 2-pass label discovery"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true

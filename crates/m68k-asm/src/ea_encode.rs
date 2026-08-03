@@ -335,6 +335,10 @@ fn encode_full_ea(
         | (bd_code << 4)
         | i_i_s;
 
+    // `base_reg: None` means the base register is suppressed, which is
+    // encoded by `base_suppress` in the extension word above — the register
+    // field itself is then ignored by the CPU, so 0 is a real don't-care
+    // rather than a swallowed parse failure.
     let (mode, reg) = (6, mi.base_reg.unwrap_or(0));
     check_ea(mode, reg, allowed)?;
 

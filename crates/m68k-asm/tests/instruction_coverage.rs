@@ -18,6 +18,13 @@
 //! Every case here is a byte-for-byte roundtrip rather than a spot-check
 //! of the decoded text, so a decoder that produces plausible-looking but
 //! wrong output fails too.
+//!
+//! **This is the authoritative instruction-set suite.** `tests/golden/
+//! vectors.json` is a deliberately frozen snapshot from v1.0.2 and is not
+//! extended (see `golden_assembler.rs` for why); new instruction forms
+//! belong here instead. Anything added to the assembler without a case in
+//! this file has no roundtrip coverage at all — that is precisely how the
+//! MMU family ended up shipping a broken PFLUSH.
 
 use m68k_asm::assembler::Assembler;
 

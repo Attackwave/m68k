@@ -11,8 +11,20 @@ env:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      # One platform failing should still report the others, so a
+      # Windows-only path bug is distinguishable from a real regression.
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        include:
+          # Lints and release artifacts only need to run once. Linux is the
+          # primary target and the one the release binaries are cut from.
+          - os: ubuntu-latest
+            primary: true
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -29,9 +41,11 @@ jobs:
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Check formatting
+        if: matrix.primary
         run: cargo fmt --all -- --check
 
       - name: Clippy
+        if: matrix.primary
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
@@ -41,9 +55,11 @@ jobs:
         run: cargo test --all --verbose
 
       - name: Build release
+        if: matrix.primary
         run: cargo build --release
 
       - name: Upload binaries
+        if: matrix.primary
         uses: actions/upload-artifact@v7
         with:
           name: m68k-binaries
@@ -51,6 +67,44 @@ jobs:
             target/release/m68k-asm
             target/release/m68k-disasm
             target/release/m68k-floppy
+
+  msrv:
+    name: msrv (1.88)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      # Pinned to the declared rust-version in the workspace manifest. If
+      # this job fails, either the code started using a newer feature (bump
+      # rust-version) or the pin drifted — do not "fix" it by widening here.
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-msrv-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Check against the declared MSRV
+        run: cargo check --all-targets --verbose
+
+  audit:
+    name: cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Advisory database changes independently of this repo, so a new
+    # advisory must not turn every unrelated PR red. Reported, not enforced.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --locked
+      - name: Audit dependencies
+        run: cargo audit
 
   fuzz-smoke:
     runs-on: ubuntu-latest

@@ -3,6 +3,7 @@ name = "m68k-asm"
 description = "Two-pass Motorola 68000 assembler"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
