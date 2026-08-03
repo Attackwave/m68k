@@ -118,13 +118,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v7
-        with:
-          # Full history so `git archive` sees the tag, and so the release
-          # notes below can reach the previous tag.
-          fetch-depth: 0
-
       - name: Download platform archives
         uses: actions/download-artifact@v7
         with:
@@ -132,28 +125,19 @@ jobs:
           path: dist
           merge-multiple: true
 
-      - name: Add source archives
-        run: |
-          set -eu
-          name="m68k-${{ github.ref_name }}"
-          # `git archive` on the tag, rather than the auto-generated GitHub
-          # tarball: this one is reproducible and honours .gitattributes.
-          git archive --format=tar.gz --prefix="${name}/" \
-            -o "dist/${name}-source.tar.gz" "${{ github.ref_name }}"
-          git archive --format=zip --prefix="${name}/" \
-            -o "dist/${name}-source.zip" "${{ github.ref_name }}"
-
       - name: Generate checksums
         run: |
           set -eu
           cd dist
-          # One .sha256 per asset for spot-checking, plus a combined
-          # SHA256SUMS that `sha256sum -c` can verify in a single pass.
-          for f in *; do
-            case "$f" in *.sha256|SHA256SUMS) continue;; esac
-            sha256sum "$f" > "${f}.sha256"
-          done
-          sha256sum $(ls | grep -vE '\.sha256$|^SHA256SUMS$') > SHA256SUMS
+          # One combined file rather than a .sha256 beside each archive:
+          # same information, and `sha256sum -c SHA256SUMS` checks whatever
+          # the user downloaded in a single pass.
+          #
+          # No source archive is built here. The source is the same for every
+          # platform — the target is a compile-time switch — and GitHub
+          # already attaches "Source code (zip/tar.gz)" to every release.
+          # Exclude SHA256SUMS explicitly so a re-run cannot checksum it.
+          sha256sum $(ls | grep -v '^SHA256SUMS$') > SHA256SUMS
           echo "--- release assets ---"
           ls -la
           echo "--- SHA256SUMS ---"
