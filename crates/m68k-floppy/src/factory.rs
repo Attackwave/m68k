@@ -228,14 +228,21 @@ mod tests {
     struct TempDir(std::path::PathBuf);
     impl TempDir {
         fn new() -> Self {
+            // Uniqueness comes from an atomic counter, not from the clock.
+            // These tests run as threads in one binary, and four modules
+            // share this helper, so a timestamp alone is not enough: on
+            // platforms whose SystemTime resolution is coarser than a
+            // nanosecond (macOS runners, in practice) two concurrent
+            // TempDir::new() calls produced the *same* path, and the first
+            // Drop then deleted the other test's directory — surfacing as
+            // "No such file or directory" in an unrelated test.
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut dir = std::env::temp_dir();
             dir.push(format!(
-                "m68k_floppy_test_{}_{}",
+                "m68k_floppy_test_factory_{}_{}",
                 std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
+                seq
             ));
             std::fs::create_dir_all(&dir).unwrap();
             Self(dir)
