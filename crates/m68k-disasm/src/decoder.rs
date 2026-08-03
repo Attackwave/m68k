@@ -1232,6 +1232,13 @@ fn parse_operands(
 
             Ok((mnemonic.into(), operands, target_addr))
         }
+        ParserType::Plpa => {
+            // PLPAR/PLPAW take a single `(An)`; the mnemonic already
+            // encodes the direction, so only the register is read here.
+            let reg = (op & 0x7) as u8;
+            operands.push(DecodedOperand::from_ea(EAOperand::AddrIndirect(reg)));
+            Ok((pat.mnemonic.to_lowercase(), operands, target_addr))
+        }
         ParserType::PflushFamily040 => {
             let opmode = (op >> 3) & 0x3;
             let reg = (op & 0x7) as u8;
@@ -1253,24 +1260,37 @@ fn parse_operands(
 
             match group_prefix {
                 0b001 => {
-                    // PFLUSHA (mode 001, no EA/FC/mask) or PFLUSH FC,MASK,<ea>
-                    // (mode 110). verified against reference encodings
-                    // output for `pflusha` (F000 2400) and
-                    // `pflush #2,#3,(a0)` (F010 3872).
+                    // Three PFLUSH forms, told apart by the extension
+                    // word's mode field (bits 12-10):
+                    //   001  PFLUSHA          — no EA, no FC/mask
+                    //   100  PFLUSH #fc,#mask — no EA
+                    //   110  PFLUSH #fc,#mask,<ea>
+                    //
+                    // Mode 100 used to fall into the three-operand branch,
+                    // which read an EA field the opword doesn't have:
+                    // `PFLUSH #0,#0` (F000 3010) disassembled to
+                    // `pflush #0,#0,d0` — an invented operand that then
+                    // failed to reassemble.
+                    //
+                    // Verified against reference encodings: `pflusha` ->
+                    // F000 2400, `pflush #0,#0` -> F000 3010,
+                    // `pflush #3,#7` -> F000 30F3,
+                    // `pflush #2,#4,(a0)` -> F010 3892.
                     let mode = (ext >> 10) & 0x7;
                     if mode == 0b001 {
-                        Ok(("pflusha".into(), operands, target_addr))
-                    } else {
+                        return Ok(("pflusha".into(), operands, target_addr));
+                    }
+                    let mask = (ext >> 5) & 0x7;
+                    let fc = ext & 0x7;
+                    operands.push(DecodedOperand::special(format!("#{}", fc)));
+                    operands.push(DecodedOperand::special(format!("#{}", mask)));
+                    if mode != 0b100 {
                         let ea_mode = ((op >> 3) & 0x7) as u8;
                         let ea_reg = (op & 0x7) as u8;
                         let ea = decode_ea(ea_mode, ea_reg, "l", stream, inst_pc, cpu)?;
-                        let mask = (ext >> 5) & 0x7;
-                        let fc = ext & 0x1F;
-                        operands.push(DecodedOperand::special(format!("#{}", fc & 0x7)));
-                        operands.push(DecodedOperand::special(format!("#{}", mask)));
                         operands.push(DecodedOperand::from_ea(ea));
-                        Ok(("pflush".into(), operands, target_addr))
                     }
+                    Ok(("pflush".into(), operands, target_addr))
                 }
                 0b100 => {
                     // PTESTR/PTESTW FC,<ea>,#level[,An]. Verified against

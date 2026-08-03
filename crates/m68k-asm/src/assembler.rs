@@ -3095,12 +3095,31 @@ impl Assembler {
         // Handle 3-operand instructions (CAS, PACK, UNPK, PFLUSH, PTESTR/PTESTW)
         let words = match mnemonic_upper.as_str() {
             "PFLUSH" => {
-                // Both spellings are valid: `#fc,#mask` flushes by function
-                // code alone, `#fc,#mask,<ea>` restricts it to one page.
-                // Requiring three operands rejected the shorter form.
+                // Three valid spellings across two architectures:
+                //   68040+: `PFLUSH (An)`          — one operand
+                //   68030 : `PFLUSH #fc,#mask`     — no EA
+                //   68030 : `PFLUSH #fc,#mask,<ea>`
+                // Requiring three operands rejected the other two.
+                if operand_texts.len() == 1 {
+                    // 68040+ single-operand form: `PFLUSH (An)`.
+                    // Reference encoding: `pflush (a0)` -> F508.
+                    let reg_op = parse_operand_text(&operand_texts[0], &self.symbols, pc)
+                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
+                    let w = crate::enc_mmu::enc_mmu_single_reg(0xF508, &reg_op, &self.cpu)
+                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
+                    self.push_instruction(AssembledInstruction {
+                        pc,
+                        words: w.clone(),
+                        line_no: Some(line.line_no),
+                        source: Some(line.raw.clone()),
+                        byte_len: None,
+                    });
+                    self.pc += (w.len() * 2) as u32;
+                    return Ok(());
+                }
                 if operand_texts.len() != 2 && operand_texts.len() != 3 {
                     return Err(AsmError::with_line(
-                        "PFLUSH takes #fc,#mask or #fc,#mask,<ea>".to_string(),
+                        "PFLUSH takes (An), #fc,#mask or #fc,#mask,<ea>".to_string(),
                         line.line_no,
                     ));
                 }

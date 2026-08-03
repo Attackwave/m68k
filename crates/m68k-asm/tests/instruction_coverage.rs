@@ -236,6 +236,39 @@ const EXT_68010_68020: &[Case] = &[
 
 /// 68030/68040/68060: MMU, cache control, MOVE16, LPSTOP.
 const EXT_68030_PLUS: &[Case] = &[
+    // MMU proper. This group was named "68030+/MMU/cache" but contained
+    // no MMU instruction at all — PMOVE/PFLUSH/PTEST had zero roundtrip
+    // coverage, which is exactly where two bugs were hiding: the
+    // two-operand `PFLUSH #fc,#mask` was rejected by the assembler, and
+    // the disassembler rendered it with an invented third operand
+    // (`pflush #0,#0,d0`) that could not be reassembled.
+    c("PMOVE TC,(A0)", "68030"),
+    c("PMOVE (A0),TC", "68030"),
+    c("PMOVE SRP,(A0)", "68030"),
+    c("PMOVE (A0),SRP", "68030"),
+    c("PMOVE CRP,(A0)", "68030"),
+    c("PMOVE (A0),CRP", "68030"),
+    c("PMOVE TT0,(A0)", "68030"),
+    c("PMOVE (A0),TT0", "68030"),
+    c("PMOVE TT1,(A0)", "68030"),
+    c("PMOVE (A0),TT1", "68030"),
+    c("PMOVE MMUSR,(A0)", "68030"),
+    c("PMOVE (A0),MMUSR", "68030"),
+    c("PFLUSHA", "68030"),
+    c("PFLUSH #0,#0", "68030"),
+    c("PFLUSH #3,#7", "68030"),
+    c("PFLUSH #2,#4,(A0)", "68030"),
+    c("PTESTR #2,(A0),#3", "68030"),
+    c("PTESTW #2,(A0),#3", "68030"),
+    c("PTESTR #2,(A0),#3,A1", "68030"),
+    // 68060 physical-address load — encodable but, until now, decoded as
+    // `cinvl` because the CACHE pattern's mask covered it.
+    c("PLPAR (A0)", "68060"),
+    c("PLPAW (A1)", "68060"),
+    // 68040 single-operand PFLUSH forms.
+    c("PFLUSH (A0)", "68040"),
+    c("PFLUSHN (A1)", "68040"),
+    c("PFLUSHAN", "68040"),
     c("PSAVE (A0)", "68030"),
     c("PRESTORE (A0)", "68030"),
     c("MOVE16 (A0)+,(A1)+", "68040"),
