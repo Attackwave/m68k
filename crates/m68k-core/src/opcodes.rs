@@ -86,6 +86,8 @@ pub enum ParserType {
     Bitfield,
     Pmove,
     PflushFamily040,
+    /// PLPAR/PLPAW (68060): single `(An)` operand, direction in bit 6.
+    Plpa,
     CacheOp040,
     Fpu,
     FpuScc,
@@ -858,6 +860,37 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: 0,
             cpu: "68040",
             parser: ParserType::PflushFamily040,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // PLPAR (68060): load physical address, read. Base 0xF5C8,
+            // address register in bits 2-0. Must precede the CACHE
+            // pattern below, whose 0xFC00/0xF400 mask covers this range
+            // and would otherwise decode it as `cinvl bc,(An)` — the
+            // assembler encodes PLPAR/PLPAW correctly, so without these
+            // two entries the roundtrip is broken.
+            // Verified against reference output: `plpar (a0)` -> F5C8,
+            // `plpar (a3)` -> F5CB.
+            mask: 0xFFF8,
+            value: 0xF5C8,
+            mnemonic: "PLPAR",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68060",
+            parser: ParserType::Plpa,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // PLPAW (68060): load physical address, write. Base 0xF588 —
+            // bit 6 distinguishes it from PLPAR.
+            // Verified: `plpaw (a0)` -> F588, `plpaw (a3)` -> F58B.
+            mask: 0xFFF8,
+            value: 0xF588,
+            mnemonic: "PLPAW",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68060",
+            parser: ParserType::Plpa,
             fixed_size: None,
         },
         OpcodePattern {
