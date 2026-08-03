@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::Parser;
@@ -10,7 +11,7 @@ use m68k_disasm::disassembler::Disassembler;
 #[command(name = "m68k-disasm")]
 #[command(about = "Motorola 68000 disassembler", long_about = None)]
 struct Args {
-    /// Input binary file to disassemble
+    /// Input binary file to disassemble (use `-` to read from stdin)
     input: PathBuf,
 
     /// Start address (hex, e.g. $1000 or 0x1000). For Amiga Hunk
@@ -40,15 +41,44 @@ fn parse_address(s: &str) -> Result<u32, String> {
     }
 }
 
+/// `-` means stdin, as documented in the README. Everything else is a
+/// filesystem path — including `./-`, which is the escape hatch for a file
+/// literally named `-`.
+fn is_stdin_path(p: &Path) -> bool {
+    p.as_os_str() == "-"
+}
+
+/// Reads the input image, either from stdin (`-`) or from a file. stdin is
+/// read as raw bytes, not text: the input is a binary image, and Hunk
+/// executables in particular are not valid UTF-8.
+fn read_input(path: &Path) -> Result<Vec<u8>, String> {
+    if is_stdin_path(path) {
+        let mut data = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut data)
+            .map_err(|e| format!("cannot read stdin: {}", e))?;
+        Ok(data)
+    } else {
+        fs::read(path).map_err(|e| format!("cannot read '{}': {}", path.display(), e))
+    }
+}
+
+fn input_display(path: &Path) -> String {
+    if is_stdin_path(path) {
+        "<stdin>".to_string()
+    } else {
+        path.display().to_string()
+    }
+}
+
 fn run(args: Args) -> Result<(), String> {
     m68k_core::cpu_gate::validate_cpu_name(&args.cpu)?;
     let start_addr = parse_address(&args.address)?;
 
-    let data = fs::read(&args.input)
-        .map_err(|e| format!("cannot read '{}': {}", args.input.display(), e))?;
+    let data = read_input(&args.input)?;
 
     if data.is_empty() {
-        return Err("empty input file".to_string());
+        return Err(format!("empty input: {}", input_display(&args.input)));
     }
 
     // Amiga Hunk executables (HUNK_HEADER magic 0x000003F3) get their
@@ -56,7 +86,7 @@ fn run(args: Args) -> Result<(), String> {
     // else is treated as a raw binary at the given start address.
     let (image, base_addr, known_labels) = if data.len() >= 4 && data[0..4] == [0, 0, 0x03, 0xf3] {
         let exe = read_hunk_executable(&data, start_addr)
-            .map_err(|e| format!("cannot read '{}': {}", args.input.display(), e))?;
+            .map_err(|e| format!("cannot read '{}': {}", input_display(&args.input), e))?;
         let labels = exe
             .all_symbols()
             .into_iter()

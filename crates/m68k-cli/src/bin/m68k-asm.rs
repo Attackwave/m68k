@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::PathBuf;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, ValueEnum};
@@ -14,10 +15,11 @@ use m68k_asm::output::{
 #[command(name = "m68k-asm")]
 #[command(about = "Motorola 68000 assembler", long_about = None)]
 struct Args {
-    /// Input assembly source file
+    /// Input assembly source file (use `-` to read from stdin)
     input: PathBuf,
 
-    /// Output file (default: stdout, or input with .bin/.srec/.hex extension)
+    /// Output file (use `-` for stdout; default: input with
+    /// .bin/.srec/.hex extension)
     #[arg(short, long)]
     output: Option<PathBuf>,
 
@@ -100,14 +102,58 @@ fn parse_origin(s: &str) -> Result<u32, String> {
     }
 }
 
+/// `-` means stdin/stdout, as documented in the README. Everything else is a
+/// filesystem path — including `./-`, which is the escape hatch for a file
+/// literally named `-`.
+fn is_dash(p: &Path) -> bool {
+    p.as_os_str() == "-"
+}
+
+/// Writes generated output to a file, or to stdout when the path is `-`.
+/// Binary formats go out as raw bytes, so stdout must not be line-buffered
+/// text here.
+fn write_output(path: &Path, data: &[u8]) -> Result<(), String> {
+    if is_dash(path) {
+        use std::io::Write;
+        let stdout = std::io::stdout();
+        let mut lock = stdout.lock();
+        lock.write_all(data)
+            .and_then(|()| lock.flush())
+            .map_err(|e| format!("cannot write to stdout: {}", e))
+    } else {
+        fs::write(path, data).map_err(|e| format!("cannot write '{}': {}", path.display(), e))
+    }
+}
+
+fn output_display(path: &Path) -> String {
+    if is_dash(path) {
+        "<stdout>".to_string()
+    } else {
+        path.display().to_string()
+    }
+}
+
 fn run(args: Args) -> Result<(), String> {
     m68k_core::cpu_gate::validate_cpu_name(&args.cpu)?;
     let origin = parse_origin(&args.origin)?;
-    let input_name = args.input.to_string_lossy().to_string();
+    let reading_stdin = is_dash(&args.input);
+    let input_name = if reading_stdin {
+        "<stdin>".to_string()
+    } else {
+        args.input.to_string_lossy().to_string()
+    };
 
-    // Read source file
-    let source = fs::read_to_string(&args.input)
-        .map_err(|e| format!("{}: cannot read: {}", input_name, e))?;
+    // Read source file (or stdin for `-`)
+    let source = if reading_stdin {
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| format!("{}: cannot read: {}", input_name, e))?;
+        buf
+    } else {
+        fs::read_to_string(&args.input)
+            .map_err(|e| format!("{}: cannot read: {}", input_name, e))?
+    };
 
     // Assemble
     let mut asm = Assembler::new(origin);
@@ -116,7 +162,9 @@ fn run(args: Args) -> Result<(), String> {
     for dir in &args.include_paths {
         asm.add_include_path(dir.clone());
     }
-    if let Some(parent) = args.input.parent() {
+    // With stdin there is no source directory to resolve relative INCLUDEs
+    // against; the current directory (and any -I paths) is all we have.
+    if !reading_stdin && let Some(parent) = args.input.parent() {
         asm.set_source_root(parent.to_path_buf());
     }
     asm.errors.filename = input_name.clone();
@@ -145,31 +193,42 @@ fn run(args: Args) -> Result<(), String> {
         ));
     }
 
-    // Determine output path
-    let output_path = args.output.clone().unwrap_or_else(|| {
-        let mut p = args.input.clone();
-        match args.format {
-            OutputFormatArg::Binary => {
-                p.set_extension("bin");
-            }
-            OutputFormatArg::Srecord => {
-                p.set_extension("srec");
-            }
-            OutputFormatArg::IntelHex => {
-                p.set_extension("hex");
-            }
-            OutputFormatArg::Elf => {
-                p.set_extension("o");
-            }
-            OutputFormatArg::Ieee695 => {
-                p.set_extension("ieee");
-            }
-            OutputFormatArg::HunkExe => {
-                p.set_extension("");
-            }
+    // Determine output path. Deriving one from the input name is impossible
+    // when the source came from stdin, so `-o` is required in that case
+    // (`-o -` to pipe the result onward).
+    let output_path = match args.output.clone() {
+        Some(p) => p,
+        None if reading_stdin => {
+            return Err(
+                "reading source from stdin requires an explicit -o/--output (use `-o -` for stdout)"
+                    .to_string(),
+            );
         }
-        p
-    });
+        None => {
+            let mut p = args.input.clone();
+            match args.format {
+                OutputFormatArg::Binary => {
+                    p.set_extension("bin");
+                }
+                OutputFormatArg::Srecord => {
+                    p.set_extension("srec");
+                }
+                OutputFormatArg::IntelHex => {
+                    p.set_extension("hex");
+                }
+                OutputFormatArg::Elf => {
+                    p.set_extension("o");
+                }
+                OutputFormatArg::Ieee695 => {
+                    p.set_extension("ieee");
+                }
+                OutputFormatArg::HunkExe => {
+                    p.set_extension("");
+                }
+            }
+            p
+        }
+    };
 
     // Generate output
     let output_data = match args.format {
@@ -201,83 +260,70 @@ fn run(args: Args) -> Result<(), String> {
         }
         OutputFormatArg::Srecord => {
             let srec = generate_srecord(&asm.code, &args.srec_name);
-            fs::write(&output_path, &srec)
-                .map_err(|e| format!("cannot write '{}': {}", output_path.display(), e))?;
+            write_output(&output_path, srec.as_bytes())?;
             eprintln!(
                 "Assembled {} instructions, {} bytes -> {}",
                 asm.code.len(),
                 srec.len(),
-                output_path.display()
+                output_display(&output_path)
             );
             return write_auxiliary_outputs(&asm, &args, &input_name);
         }
         OutputFormatArg::IntelHex => {
             let ihex = generate_intel_hex(&asm.code);
-            fs::write(&output_path, &ihex)
-                .map_err(|e| format!("cannot write '{}': {}", output_path.display(), e))?;
+            write_output(&output_path, ihex.as_bytes())?;
             eprintln!(
                 "Assembled {} instructions, {} bytes -> {}",
                 asm.code.len(),
                 ihex.len(),
-                output_path.display()
+                output_display(&output_path)
             );
             return write_auxiliary_outputs(&asm, &args, &input_name);
         }
         OutputFormatArg::Elf => {
             let elf = generate_elf_sections(&asm.sections, &asm.symbols);
-            fs::write(&output_path, &elf)
-                .map_err(|e| format!("cannot write '{}': {}", output_path.display(), e))?;
+            write_output(&output_path, &elf)?;
             eprintln!(
                 "Assembled {} instructions, {} bytes -> {}",
                 asm.code.len(),
                 elf.len(),
-                output_path.display()
+                output_display(&output_path)
             );
             return write_auxiliary_outputs(&asm, &args, &input_name);
         }
         OutputFormatArg::Ieee695 => {
             let ieee = generate_ieee695_sections(&asm.sections, &asm.symbols);
-            fs::write(&output_path, &ieee)
-                .map_err(|e| format!("cannot write '{}': {}", output_path.display(), e))?;
+            write_output(&output_path, &ieee)?;
             eprintln!(
                 "Assembled {} instructions, {} bytes -> {}",
                 asm.code.len(),
                 ieee.len(),
-                output_path.display()
+                output_display(&output_path)
             );
             return write_auxiliary_outputs(&asm, &args, &input_name);
         }
         OutputFormatArg::HunkExe => {
             let hunk = generate_hunk_exe(&asm.sections, &asm.symbols);
-            fs::write(&output_path, &hunk)
-                .map_err(|e| format!("cannot write '{}': {}", output_path.display(), e))?;
+            write_output(&output_path, &hunk)?;
             eprintln!(
                 "Assembled {} instructions, {} bytes -> {}",
                 asm.code.len(),
                 hunk.len(),
-                output_path.display()
+                output_display(&output_path)
             );
             return write_auxiliary_outputs(&asm, &args, &input_name);
         }
     };
 
     // Write binary output
-    if output_path.to_str() == Some("-") {
-        use std::io::Write;
-        std::io::stdout()
-            .write_all(&output_data)
-            .map_err(|e| format!("cannot write to stdout: {}", e))?;
-    } else {
-        fs::write(&output_path, &output_data)
-            .map_err(|e| format!("cannot write '{}': {}", output_path.display(), e))?;
-    }
+    write_output(&output_path, &output_data)?;
 
     // Summary
     eprintln!(
         "Assembled {} instructions, {} bytes -> {}",
         asm.code.len(),
         output_data.len(),
-        output_path.display()
+        output_display(&output_path)
     );
 
     write_auxiliary_outputs(&asm, &args, &input_name)
