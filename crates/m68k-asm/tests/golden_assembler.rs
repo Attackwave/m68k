@@ -1,4 +1,18 @@
 //! Golden vector tests using the 2-pass assembler end-to-end.
+//!
+//! # The vector file is frozen, by decision
+//!
+//! `tests/golden/vectors.json` holds 123 vectors snapshotted at v1.0.2 and
+//! is deliberately **not** extended as new instruction forms land. Its value
+//! is precisely that it does not move: it pins encoder output produced
+//! before several rounds of audits, so a regression that both the encoder
+//! and a freshly regenerated expectation would agree on still fails here.
+//! A snapshot regenerated from the current implementation could not do that.
+//!
+//! The consequence is that everything added since v1.0.2 (MMU forms, the
+//! FMOVE k-factor syntax, the v2.0.x fixes) is absent from this file. That
+//! is intended, not an oversight: `tests/instruction_coverage.rs` is the
+//! authoritative instruction-set suite and is where new forms are added.
 
 use m68k_asm::assembler::Assembler;
 

@@ -66,7 +66,7 @@ Das sind genau die Module, in denen im Juli zwei kritische Bugs steckten (Datenb
 
 **Aufgabe:** neues Target `fuzz/fuzz_targets/floppy_amigados.rs`, das ein synthetisches ADF aus den Fuzz-Bytes baut und `AmigaFs::mount` + `list_dir` + `walk` + `read_file_at_path` durchläuft. In den CI-Job `fuzz-smoke` aufnehmen.
 
-### P1.3 README dokumentiert stdin-Unterstützung, die nicht existiert
+### P1.3 README dokumentiert stdin-Unterstützung, die nicht existiert — ✅ erledigt (PR #21)
 
 `README.md:31` (`m68k-disasm`) und `README.md:110` (`m68k-asm`) versprechen beide „use `-` for standard input". **Verifiziert: beide brechen ab** mit `cannot read '-': No such file or directory`.
 
@@ -80,7 +80,11 @@ Betrifft 68060-Code. Der Assembler kann die Instruktionen (`encoder.rs`), `opcod
 
 **Aufgabe:** `OpcodePattern`-Einträge für PLPAR/PLPAW in `crates/m68k-core/src/opcodes.rs` ergänzen, **vor** dem CACHE-Pattern (dessen Maske sie sonst verschluckt — anders als bei den Fällen unten scheitert hier das Operanden-Parsing *nicht*, das breitere Pattern greift also wirklich). Sollbytes: `F5C8` = `PLPAR (A0)`, `F589` = `PLPAW (A1)`. Danach in `instruction_coverage.rs` aufnehmen.
 
-### P1.5 `m68k-floppy` validiert `--cpu` nicht
+### P1.5 `m68k-floppy` validiert `--cpu` nicht — ✅ gegenstandslos (2026-08-03)
+
+**Nachgeprüft:** `m68k-floppy` hat gar kein `--cpu`-Flag mehr (`--help` zeigt nur `--backend`, `--bootblock`, `--sector`, `--list(-all)`, `--extract(-all)`, `-o`, `--tracks`, `--fix-bootblock`). Die im Audit beschriebene Inkonsistenz existiert nicht mehr; nichts zu tun. Ursprünglicher Befund:
+
+
 
 `m68k-asm` und `m68k-disasm` rufen beide `validate_cpu_name` auf, `m68k-floppy` nicht (verifiziert per grep). Aktuell folgenlos, weil das Binary die CPU nicht nutzt — aber inkonsistent, und wenn es später Disassembly-Optionen bekommt, wird es zur stillen Fehlerquelle.
 
@@ -90,45 +94,65 @@ Betrifft 68060-Code. Der Assembler kann die Instruktionen (`encoder.rs`), `opcod
 
 ## P2 — Qualität und Wartbarkeit
 
-### P2.1 `AGENTS.md` ist stale
+### P2.1 `AGENTS.md` ist stale — ✅ erledigt (2026-08-03)
 
 Zeile 13 nennt „570 passed" — aktuell sind es 595. Die Modul-LOC-Angaben stammen von PR #13. Da die Datei als Projektstand dient, führt das beim nächsten Antasten in die Irre.
 
 **Aufgabe:** Testzahlen, LOC-Angaben und den „Stand"-Block auf v2.0.1 aktualisieren.
 
-### P2.2 14 stille `unwrap_or(0)` / `unwrap_or_default()` in Encoder-Pfaden
+**Ergebnis:** Stand-Block auf 2026-08-03 / 611 Tests, alle LOC-Angaben per `wc -l` neu gemessen (assembler.rs war mit ~4200+ gegen real 6754 am weitesten daneben), CI-Beschreibung, MSRV-Zeile und `cargo audit`-Status ergänzt. Zeile 8 nannte Rust 1.93.0 - jetzt MSRV 1.88 / lokal 1.97.1.
+
+### P2.2 14 stille `unwrap_or(0)` / `unwrap_or_default()` in Encoder-Pfaden — ✅ erledigt (2026-08-03)
 
 `grep` findet 14 Stellen in `crates/m68k-asm/src/` und `crates/m68k-core/src/` außerhalb von Tests. Jede davon kann einen Parse- oder Auswertungsfehler in eine stille 0 verwandeln — exakt das Muster, das bei `evaluate_simple_number` zu den PC-relativen und Displacement-Bugs geführt hat.
 
 **Aufgabe:** jede Stelle einzeln bewerten: Ist 0 ein legitimer Default (dann Kommentar warum) oder verschluckt sie einen Fehler (dann `?` propagieren)? Nicht pauschal ersetzen — bei Pass-1-Größenschätzungen ist der Fallback teils gewollt.
 
-### P2.3 Kein MSRV, keine `rust-toolchain`-Datei
+**Ergebnis:** alle 14 einzeln bewertet. **Ein echter Bug gefunden und gefixt:** `REPT $ZZ` (malformiertes Hex) wurde per `unwrap_or(0)` zu `REPT 0` - der Block verschwand ersatzlos, während die Referenz die Zeile ablehnt. **Empirisch verifiziert** (vasm: `error 76: base 16 numerical term expected`; wir: 2 Instruktionen statt 3, der NOP fehlte). Der erste Fixversuch (Zeile nur durchreichen) griff zu kurz, weil `rept` in `is_directive_name` steht und dann in einem No-Op-Arm landet - der Body wäre einmal ungeschützt assembliert worden. Jetzt echter Diagnostic über `self.errors.error`, Exit-Code 1, keine Ausgabe. Regressionstest ergänzt.
+
+Die übrigen 13 sind legitim, jetzt aber begründet: `line_no.unwrap_or(0)` (Zeilennummer unbekannt) x2, Makro-Parametersubstitution (nicht übergeben -> leer, dokumentiertes Verhalten) x2, `chunks(2)`-Restbyte, Pass-1-Größenschätzung (war bereits ausführlich kommentiert), `base_reg: None` = Basisregister unterdrückt (Kommentar ergänzt), `.max()` nach `is_empty()`-Guard = unerreichbar (Kommentar ergänzt), S-Record-Prüfsumme über selbst formatierten Hex-String (`debug_assert!` ergänzt statt Fehlerkanal für einen strukturell unmöglichen Fall), Rest in Testmodulen.
+
+### P2.3 Kein MSRV, keine `rust-toolchain`-Datei — ✅ erledigt (2026-08-03)
 
 Weder `rust-version` in einer `Cargo.toml` noch eine `rust-toolchain.toml`. Der Code nutzt aber neuere Features (let-chains, `is_multiple_of`), die eine recht aktuelle Toolchain verlangen. CI läuft auf `stable` — ein Nutzer mit älterem Rust bekommt kryptische Compilerfehler.
 
 **Aufgabe:** `rust-version` im Workspace deklarieren (die tatsächlich benötigte Version ermitteln, nicht raten) und optional `rust-toolchain.toml` für reproduzierbare Builds.
 
-### P2.4 CI testet nur eine Plattform, eine Toolchain
+**Ergebnis:** MSRV **1.88**, empirisch bestimmt statt geraten: 1.87 scheitert mit `E0658` an den let-chains in `m68k-core`, 1.88 hat sie stabilisiert und baut sauber. Obere Kante gegen 1.97.1 (aktuelles stable) mitgeprüft - volle Prüfkette dort grün. `rust-version` im `[workspace.package]`, per `rust-version.workspace = true` an alle fünf Crates vererbt; cargo meldet auf 1.87 jetzt "requires rustc 1.88" statt eines kryptischen Compilerfehlers (verifiziert).
+
+**`rust-toolchain.toml` bewusst weggelassen:** sie würde jeden Contributor auf eine feste Version zwingen und in CI auch den MSRV-Job überschreiben, der damit wirkungslos wäre.
+
+### P2.4 CI testet nur eine Plattform, eine Toolchain — ✅ erledigt (2026-08-03)
 
 `.github/workflows/ci.yml` läuft ausschließlich auf `ubuntu-latest` mit `stable`. Für ein Tool, das laut README auch anderswo laufen soll, fehlt zumindest ein Windows- oder macOS-Job. Auch `cargo audit` läuft nicht in CI (AGENTS.md erwähnt es als manuell ausgeführt).
 
 **Aufgabe:** Matrix um `windows-latest` erweitern; `cargo audit` als eigenen (nicht blockierenden) Job.
 
-### P2.5 Golden-Vektoren sind eingefroren und decken die Neuzugänge nicht
+**Ergebnis:** `build` ist jetzt eine Matrix über ubuntu/windows/macos mit `fail-fast: false`, damit ein plattformspezifischer Bruch von einer echten Regression unterscheidbar bleibt. Build+Test laufen überall; `fmt`, `clippy` und die Release-Artefakte nur auf ubuntu (`matrix.primary`), da plattformunabhängig. Dazu zwei neue Jobs: `msrv` (`cargo check` auf 1.88.0) und `audit` (`continue-on-error`, weil die Advisory-DB sich unabhängig vom Repo ändert und ein neuer Eintrag nicht jeden unbeteiligten PR rot färben darf).
+
+Vorab lokal auf plattformabhängige Annahmen geprüft: durchweg `std::env::temp_dir()` statt hartkodiertem `/tmp`, `.lines()` verträgt CRLF, die `readelf`-Tests überspringen sich sauber, wenn das Tool fehlt.
+
+### P2.5 Golden-Vektoren sind eingefroren und decken die Neuzugänge nicht — ✅ entschieden (2026-08-03)
 
 `tests/golden/vectors.json` hat 123 Vektoren und ist laut AGENTS.md „nicht mehr regenerierbar". Alle seit v1.0.2 hinzugekommenen Instruktionsformen (MMU, k-factor, die v2.0.1-Fixes) sind dort nicht vertreten.
 
 **Aufgabe:** entscheiden, ob die Golden-Vektoren eingefroren bleiben (dann dokumentieren, dass `instruction_coverage.rs` die maßgebliche Suite ist) oder ob sie kontrolliert erweitert werden. Nicht beides halb.
 
+**Entscheidung: eingefroren.** Der Wert des Snapshots liegt gerade darin, dass er sich nicht bewegt - er stammt von v1.0.2 und fängt damit Regressionen, auf die sich Encoder und eine frisch regenerierte Erwartung gemeinsam einigen würden. Eine aus der aktuellen Implementierung regenerierte Datei könnte das nicht.
+
+Dokumentiert an drei Stellen: Modulkommentar in `golden_assembler.rs` (warum eingefroren), Modulkommentar in `instruction_coverage.rs` (dies ist die maßgebliche Suite, neue Formen kommen hierher) und AGENTS.md.
+
 ---
 
-### P2.6 CNOP: Padding-Formel in beiden Pässen dupliziert
+### P2.6 CNOP: Padding-Formel in beiden Pässen dupliziert — ✅ erledigt (2026-08-03)
 
 `estimate_directive_size` (Zeile 2602) und `encode_directive` (Zeile 3647) berechnen das CNOP-Padding mit derselben, aber **getrennt hingeschriebenen** Formel `alignment - (target % alignment)`. `EVEN`, `ALIGN` und `INCBIN` nutzen dagegen je einen gemeinsamen `handle_*_pass1`/`pass2`-Kern.
 
 **Verifiziert:** Aktuell kein Zahlenunterschied — auch nicht mit einem `SET`-Symbol als Alignment (getestet: `ALIGNVAL SET 4` → beide Pässe liefern dasselbe, Bytes identisch zur Referenz). Es ist ein Wartungsrisiko, kein Bug: Genau diese Divergenzklasse hat im Juli-Audit sechs Label-Korruptionen verursacht.
 
 **Aufgabe:** Padding-Berechnung in einen gemeinsamen Helfer ziehen, analog zu `handle_align_pass1`.
+
+**Ergebnis:** neue Methode `Assembler::cnop_padding(args, line_no)` kapselt Argumentauswertung, Validierung und Padding-Formel; beide Pässe rufen sie auf. (Randnotiz: das im Audit genannte Vorbild `handle_align_pass1` existiert nicht - EVEN/ALIGN/INCBIN sind anders strukturiert.) Die Validierung läuft bewusst bei jedem Aufruf statt als aus Pass 1 übernommen, weil ein `SET`-Symbol als Alignment zwischen den Pässen den Wert aendern kann. Regressionstest für genau diesen Fall ergänzt - plan.md nannte ihn als getestet, ein Test existierte aber nicht.
 
 ## Geprüft und entkräftet
 

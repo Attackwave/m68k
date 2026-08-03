@@ -1886,12 +1886,28 @@ impl Assembler {
                 let count: usize = match operands1[0].parse() {
                     Ok(n) => n,
                     Err(_) => {
-                        if let Some(hex) = operands1[0].strip_prefix('$') {
-                            usize::from_str_radix(hex, 16).unwrap_or(0)
-                        } else {
-                            output.push(raw.to_string());
-                            i += 1;
-                            continue;
+                        // A malformed hex count used to `unwrap_or(0)` here,
+                        // which expanded the block zero times and dropped its
+                        // body without a word — `REPT $ZZ` silently assembled
+                        // to nothing while the reference assembler rejects it.
+                        // Passing the line through is not enough either: `rept`
+                        // is a known name in `is_directive_name`, so it lands in
+                        // a no-op arm and the body would be emitted once,
+                        // unguarded. Report it instead.
+                        match operands1[0]
+                            .strip_prefix('$')
+                            .and_then(|hex| usize::from_str_radix(hex, 16).ok())
+                        {
+                            Some(n) => n,
+                            None => {
+                                self.errors.error(
+                                    format!("invalid REPT count: '{}'", operands1[0]),
+                                    Some(i + 1),
+                                );
+                                output.push(raw.to_string());
+                                i += 1;
+                                continue;
+                            }
                         }
                     }
                 };
@@ -2383,6 +2399,45 @@ impl Assembler {
     }
 
     /// Estimate size for a directive.
+    /// Shared CNOP argument evaluation, validation, and padding calculation
+    /// for both passes.
+    ///
+    /// Pass 1 (sizing) and pass 2 (encoding) previously carried two separately
+    /// written copies of this. They agreed numerically, but that is exactly
+    /// the divergence class that produced six label corruptions in the July
+    /// audit, so the arithmetic now exists once.
+    ///
+    /// The validation deliberately runs on every call rather than being
+    /// treated as carried over from pass 1: if the alignment expression
+    /// depends on a `SET` symbol whose value changed between passes, pass 1
+    /// may have validated a different value, and `target % alignment` would
+    /// divide by zero on an alignment of 0.
+    fn cnop_padding(&self, args: &[String], line_no: usize) -> Result<u32, AsmError> {
+        if args.len() < 2 {
+            return Err(AsmError::with_line(
+                "CNOP requires offset and alignment",
+                line_no,
+            ));
+        }
+        let offset = evaluate_expr_str(&args[0], &self.symbols, self.pc)
+            .map_err(|e| AsmError::with_line(e.message, line_no))? as u32;
+        let alignment = evaluate_expr_str(&args[1], &self.symbols, self.pc)
+            .map_err(|e| AsmError::with_line(e.message, line_no))? as u32;
+        if alignment == 0 || !alignment.is_power_of_two() {
+            return Err(AsmError::with_line(
+                format!("CNOP alignment must be power of 2, got {}", alignment),
+                line_no,
+            ));
+        }
+        // CNOP offset,align → aligns to (PC + offset) % align == 0
+        let target = self.pc + offset;
+        Ok(if target.is_multiple_of(alignment) {
+            0
+        } else {
+            alignment - (target % alignment)
+        })
+    }
+
     fn estimate_directive_size(
         &mut self,
         name: &str,
@@ -2580,30 +2635,9 @@ impl Assembler {
                 Ok(0)
             }
             "cnop" => {
-                // CNOP offset,align → aligns to (PC + offset) % align == 0
-                if args.len() < 2 {
-                    return Err(AsmError::with_line(
-                        "CNOP requires offset and alignment",
-                        line_no,
-                    ));
-                }
-                let _offset = evaluate_expr_str(&args[0], &self.symbols, self.pc)? as u32;
-                let alignment = evaluate_expr_str(&args[1], &self.symbols, self.pc)? as u32;
-                if alignment == 0 || !alignment.is_power_of_two() {
-                    return Err(AsmError::with_line(
-                        format!("CNOP alignment must be power of 2, got {}", alignment),
-                        line_no,
-                    ));
-                }
-                let target = self.pc + _offset;
-                let padding = if target.is_multiple_of(alignment) {
-                    0
-                } else {
-                    alignment - (target % alignment)
-                };
-                let bytes = padding;
-                if bytes > 0 {
-                    self.pc += bytes;
+                let padding = self.cnop_padding(args, line_no)?;
+                if padding > 0 {
+                    self.pc += padding;
                 }
                 Ok(0)
             }
@@ -3639,32 +3673,10 @@ impl Assembler {
                 Ok(())
             }
             "cnop" => {
-                // CNOP in pass 2: emit NOP padding. Pass 1 (see above)
-                // validates alignment is a nonzero power of two — that
-                // check must be repeated here too, not assumed carried
-                // over: if `alignment`'s expression depends on a SET
-                // symbol whose value changed between pass 1 and pass 2,
-                // pass 1's validation could have run against a different
-                // value than what's used here, and `target % alignment`
-                // below would divide by zero on an alignment of 0.
-                let _offset = evaluate_expr_str(&args[0], &self.symbols, self.pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-                    as u32;
-                let alignment = evaluate_expr_str(&args[1], &self.symbols, self.pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-                    as u32;
-                if alignment == 0 || !alignment.is_power_of_two() {
-                    return Err(AsmError::with_line(
-                        format!("CNOP alignment must be power of 2, got {}", alignment),
-                        line.line_no,
-                    ));
-                }
-                let target = self.pc + _offset;
-                let padding = if target.is_multiple_of(alignment) {
-                    0
-                } else {
-                    alignment - (target % alignment)
-                };
+                // Pass 2: emit the padding sized by `cnop_padding`, which is
+                // the same code pass 1 used — see its doc comment for why the
+                // validation re-runs here rather than being carried over.
+                let padding = self.cnop_padding(args, line.line_no)?;
                 if padding > 0 {
                     // An odd PC is squared up with a single zero byte
                     // first; only whole words after that become NOPs.
@@ -5343,6 +5355,39 @@ recur   MACRO
     }
 
     #[test]
+    fn test_rept_malformed_hex_count_is_not_silently_zero() {
+        // `$ZZ` is not a valid hex count. This used to `unwrap_or(0)`, which
+        // expanded the block zero times and dropped the NOP without any
+        // diagnostic — the reference assembler rejects the same input. The
+        // line must not assemble to just `MOVEQ`/`RTS`.
+        let mut asm = Assembler::new(0x1000);
+        let result = asm.assemble(
+            "
+    ORG $1000
+    MOVEQ #0,D0
+    REPT $ZZ
+    NOP
+    ENDR
+    RTS
+",
+        );
+        let _ = result;
+        assert!(
+            asm.errors.has_errors(),
+            "malformed REPT count was accepted silently; diagnostics: {:?}",
+            asm.errors.errors
+        );
+        assert!(
+            asm.errors
+                .errors
+                .iter()
+                .any(|d| d.message.contains("invalid REPT count")),
+            "expected an explicit REPT diagnostic, got {:?}",
+            asm.errors.errors
+        );
+    }
+
+    #[test]
     fn test_rept_with_label() {
         let mut asm = Assembler::new(0x1000);
         let result = asm.assemble(
@@ -6007,6 +6052,28 @@ far:
         let mut asm = Assembler::new(0x1000);
         let result = asm.assemble("    CNOP 0,0\n");
         assert!(result.is_err());
+    }
+
+    /// Both passes derive CNOP padding from `cnop_padding` now. A `SET`
+    /// symbol as the alignment is the case where two separately written
+    /// copies could have drifted, since its value is re-evaluated per pass.
+    #[test]
+    fn test_cnop_alignment_from_set_symbol_agrees_across_passes() {
+        let mut asm = Assembler::new(0x1000);
+        let result = asm.assemble(
+            "
+ALIGNVAL SET 4
+    ORG $1000
+    DC.B 1
+    CNOP 0,ALIGNVAL
+    DC.W $1234
+",
+        );
+        assert!(result.is_ok(), "CNOP failed: {:?}", result.err());
+        // A pass-1/pass-2 disagreement shows up as a shifted address here:
+        // 0x1000 + 1 byte, padded up to the next 4-byte boundary.
+        let last = asm.code.last().expect("DC.W was emitted");
+        assert_eq!(last.pc, 0x1004);
     }
 
     #[test]

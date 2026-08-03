@@ -53,7 +53,13 @@ fn asm_reads_stdin_and_writes_stdout() {
 
 #[test]
 fn asm_stdin_matches_file_input() {
-    let dir = std::env::temp_dir().join(format!("m68k-cli-stdin-{}", std::process::id()));
+    // Name is unique per process and per test binary, so a concurrent
+    // `cargo test` run (or a recycled PID) cannot collide here.
+    let dir = std::env::temp_dir().join(format!(
+        "m68k-cli-stdin-{}-{}",
+        std::process::id(),
+        env!("CARGO_CRATE_NAME")
+    ));
     std::fs::create_dir_all(&dir).expect("failed to create temp dir");
     let src = dir.join("t.s");
     let out = dir.join("t.bin");

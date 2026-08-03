@@ -173,7 +173,9 @@ impl SRecordWriter {
             return;
         }
 
-        // Determine max address to choose record type
+        // Determine max address to choose record type. The `is_empty()`
+        // guard above means the iterator always yields at least one element,
+        // so the fallback is unreachable rather than a masked empty case.
         let max_addr = instructions
             .iter()
             .map(|i| i.pc + i.size_bytes() as u32 - 1)
@@ -322,7 +324,20 @@ fn compute_checksum_srec(byte_count: u8, _record_type: u8, data: &[u8]) -> u8 {
     (!sum & 0xFF) as u8
 }
 
+/// Sums the byte pairs of an already-formatted S-Record body.
+///
+/// The input is always produced by `format!("{:02X}")` immediately above the
+/// single call site, so every pair is valid ASCII hex by construction. The
+/// fallbacks below therefore only guard against a future caller passing
+/// arbitrary text: a non-hex pair contributes 0 rather than silently
+/// corrupting the record, and `debug_assert!` makes that case loud in tests
+/// instead of shipping a wrong checksum unnoticed.
 fn compute_srec_checksum_from_str(hex_str: &str) -> u8 {
+    debug_assert!(
+        hex_str.len().is_multiple_of(2) && hex_str.bytes().all(|b| b.is_ascii_hexdigit()),
+        "S-Record body must be an even-length ASCII hex string, got {:?}",
+        hex_str
+    );
     let mut sum: u16 = 0;
     let bytes = hex_str.as_bytes();
     let mut i = 0;
