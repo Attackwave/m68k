@@ -16,9 +16,12 @@ jobs:
     steps:
       - run: echo "Release approved for ${{ github.ref_name }}"
 
-  build-and-release:
+  build:
     needs: approve
     strategy:
+      # A broken archive on one platform should not hide whether the others
+      # built, so all three always run to completion.
+      fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
@@ -44,26 +47,129 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --target ${{ matrix.target }}
 
+      - name: Smoke-test the binaries
+        shell: bash
+        # Catches an archive full of binaries that cannot run at all — a
+        # broken build, a missing runtime, a wrong-architecture cross-build.
+        # Assembling and disassembling through a pipe exercises both tools
+        # and the stdin/stdout paths in one go.
+        run: |
+          set -eu
+          bindir="target/${{ matrix.target }}/release"
+          printf '\tmoveq\t#0,d0\n\trts\n' > smoke.s
+          "$bindir/m68k-asm${{ matrix.suffix }}" smoke.s -o smoke.bin
+          # 7000 4e75 = MOVEQ #0,D0 / RTS
+          actual=$(od -An -tx1 -v smoke.bin | tr -d ' \n')
+          if [ "$actual" != "70004e75" ]; then
+            echo "unexpected assembler output: $actual" >&2
+            exit 1
+          fi
+          "$bindir/m68k-disasm${{ matrix.suffix }}" smoke.bin | grep -qi 'moveq'
+          "$bindir/m68k-floppy${{ matrix.suffix }}" --help > /dev/null
+          echo "smoke test passed for ${{ matrix.target }}"
+
       - name: Package archive
         shell: bash
         run: |
           set -eu
-          staging="m68k-${{ matrix.target }}"
+          staging="m68k-${{ github.ref_name }}-${{ matrix.target }}"
           mkdir -p "$staging"
           for bin in m68k-asm m68k-disasm m68k-floppy; do
             cp "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" "$staging/"
           done
-          if [ "${{ runner.os }}" = "Windows" ]; then
-            7z a "${staging}.zip" "$staging"
-            echo "ASSET=${staging}.zip" >> "$GITHUB_ENV"
-          else
-            tar czf "${staging}.tar.gz" "$staging"
-            echo "ASSET=${staging}.tar.gz" >> "$GITHUB_ENV"
+          # Ship the licence and readme alongside the binaries — an archive
+          # of bare executables says nothing about its own terms. No `|| true`
+          # here: if either file goes missing the release should fail loudly.
+          cp README.md LICENSE "$staging/"
+
+          # Strip on the platforms where it is reliable. Windows MSVC keeps
+          # its debug info in a separate .pdb that is not shipped, so there
+          # is nothing to strip there.
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            strip "$staging"/m68k-asm "$staging"/m68k-disasm "$staging"/m68k-floppy
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            strip -x "$staging"/m68k-asm "$staging"/m68k-disasm "$staging"/m68k-floppy
           fi
 
-      - name: Upload assets to GitHub Release
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${staging}.zip" "$staging" > /dev/null
+            asset="${staging}.zip"
+          else
+            tar czf "${staging}.tar.gz" "$staging"
+            asset="${staging}.tar.gz"
+          fi
+          echo "ASSET=${asset}" >> "$GITHUB_ENV"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: archive-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    # Everything is published from one job so the release either has the
+    # complete set of assets or fails visibly — previously each platform
+    # uploaded on its own, and a mid-matrix failure left a half-populated
+    # release behind with no single place to see it.
+    needs: build
+    name: Publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          # Full history so `git archive` sees the tag, and so the release
+          # notes below can reach the previous tag.
+          fetch-depth: 0
+
+      - name: Download platform archives
+        uses: actions/download-artifact@v7
+        with:
+          pattern: archive-*
+          path: dist
+          merge-multiple: true
+
+      - name: Add source archives
+        run: |
+          set -eu
+          name="m68k-${{ github.ref_name }}"
+          # `git archive` on the tag, rather than the auto-generated GitHub
+          # tarball: this one is reproducible and honours .gitattributes.
+          git archive --format=tar.gz --prefix="${name}/" \
+            -o "dist/${name}-source.tar.gz" "${{ github.ref_name }}"
+          git archive --format=zip --prefix="${name}/" \
+            -o "dist/${name}-source.zip" "${{ github.ref_name }}"
+
+      - name: Generate checksums
+        run: |
+          set -eu
+          cd dist
+          # One .sha256 per asset for spot-checking, plus a combined
+          # SHA256SUMS that `sha256sum -c` can verify in a single pass.
+          for f in *; do
+            case "$f" in *.sha256|SHA256SUMS) continue;; esac
+            sha256sum "$f" > "${f}.sha256"
+          done
+          sha256sum $(ls | grep -vE '\.sha256$|^SHA256SUMS$') > SHA256SUMS
+          echo "--- release assets ---"
+          ls -la
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
+      - name: Verify checksums
+        # Reads back what was just written, so a corrupted upload candidate
+        # fails here rather than being discovered by whoever downloads it.
+        run: cd dist && sha256sum -c SHA256SUMS
+
+      - name: Publish release
         uses: softprops/action-gh-release@v3
         with:
-          files: ${{ env.ASSET }}
+          name: ${{ github.ref_name }}
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
