@@ -340,7 +340,13 @@ pub fn split_line(line: &str) -> (Option<String>, String, String, Vec<String>) {
         let rest_parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
         if let Some(first) = rest_parts.first() {
             let mnem = first.split('.').next().unwrap_or(first).to_lowercase();
-            if is_directive(&mnem) {
+            // `REG` needs a label but is also a plausible symbol name, and
+            // the reference assembler accepts it as one. It is only a
+            // directive when a register list follows, which tells
+            // `SAVE REG D0-D3` (label + directive) apart from `BEQ REG`
+            // (branch to a label called REG).
+            let is_reg_directive = mnem == "reg" && rest_parts.len() == 2;
+            if is_directive(&mnem) || is_reg_directive {
                 return parse_rest_with_label(rest, Some(parts[0].to_string()));
             }
         }
@@ -486,11 +492,27 @@ fn takes_cache_scope_operand(word: &str) -> bool {
     )
 }
 
+/// Directive names recognised while *splitting* a line, so that
+/// `NAME DIRECTIVE args` is understood as a label plus a directive rather
+/// than as a mnemonic.
+///
+/// Only directives that genuinely take a label belong here. A name in this
+/// list is also claimed in the *operand* position — `BEQ far` would be read
+/// as the label `BEQ` followed by the directive `far` — so an entry that
+/// does not need a label makes that word unusable as a symbol. The
+/// reference assembler accepts `far`, `near`, `auto`, `reg` and `cpu` as
+/// ordinary labels, and so must this.
+///
+/// Directives that stand alone (`NEAR`, `MACHINE 68020`, `INCDIR "x"`) are
+/// deliberately absent; `assembler::is_directive_name` recognises them once
+/// the line has been split, which is enough.
 fn is_directive(s: &str) -> bool {
     matches!(
         s,
         "org"
             | "equ"
+            // EQUR/REG are label-taking by definition: `CNT EQUR D3`.
+            | "equr"
             | "dc"
             | "dcb"
             | "ds"
