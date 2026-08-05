@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use m68k_core::errors::{AsmError, ErrorCollector};
-use m68k_core::operands::Operand;
+use m68k_core::operands::{MemoryIndirectOperand, Operand};
 use m68k_core::tokens::{is_local_label, split_line};
 
 use crate::directives::{
@@ -501,6 +501,28 @@ fn parse_operand_text(
         ));
     }
 
+    // Indexed with the base register suppressed: `(bd,Xn.size*scale)`, and
+    // the explicit `(bd,ZAn,Xn.size*scale)` spelling for the same thing.
+    // This is a 68020 full-format EA that the encoder has always been able
+    // to emit — `MemoryIndirectOperand::base_reg` is an `Option` precisely
+    // for it — but no parser produced one, so the reference assembled
+    // `move.l ($1000,d0.w*8),d1` and we rejected it.
+    if let Some((xn, disp, scale, xn_is_long)) =
+        parse_parens_disp_index_no_base(paren_text, symbols, current_pc)
+    {
+        return Ok(Operand::MemoryIndirect(Box::new(MemoryIndirectOperand {
+            base_reg: None,
+            base_is_pc: false,
+            base_disp: Some(disp),
+            index_reg: Some(xn),
+            index_long: xn_is_long,
+            index_scale: scale,
+            outer_disp: None,
+            is_postindexed: false,
+            is_indirect: false,
+        })));
+    }
+
     // Absolute address with .W/.L suffix.
     //
     // Case-insensitively: this used to test only for the upper-case forms,
@@ -534,6 +556,29 @@ fn parse_operand_text(
                 Ok(Operand::AbsoluteShort(value as i32))
             };
         }
+    }
+
+    // Parenthesised absolute address: `($1234)`. Every form that puts a
+    // register inside the parens has been tried above, so a remaining
+    // bracketed expression is just an address with redundant parentheses —
+    // which the reference accepts and real listings contain.
+    if let Some(inner) = text
+        .trim()
+        .strip_prefix('(')
+        .and_then(|t| t.strip_suffix(')'))
+        && !inner.contains('(')
+        && !inner.contains(')')
+        && !inner.contains(',')
+        && parse_register(inner.trim()).is_none()
+        && let Ok(value) = evaluate_expr_str(inner, symbols, current_pc)
+    {
+        return Ok(
+            if symbols.optimize_absolute() && (0..=0xFFFF).contains(&value) {
+                Operand::AbsoluteShort(value as i32)
+            } else {
+                Operand::AbsoluteLong(value as i32)
+            },
+        );
     }
 
     // Absolute address: $xxxx or a number/label without a register.
@@ -961,6 +1006,51 @@ fn parse_parens_disp_pc_index(
 /// Supports optional scale: (d8,An,Xn*1), (d8,An,Xn*2), (d8,An,Xn*4), (d8,An,Xn*8)
 /// Supports optional index size: (d8,An,Xn.W), (d8,An,Xn.L)
 /// Returns (An, Xn, disp, scale, is_long).
+/// Parse `(bd,Xn.size*scale)` — an indexed EA with the base register
+/// suppressed — and the equivalent `(bd,ZAn,Xn.size*scale)` spelling.
+///
+/// Distinguished from `(bd,An,Xn)` by the middle field: either it is
+/// absent, or it names a suppressed base (`ZA0`..`ZA7`, `ZPC`). Returns
+/// the index register, base displacement, scale and index size.
+fn parse_parens_disp_index_no_base(
+    text: &str,
+    symbols: &SymbolTable,
+    pc: u32,
+) -> Option<(u8, i32, u8, bool)> {
+    let trimmed = text.trim();
+    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').collect();
+
+    let (disp_str, xn_full) = match parts.len() {
+        // (bd,Xn)
+        2 => (parts[0].trim(), parts[1].trim()),
+        // (bd,ZAn,Xn) — explicit base suppression
+        3 => {
+            let mid = parts[1].trim().to_uppercase();
+            let suppressed = mid == "ZPC"
+                || (mid.starts_with("ZA") && mid.len() == 3 && mid.as_bytes()[2].is_ascii_digit());
+            if !suppressed {
+                return None;
+            }
+            (parts[0].trim(), parts[2].trim())
+        }
+        _ => return None,
+    };
+
+    // The middle field of the 2-part form must be an index register, not a
+    // base one — `(4,A0)` is a plain displacement and belongs elsewhere.
+    let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
+    let reg = parse_register(&xn_name)?;
+    let xn = index_reg_num(&reg)?;
+    // A bare `(An,Xn)` has already been handled by the caller above; here a
+    // two-part form only qualifies when the first field is not a register.
+    if parts.len() == 2 && parse_register(disp_str).is_some() {
+        return None;
+    }
+    let disp = evaluate_displacement(disp_str, symbols, pc);
+    Some((xn, disp, scale, is_long))
+}
+
 fn parse_parens_disp_reg_index(
     text: &str,
     symbols: &SymbolTable,
@@ -1131,6 +1221,8 @@ fn parse_memory_indirect(
         index_scale,
         outer_disp,
         is_postindexed,
+        // Reached only from the bracketed syntax.
+        is_indirect: true,
     }))
 }
 

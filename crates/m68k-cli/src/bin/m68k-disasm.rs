@@ -106,6 +106,13 @@ fn run(args: Args) -> Result<(), String> {
             eprintln!("{}", line.text);
             continue;
         }
+        // Emit the label definition on its own line, ahead of the
+        // instruction it marks. Without it the output referenced labels
+        // that were never defined anywhere, so it could not be fed back
+        // into the assembler.
+        if let Some(label) = &line.label {
+            println!("{}:", label);
+        }
         if args.raw {
             let hex: String = line
                 .raw_bytes

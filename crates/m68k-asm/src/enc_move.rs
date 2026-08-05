@@ -231,6 +231,12 @@ pub fn enc_movep(src: &Operand, dst: &Operand, size: &str) -> Result<Vec<u16>, A
     let (data_reg, addr_reg, disp, to_mem) = match (src, dst) {
         (Operand::DataReg(dr), Operand::AddrRegIndirectDisp(ar, d, _)) => (*dr, *ar, *d, true),
         (Operand::AddrRegIndirectDisp(ar, d, _), Operand::DataReg(dr)) => (*dr, *ar, *d, false),
+        // `(An)` without a displacement means displacement 0. MOVEP has no
+        // plain-indirect encoding, so the operand shape differs from the
+        // instruction's addressing mode — the reference accepts
+        // `movep.w (a2),d6` and emits the same bytes as `0(a2)`.
+        (Operand::DataReg(dr), Operand::AddrRegIndirect(ar)) => (*dr, *ar, 0, true),
+        (Operand::AddrRegIndirect(ar), Operand::DataReg(dr)) => (*dr, *ar, 0, false),
         _ => return Err(AsmError::new("MOVEP requires Dn,(An,disp) or (An,disp),Dn")),
     };
     let op_mode = if to_mem {

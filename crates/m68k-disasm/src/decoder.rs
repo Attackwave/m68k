@@ -139,7 +139,11 @@ fn standard_ea_role(parser: ParserType) -> Option<StandardEa> {
         | ParserType::Jmp
         | ParserType::Jsr
         | ParserType::Pea
-        | ParserType::MovemMr => Source,
+        | ParserType::MovemMr
+        | ParserType::Callm
+        | ParserType::Chk2Cmp2
+        | ParserType::DivLong
+        | ParserType::MulLong => Source,
         ParserType::RegEa
         | ParserType::ImmEa
         | ParserType::Quick
@@ -156,7 +160,12 @@ fn standard_ea_role(parser: ParserType) -> Option<StandardEa> {
         | ParserType::Tst
         | ParserType::SingleEa
         | ParserType::Scc
-        | ParserType::MovemRm => Destination,
+        | ParserType::MovemRm
+        | ParserType::Cas
+        | ParserType::Clr
+        | ParserType::Cmpi
+        | ParserType::Moves
+        | ParserType::ShiftMem => Destination,
         _ => return None,
     })
 }
@@ -1263,9 +1272,23 @@ fn parse_operands(
             let size = if opmode & 0x1 != 0 { "l" } else { "w" };
             let reg = ((op >> 9) & 0x7) as u8;
             let addr_reg = (op & 0x7) as u8;
-            let disp = sign_extend_8(stream.read_word()? as u8);
+            // MOVEP's displacement is a full 16-bit word, not a byte:
+            // `sign_extend_8` threw away the high half, so `0d0a 1234`
+            // decoded as `movep.w $34(a2),d6` — a different address.
+            let disp = sign_extend_16(stream.read_word()?);
             let dreg = DecodedOperand::from_ea(EAOperand::DataReg(reg));
-            let mem = DecodedOperand::from_ea(EAOperand::AddrDisp(addr_reg, disp));
+            // Rendered with an explicit displacement even when it is zero.
+            // `AddrDisp` formats `0(a2)` as `(a2)`, which is right for the
+            // ordinary indirect mode but not here: MOVEP has no such mode,
+            // so the shortened form does not reassemble.
+            // Negative displacements are printed in decimal: the reference
+            // rejects `$fffe(a2)` as out of range for a signed 16-bit
+            // field but takes `-2(a2)`, which encodes to the same bytes.
+            let mem = DecodedOperand::special(if disp < 0 {
+                format!("{}(a{})", disp, addr_reg)
+            } else {
+                format!("${:x}(a{})", disp, addr_reg)
+            });
             if to_mem {
                 operands.push(dreg);
                 operands.push(mem);

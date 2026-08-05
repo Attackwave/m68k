@@ -320,7 +320,14 @@ fn encode_full_ea(
     // Indirect Postindexed - the struct's own doc comment (operands.rs) already
     // documents this correctly; this encoder previously had it backwards, the
     // same inversion as the decoder's `is_postindexed` in addressing.rs.
-    let i_i_s: u16 = if mi.is_postindexed {
+    let i_i_s: u16 = if !mi.is_indirect {
+        // No memory indirection: `(bd,Xn.size*scale)` with the base
+        // register suppressed uses the full-format extension word but
+        // selects I/IS = 0. Encoding it as an indirect form put a 1 in the
+        // low nibble — `($1000,d0.w*8)` came out as `07a1` where the
+        // reference has `07a0`.
+        0
+    } else if mi.is_postindexed {
         5 + iis_offset
     } else {
         1 + iis_offset
@@ -457,6 +464,7 @@ mod tests {
             index_scale: 1,
             outer_disp: None,
             is_postindexed: false,
+            is_indirect: true,
         }
     }
 
@@ -489,6 +497,7 @@ mod tests {
             index_scale: 2,
             outer_disp: Some(0x20),
             is_postindexed: false,
+            is_indirect: true,
         };
         let op = Operand::MemoryIndirect(Box::new(mi));
         let (mode, reg, ext) = encode_ea(&op, "l", 0, 0xFFFF, "68020").unwrap();
@@ -508,6 +517,7 @@ mod tests {
             index_scale: 2,
             outer_disp: Some(0x20),
             is_postindexed: true,
+            is_indirect: true,
         };
         let op = Operand::MemoryIndirect(Box::new(mi));
         let (mode, reg, ext) = encode_ea(&op, "l", 0, 0xFFFF, "68020").unwrap();
@@ -526,6 +536,7 @@ mod tests {
             index_scale: 1,
             outer_disp: None,
             is_postindexed: false,
+            is_indirect: true,
         };
         let op = Operand::MemoryIndirect(Box::new(mi));
         let err = encode_ea(&op, "l", 0, 0xFFFF, "68020").unwrap_err();
