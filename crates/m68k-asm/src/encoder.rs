@@ -11,47 +11,19 @@ use crate::enc_math::*;
 use crate::enc_mmu::*;
 use crate::enc_move::*;
 
-/// FPU arithmetic-instruction opclass/opmode field (extension word bits 6-0), by mnemonic.
+/// FPU arithmetic-instruction opclass/opmode field (extension word bits 6-0).
+///
+/// Delegates to the shared table in `m68k-core`; the assembler and the
+/// disassembler previously kept separate copies that had drifted from the
+/// hardware in the same six places, so they agreed with each other and
+/// nothing failed.
 fn fpu_arith_cmd(mnemonic: &str) -> Option<u16> {
-    Some(match mnemonic {
-        "FINT" => 0x01,
-        "FSINH" => 0x02,
-        "FINTRZ" => 0x03,
-        "FSQRT" => 0x04,
-        "FLOGNP1" => 0x06,
-        "FETOXM1" => 0x08,
-        "FTANH" => 0x09,
-        "FATAN" => 0x0A,
-        "FTAN" => 0x0B,
-        "FASIN" => 0x0C,
-        "FATANH" => 0x0D,
-        "FSIN" => 0x0E,
-        "FTENTOX" => 0x0F,
-        "FTWOTOX" => 0x10,
-        "FETOX" => 0x11,
-        "FLOG10" => 0x12,
-        "FLOG2" => 0x14,
-        "FLOGN" => 0x15,
-        "FABS" => 0x18,
-        "FCOSH" => 0x19,
-        "FNEG" => 0x1A,
-        "FACOS" => 0x1C,
-        "FCOS" => 0x1D,
-        "FGETEXP" => 0x1E,
-        "FGETMAN" => 0x1F,
-        "FDIV" => 0x20,
-        "FMOD" => 0x21,
-        "FADD" => 0x22,
-        "FMUL" => 0x23,
-        "FSGLDIV" => 0x24,
-        "FREM" => 0x25,
-        "FSCALE" => 0x26,
-        "FSGLMUL" => 0x27,
-        "FSUB" => 0x28,
-        "FCMP" => 0x38,
-        "FTST" => 0x3A,
-        _ => return None,
-    })
+    // FMOVE has its own dispatch path (register/control-register forms and
+    // the k-factor syntax), so it is deliberately not reachable here.
+    if mnemonic.eq_ignore_ascii_case("fmove") {
+        return None;
+    }
+    m68k_core::opcodes::fpu_arith_code(mnemonic)
 }
 
 /// "Short" (rounding-precision-forcing) FPU instruction opclass/opmode field, by mnemonic.

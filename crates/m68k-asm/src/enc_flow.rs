@@ -115,13 +115,25 @@ pub fn enc_bsr(target: i32, pc: u32) -> Result<Vec<u16>, AsmError> {
 }
 
 /// Encode DBcc instruction.
+///
+/// Base is `0x50C8 | (cc << 8) | reg` — **not** `0x51C8 | ...`. The often
+/// quoted `0x51C8` is the encoding of `DBF`/`DBRA` specifically, whose
+/// condition code happens to be 1; using it as the base ORs that 1 into
+/// every condition, turning each even code into the odd one above it.
+/// `DBT` (cc=0) came out as `DBF`, `DBHI` (2) as `DBLS` (3), and so on for
+/// all eight even conditions — a loop that never terminates where the
+/// source asked for one that terminates immediately, and vice versa.
+///
+/// This survived because the only test covered `DBF`, the one condition
+/// where both forms agree. Verified against the reference across all
+/// sixteen conditions.
 pub fn enc_dbcc(cond: &str, reg: u8, target: i32, pc: u32) -> Result<Vec<u16>, AsmError> {
     let cc = cond_code(cond)?;
     let disp = target.wrapping_sub(pc as i32);
     if !(-32768..=32767).contains(&disp) {
         return Err(AsmError::new("DBcc displacement out of range"));
     }
-    let op = 0x5100 | ((cc as u16) << 8) | 0x00C8 | (reg as u16);
+    let op = 0x50C8 | ((cc as u16) << 8) | (reg as u16);
     Ok(vec![op, (disp & 0xFFFF) as u16])
 }
 
@@ -1109,6 +1121,40 @@ mod tests {
     fn test_dbra() {
         let words = enc_dbcc("f", 0, 0x100, 0x104).unwrap();
         assert_eq!(words, vec![0x51C8, 0xFFFC]);
+    }
+
+    #[test]
+    fn test_dbcc_all_conditions() {
+        // `DBF` (cc=1) is the one condition where the old `0x51C8` base
+        // agreed with the correct `0x50C8`, which is why testing only that
+        // one hid the bug for every even condition. Reference-verified.
+        for (cond, cc) in [
+            ("t", 0u16),
+            ("f", 1),
+            ("hi", 2),
+            ("ls", 3),
+            ("cc", 4),
+            ("cs", 5),
+            ("ne", 6),
+            ("eq", 7),
+            ("vc", 8),
+            ("vs", 9),
+            ("pl", 10),
+            ("mi", 11),
+            ("ge", 12),
+            ("lt", 13),
+            ("gt", 14),
+            ("le", 15),
+        ] {
+            let words = enc_dbcc(cond, 0, 0x100, 0x102).unwrap();
+            assert_eq!(
+                words[0],
+                0x50C8 | (cc << 8),
+                "DB{} encoded as {:#06x}",
+                cond,
+                words[0]
+            );
+        }
     }
 
     #[test]

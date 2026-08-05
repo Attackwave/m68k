@@ -1664,3 +1664,71 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
         },
     ]
 }
+
+/// FPU arithmetic opclass/opmode codes (extension word bits 6-0).
+///
+/// The single source of truth for both directions. The assembler and the
+/// disassembler each used to carry their own copy, and six entries had
+/// drifted apart from the hardware in *both* copies identically: `FTAN`
+/// sat at 0x0B (unassigned) while 0x0F held `FTENTOX`, and the
+/// exponential/logarithm group was rotated by one. Every affected
+/// instruction assembled to a different but perfectly valid FPU operation
+/// — `FETOX` emitting `FTWOTOX`, `FLOGN` emitting `FLOG10` — with no
+/// diagnostic anywhere, because the two tables agreed with each other.
+///
+/// Verified entry by entry against the reference assembler.
+pub const FPU_ARITH_OPS: &[(u16, &str)] = &[
+    (0x00, "fmove"),
+    (0x01, "fint"),
+    (0x02, "fsinh"),
+    (0x03, "fintrz"),
+    (0x04, "fsqrt"),
+    (0x06, "flognp1"),
+    (0x08, "fetoxm1"),
+    (0x09, "ftanh"),
+    (0x0A, "fatan"),
+    (0x0C, "fasin"),
+    (0x0D, "fatanh"),
+    (0x0E, "fsin"),
+    (0x0F, "ftan"),
+    (0x10, "fetox"),
+    (0x11, "ftwotox"),
+    (0x12, "ftentox"),
+    (0x14, "flogn"),
+    (0x15, "flog10"),
+    (0x16, "flog2"),
+    (0x18, "fabs"),
+    (0x19, "fcosh"),
+    (0x1A, "fneg"),
+    (0x1C, "facos"),
+    (0x1D, "fcos"),
+    (0x1E, "fgetexp"),
+    (0x1F, "fgetman"),
+    (0x20, "fdiv"),
+    (0x21, "fmod"),
+    (0x22, "fadd"),
+    (0x23, "fmul"),
+    (0x24, "fsgldiv"),
+    (0x25, "frem"),
+    (0x26, "fscale"),
+    (0x27, "fsglmul"),
+    (0x28, "fsub"),
+    (0x38, "fcmp"),
+    (0x3A, "ftst"),
+];
+
+/// Opcode for an FPU arithmetic mnemonic (case-insensitive).
+pub fn fpu_arith_code(mnemonic: &str) -> Option<u16> {
+    FPU_ARITH_OPS
+        .iter()
+        .find(|(_, n)| n.eq_ignore_ascii_case(mnemonic))
+        .map(|(c, _)| *c)
+}
+
+/// Mnemonic for an FPU arithmetic opcode.
+pub fn fpu_arith_mnemonic(code: u16) -> Option<&'static str> {
+    FPU_ARITH_OPS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, n)| *n)
+}

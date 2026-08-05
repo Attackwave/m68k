@@ -7191,8 +7191,12 @@ mymexc MACRO
 
     #[test]
     fn test_dbne_with_label_target() {
+        // DBNE is condition code 6, so the opword is 0x56C9. This test
+        // asserted 0x57C9 — the encoding of DBEQ — because the encoder
+        // used 0x51C8 as its base, which ORs DBF's condition bit into
+        // every even condition. Reference: `dbne d1,lbl` = `56c9 fffe`.
         let bytes = assemble_source_with_cpu("LOOP:\n    DBNE D1,LOOP\n", "68000");
-        assert_eq!(bytes, vec![0x57, 0xC9, 0xFF, 0xFE]);
+        assert_eq!(bytes, vec![0x56, 0xC9, 0xFF, 0xFE]);
     }
 
     #[test]

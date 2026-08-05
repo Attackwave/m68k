@@ -1524,48 +1524,10 @@ fn fpu_fmt_suffix(fmt: u16) -> &'static str {
     }
 }
 
-/// FPU monadic/dyadic arithmetic opclass/opmode (extension word bits 6-0) to mnemonic.
+/// FPU monadic/dyadic arithmetic opclass/opmode (extension word bits 6-0)
+/// to mnemonic. Shares its table with the encoder, in `m68k-core`.
 fn fpu_arith_name(cmd: u16) -> Option<&'static str> {
-    Some(match cmd {
-        0x00 => "fmove",
-        0x01 => "fint",
-        0x02 => "fsinh",
-        0x03 => "fintrz",
-        0x04 => "fsqrt",
-        0x06 => "flognp1",
-        0x08 => "fetoxm1",
-        0x09 => "ftanh",
-        0x0A => "fatan",
-        0x0B => "ftan",
-        0x0C => "fasin",
-        0x0D => "fatanh",
-        0x0E => "fsin",
-        0x0F => "ftentox",
-        0x10 => "ftwotox",
-        0x11 => "fetox",
-        0x12 => "flog10",
-        0x14 => "flog2",
-        0x15 => "flogn",
-        0x18 => "fabs",
-        0x19 => "fcosh",
-        0x1A => "fneg",
-        0x1C => "facos",
-        0x1D => "fcos",
-        0x1E => "fgetexp",
-        0x1F => "fgetman",
-        0x20 => "fdiv",
-        0x21 => "fmod",
-        0x22 => "fadd",
-        0x23 => "fmul",
-        0x24 => "fsgldiv",
-        0x25 => "frem",
-        0x26 => "fscale",
-        0x27 => "fsglmul",
-        0x28 => "fsub",
-        0x38 => "fcmp",
-        0x3A => "ftst",
-        _ => return None,
-    })
+    m68k_core::opcodes::fpu_arith_mnemonic(cmd)
 }
 
 /// "Short" (rounding-precision-forcing) FPU opclass/opmode to mnemonic.
