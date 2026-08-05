@@ -4,8 +4,19 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::Parser;
-use m68k_core::amiga_hunk::read_hunk_executable;
+use m68k_core::amiga_hunk::{SectionKind, read_hunk_executable};
 use m68k_disasm::disassembler::Disassembler;
+
+/// Layout facts recovered from an Amiga Hunk executable's own metadata,
+/// handed to the disassembler so it need not infer them from the bytes.
+struct HunkInfo {
+    /// Addresses of relocated 32-bit pointers.
+    relocs: Vec<u32>,
+    /// `[start, end)` spans of non-code hunks.
+    data_ranges: Vec<(u32, u32)>,
+    /// The executable's entry point, if it has any hunks at all.
+    entry: Option<u32>,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "m68k-disasm")]
@@ -84,14 +95,33 @@ fn run(args: Args) -> Result<(), String> {
     // Amiga Hunk executables (HUNK_HEADER magic 0x000003F3) get their
     // hunks loaded, relocated, and flattened into one image; everything
     // else is treated as a raw binary at the given start address.
+    let mut hunk_info: Option<HunkInfo> = None;
     let (image, base_addr, known_labels) = if data.len() >= 4 && data[0..4] == [0, 0, 0x03, 0xf3] {
         let exe = read_hunk_executable(&data, start_addr)
             .map_err(|e| format!("cannot read '{}': {}", input_display(&args.input), e))?;
-        let labels = exe
+        let labels: Vec<(u32, String)> = exe
             .all_symbols()
             .into_iter()
             .map(|(name, addr)| (addr, name))
             .collect();
+        // What the linker recorded about this executable: every relocated
+        // longword is a pointer, and every non-Code hunk is data outright.
+        // Both beat guessing from the bytes.
+        hunk_info = Some(HunkInfo {
+            relocs: exe.all_relocs(),
+            data_ranges: exe
+                .sections
+                .iter()
+                .filter(|s| s.kind != SectionKind::Code)
+                .filter_map(|s| {
+                    s.address
+                        .checked_add(s.data.len() as u32)
+                        .map(|end| (s.address, end))
+                })
+                .collect(),
+            // Execution begins at the start of the first hunk.
+            entry: exe.sections.first().map(|s| s.address),
+        });
         (exe.image, exe.load_base, labels)
     } else {
         (data, start_addr, Vec::new())
@@ -99,6 +129,11 @@ fn run(args: Args) -> Result<(), String> {
 
     let mut disasm = Disassembler::new(image, base_addr);
     disasm.add_known_labels(known_labels);
+    if let Some(info) = hunk_info {
+        disasm.add_pointer_sites(info.relocs);
+        disasm.add_data_ranges(info.data_ranges);
+        disasm.add_entry_points(info.entry);
+    }
     disasm.set_cpu(&args.cpu);
 
     for line in disasm.disassemble() {
