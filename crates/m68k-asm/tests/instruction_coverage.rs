@@ -222,7 +222,10 @@ const EXT_68010_68020: &[Case] = &[
     c("RTM D2", "68020"),
     c("RTM A3", "68020"),
     c("CALLM #4,(A0)", "68020"),
+    c("CALLM #255,(A0)", "68020"),
     c("CHK.L D0,D1", "68020"),
+    c("CHK.W (A0),D3", "68000"),
+    c("CHK.L (A0),D3", "68020"),
     c("LINK.L A5,#-4", "68020"),
     // TRAPcc, all three operand forms
     c("TRAPEQ", "68020"),

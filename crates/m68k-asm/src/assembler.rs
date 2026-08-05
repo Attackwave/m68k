@@ -1221,6 +1221,8 @@ fn evaluate_simple_number(text: &str) -> Option<i32> {
         i32::from_str_radix(hex, 16).ok()?
     } else if let Some(bin) = body.strip_prefix('%') {
         i32::from_str_radix(bin, 2).ok()?
+    } else if let Some(oct) = body.strip_prefix('@') {
+        i32::from_str_radix(oct, 8).ok()?
     } else {
         body.parse::<i32>().ok()?
     };
@@ -1357,6 +1359,17 @@ fn is_directive_name(name: &str) -> bool {
             | "section"
             | "xref"
             | "xdef"
+            | "equr"
+            | "reg"
+            | "incdir"
+            | "machine"
+            | "cpu"
+            | "fpu"
+            | "near"
+            | "far"
+            | "auto"
+            | "inline"
+            | "einline"
             | "public"
             | "extern"
             | "rept"
@@ -1480,6 +1493,14 @@ pub struct Assembler {
     /// Extra directories searched for `INCLUDE` files (the `-I` paths),
     /// tried after the including file's own directory.
     pub include_paths: Vec<PathBuf>,
+    /// `EQUR` register aliases and `REG` register lists, keyed by
+    /// upper-cased name.
+    ///
+    /// Both are pure textual substitutions — `CNT EQUR D3` makes `CNT` mean
+    /// `D3` everywhere a register may appear, and `SAVE REG D0-D3/A0-A2`
+    /// does the same for a `MOVEM` list. Verified against the reference:
+    /// the aliased and spelled-out forms assemble to identical bytes.
+    pub register_aliases: HashMap<String, String>,
     /// Files already spliced in, so each is included only once.
     included_files: std::collections::HashSet<PathBuf>,
     /// Most recent global (non-local) label, used to scope local labels.
@@ -1595,6 +1616,7 @@ impl Assembler {
             line_pcs: Vec::new(),
             source_root: PathBuf::from("."),
             include_paths: Vec::new(),
+            register_aliases: HashMap::new(),
             included_files: std::collections::HashSet::new(),
             conditional_stack: Vec::new(),
             macro_definitions: HashMap::new(),
@@ -2144,9 +2166,13 @@ impl Assembler {
     fn expand_includes(&mut self, source: &str, depth: usize) -> Result<String, AsmError> {
         const MAX_INCLUDE_DEPTH: usize = 64;
 
+        // INCDIR has to be handled here rather than in pass 1: includes are
+        // expanded in this separate sweep, so by the time pass 1 sees an
+        // `incdir` line the `include` below it has already been resolved —
+        // and failed.
         if !source
             .lines()
-            .any(|l| matches!(split_line(l).1.as_str(), "include"))
+            .any(|l| matches!(split_line(l).1.as_str(), "include" | "incdir"))
         {
             return Ok(source.to_string());
         }
@@ -2160,6 +2186,26 @@ impl Assembler {
         let mut out = String::with_capacity(source.len());
         for (idx, raw) in source.lines().enumerate() {
             let (_, mnemonic, size, operands) = split_line(raw);
+            if mnemonic == "incdir" {
+                // Register the search path and keep the line: pass 1 sees it
+                // again as a no-op, and dropping it here would change line
+                // numbers in diagnostics.
+                let args = build_directive_args(&None, &size, &operands);
+                if let Some(arg) = args.first() {
+                    let dir = strip_quotes(arg.trim()).to_string();
+                    let path = if std::path::Path::new(&dir).is_absolute() {
+                        std::path::PathBuf::from(&dir)
+                    } else {
+                        self.source_root.join(dir)
+                    };
+                    if !self.include_paths.contains(&path) {
+                        self.include_paths.push(path);
+                    }
+                }
+                out.push_str(raw);
+                out.push('\n');
+                continue;
+            }
             if mnemonic != "include" {
                 out.push_str(raw);
                 out.push('\n');
@@ -2308,11 +2354,15 @@ impl Assembler {
                 continue;
             }
 
-            // Handle label (skip for EQU/SET which manage their own labels)
+            // Handle label (skip for directives that own their label:
+            // EQU/SET define a value, EQUR/REG define a register alias.
+            // Defining those as ordinary labels too would put them in the
+            // symbol table pointing at the current PC, which is both wrong
+            // and confusing in `--sym` output.)
             if let Some(ref label) = line.label {
                 let is_equ_or_set = matches!(&line.line_type,
                     LineType::Directive { name, .. }
-                    if name == "equ" || name == "set"
+                    if name == "equ" || name == "set" || name == "equr" || name == "reg"
                 );
                 if !is_equ_or_set {
                     let name = self.qualify_label(label);
@@ -2466,6 +2516,29 @@ impl Assembler {
             "set" => {
                 // SET is like EQU but allows redefinition
                 handle_set(label, args, &mut self.symbols, self.pc, line_no).map(|_| 0)
+            }
+            // `NAME EQUR Dn` and `NAME REG D0-D3/A0-A2`: textual aliases for
+            // a register and for a register list. Both are substituted
+            // wherever a register may appear, so the aliased source encodes
+            // exactly like the spelled-out one.
+            "equr" | "reg" => {
+                let directive = name.to_uppercase();
+                let Some(alias) = label else {
+                    return Err(AsmError::with_line(
+                        format!("{} requires a label", directive),
+                        line_no,
+                    ));
+                };
+                let value = args.join(",");
+                if value.trim().is_empty() {
+                    return Err(AsmError::with_line(
+                        format!("{} requires a register or register list", directive),
+                        line_no,
+                    ));
+                }
+                self.register_aliases
+                    .insert(alias.to_uppercase(), value.trim().to_string());
+                Ok(0)
             }
             "dc" => {
                 // DC.B/W/L - must match encode_dc's byte counting exactly,
@@ -2622,6 +2695,55 @@ impl Assembler {
                 self.rs_counter = 0;
                 Ok(0)
             }
+            // MACHINE/FPU let a source declare its own target, so a file
+            // saying `machine 68020` assembles without `-c 68020` on the
+            // command line — which is how the reference behaves, and how
+            // sources that carry their own requirements are written.
+            "machine" | "cpu" => {
+                if let Some(arg) = args.first() {
+                    let name = arg.trim().trim_start_matches("mc").to_lowercase();
+                    if name == "any" {
+                        self.cpu = "68060".to_string();
+                    } else {
+                        m68k_core::cpu_gate::validate_cpu_name(&name).map_err(|e| {
+                            AsmError::with_line(format!("invalid MACHINE argument: {}", e), line_no)
+                        })?;
+                        self.cpu = name;
+                    }
+                }
+                Ok(0)
+            }
+            // `FPU <n>`: a non-zero argument enables coprocessor
+            // instructions. Those are gated on the CPU level here, so this
+            // raises the floor to a model that has an FPU rather than
+            // tracking a separate flag.
+            "fpu" => {
+                let enabled = match args.first() {
+                    Some(arg) => evaluate_expr_str(arg, &self.symbols, self.pc).unwrap_or(1) != 0,
+                    None => true,
+                };
+                if enabled && matches!(self.cpu.as_str(), "68000" | "68010" | "68020") {
+                    self.cpu = "68030".to_string();
+                }
+                Ok(0)
+            }
+            "incdir" => {
+                if let Some(arg) = args.first() {
+                    let dir = crate::directives::strip_quotes(arg.trim());
+                    // Relative to the including file, matching how INCLUDE
+                    // itself resolves — an INCDIR in a source moved into a
+                    // subdirectory should still find its own headers.
+                    let path = if std::path::Path::new(&dir).is_absolute() {
+                        std::path::PathBuf::from(&dir)
+                    } else {
+                        self.source_root.join(dir)
+                    };
+                    if !self.include_paths.contains(&path) {
+                        self.include_paths.push(path);
+                    }
+                }
+                Ok(0)
+            }
             "rsset" => {
                 if let Some(arg) = args.first() {
                     self.rs_counter = evaluate_expr_str(arg, &self.symbols, self.pc)? as u32;
@@ -2634,6 +2756,12 @@ impl Assembler {
             | "exitm" | "print" | "printt" | "printv" | "list" | "nolist" | "page" | "title" => {
                 Ok(0)
             }
+            // Optimisation and code-placement hints. This assembler resolves
+            // everything to absolute addresses and performs no branch
+            // shortening beyond the relaxation pass, so there is nothing for
+            // these to control — but rejecting them means a source that
+            // merely mentions them will not assemble at all.
+            "near" | "far" | "auto" | "inline" | "einline" => Ok(0),
             "cnop" => {
                 let padding = self.cnop_padding(args, line_no)?;
                 if padding > 0 {
@@ -2665,6 +2793,19 @@ impl Assembler {
         size: Option<&str>,
         operand_texts: &[String],
     ) -> Result<u32, AsmError> {
+        // Aliases must be resolved here too: pass 1 sizes the instruction
+        // and pass 2 encodes it, so an alias visible to only one of them
+        // would desync every label that follows.
+        let resolved: Vec<String>;
+        let operand_texts: &[String] = if self.register_aliases.is_empty() {
+            operand_texts
+        } else {
+            resolved = operand_texts
+                .iter()
+                .map(|t| self.apply_register_aliases(t))
+                .collect();
+            &resolved
+        };
         // `Operand::Address(0)` is parse_operand_text's fallback for a bare
         // symbol it couldn't resolve yet (undefined forward reference) — it
         // is NOT a real "address 0" operand. Widening it to AbsoluteLong
@@ -2838,9 +2979,11 @@ impl Assembler {
                 // source with an `EQU` (i.e. essentially every real Amiga
                 // program, which equates the hardware registers) silently
                 // got zeroes wherever it used one.
+                // EQUR/REG own their labels too — they name a register, not
+                // an address, and must not be entered as ordinary symbols.
                 let is_equ_or_set = matches!(&line.line_type,
                     LineType::Directive { name, .. }
-                    if name == "equ" || name == "set"
+                    if name == "equ" || name == "set" || name == "equr" || name == "reg"
                 );
                 if let Some(ref label) = line.label
                     && !is_equ_or_set
@@ -3058,6 +3201,39 @@ impl Assembler {
     }
 
     /// Encode a single instruction line.
+    /// Substitute `EQUR`/`REG` aliases in an operand.
+    ///
+    /// Whole identifiers only: an alias named `A` must not rewrite the `A`
+    /// inside `ADDR` or `(A0)`. Substitution is one level deep, which is
+    /// what the directives mean — an alias names a register, not another
+    /// alias.
+    fn apply_register_aliases(&self, text: &str) -> String {
+        if self.register_aliases.is_empty() {
+            return text.to_string();
+        }
+        let mut out = String::with_capacity(text.len());
+        let mut ident = String::new();
+        let flush = |ident: &mut String, out: &mut String, aliases: &HashMap<String, String>| {
+            if !ident.is_empty() {
+                match aliases.get(&ident.to_uppercase()) {
+                    Some(v) => out.push_str(v),
+                    None => out.push_str(ident),
+                }
+                ident.clear();
+            }
+        };
+        for ch in text.chars() {
+            if ch.is_ascii_alphanumeric() || ch == '_' || ch == '.' {
+                ident.push(ch);
+            } else {
+                flush(&mut ident, &mut out, &self.register_aliases);
+                out.push(ch);
+            }
+        }
+        flush(&mut ident, &mut out, &self.register_aliases);
+        out
+    }
+
     fn encode_instruction_line(
         &mut self,
         mnemonic: &str,
@@ -3073,6 +3249,21 @@ impl Assembler {
             self.emit_alignment_pad(line);
         }
         let pc = self.pc;
+
+        // Resolve EQUR/REG aliases once, up front, so every path below —
+        // operand parsing, the branch and MOVEM special cases, the generic
+        // encoder — works on real register names and needs no knowledge of
+        // aliases at all.
+        let resolved: Vec<String>;
+        let operand_texts: &[String] = if self.register_aliases.is_empty() {
+            operand_texts
+        } else {
+            resolved = operand_texts
+                .iter()
+                .map(|t| self.apply_register_aliases(t))
+                .collect();
+            &resolved
+        };
 
         // Central CPU-gating check, before any mnemonic-specific dispatch:
         // covers the branch path, the 3-operand special forms (CAS/CAS2/
@@ -3649,7 +3840,8 @@ impl Assembler {
             "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef" | "ifndef"
             | "ifc" | "ifnc" | "else" | "endif" | "endc" | "macro" | "endm" | "rept" | "irp"
             | "irpc" | "endr" | "xref" | "xdef" | "public" | "extern" | "mexit" | "exitm"
-            | "list" | "nolist" | "page" | "title" => Ok(()),
+            | "near" | "far" | "auto" | "inline" | "einline" | "machine" | "cpu" | "fpu"
+            | "incdir" | "equr" | "reg" | "list" | "nolist" | "page" | "title" => Ok(()),
             "opt" => {
                 for msg in self.opt.apply(args) {
                     self.errors.warning(msg, Some(line.line_no));
@@ -6478,6 +6670,218 @@ mymexc MACRO
         // architecture; the fix belongs with a broader pass-1 estimation pass.
         let bytes = assemble_source_with_cpu("    CAS.W D0,D1,(A0)\nlabel:\n    NOP\n", "68020");
         assert_eq!(bytes, vec![0x0C, 0xD0, 0x00, 0x40, 0x4E, 0x71]);
+    }
+
+    #[test]
+    fn test_section_with_type_keyword() {
+        // `SECTION name,TYPE` is how essentially every real Amiga source
+        // declares a section. It used to be rejected outright: the second
+        // argument was only ever parsed as an origin expression, so this
+        // failed with "undefined symbol: CODE".
+        for src in [
+            "    SECTION code,CODE\n    NOP\n",
+            "    SECTION data,DATA\n    DC.W 1\n",
+            "    SECTION bss,BSS\n    DS.B 4\n",
+            "    SECTION mycode,CODE_C\n    NOP\n",
+            "    SECTION mydata,DATA_F\n    DC.W 1\n",
+        ] {
+            let mut asm = Assembler::new(0);
+            assert!(
+                asm.assemble(src).is_ok(),
+                "SECTION with a type keyword must assemble: {:?}",
+                src
+            );
+        }
+    }
+
+    #[test]
+    fn test_section_type_keyword_beats_the_name() {
+        // `SECTION mydata,DATA` is a data section even though its name is
+        // not one of the well-known ones. Without this the hunk writer
+        // emitted it as HUNK_CODE — declared data becoming executable code.
+        use crate::directives::SectionKind;
+        let mut asm = Assembler::new(0);
+        asm.assemble("    SECTION mydata,DATA\n    DC.W 1\n")
+            .unwrap();
+        let section = asm
+            .sections
+            .get_section(&SectionKind::Named("mydata".to_string()))
+            .expect("named section must exist");
+        assert_eq!(section.effective_kind(), &SectionKind::Data);
+    }
+
+    #[test]
+    fn test_section_origin_form_still_works() {
+        // The numeric second argument is a local extension the reference
+        // assembler does not accept; keep it working regardless.
+        let mut asm = Assembler::new(0);
+        asm.assemble("    SECTION foo,$1000\n    NOP\n").unwrap();
+        assert_eq!(asm.code[0].pc, 0x1000);
+    }
+
+    #[test]
+    fn test_sections_keep_declaration_order() {
+        // Output writers used to sort by address and then by name. With
+        // every section based at 0 that became alphabetical order, which
+        // can put a data or BSS hunk at index 0 — where LoadSeg() enters.
+        let mut asm = Assembler::new(0);
+        asm.assemble("    SECTION zdata,DATA\n    DC.W 1\n    SECTION acode,CODE\n    RTS\n")
+            .unwrap();
+        // The implicit default `text` section exists but stays empty, and
+        // output writers filter it out — so compare what actually ships.
+        let names: Vec<&str> = asm
+            .sections
+            .iter_sections()
+            .filter(|(_, s)| !s.is_empty())
+            .map(|(k, _)| k.name())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["zdata", "acode"],
+            "sections must iterate in declaration order, not sorted by name"
+        );
+    }
+
+    #[test]
+    fn test_bss_section_with_only_ds_is_not_empty() {
+        // A BSS section holding nothing but reservations has no
+        // instructions, so it was filtered out of every output format and
+        // vanished — code referencing a label in it pointed at nothing.
+        use crate::directives::SectionKind;
+        let mut asm = Assembler::new(0);
+        asm.assemble("    SECTION code,CODE\n    RTS\n    SECTION vars,BSS\nbuf:    DS.B 1024\n")
+            .unwrap();
+        let bss = asm
+            .sections
+            .get_section(&SectionKind::Named("vars".to_string()))
+            .expect("bss section must exist");
+        assert!(bss.instructions.is_empty(), "DS emits no instructions");
+        assert!(!bss.is_empty(), "but the section is not empty");
+        assert_eq!(bss.reserved_size(), 1024);
+    }
+
+    #[test]
+    fn test_equr_and_reg_aliases() {
+        // EQUR/REG are pure textual substitutions: the aliased source must
+        // encode exactly like the spelled-out one. Reference-verified.
+        let mut aliased = Assembler::new(0);
+        aliased
+            .assemble(
+                "CNT\tEQUR\tD3\nPTR\tEQUR\tA2\nSAVE\tREG\tD0-D3/A0-A2\n\
+                 \tMOVEQ\t#5,CNT\n\tMOVE.L\t(PTR),CNT\n\
+                 \tMOVEM.L\tSAVE,-(SP)\n\tMOVEM.L\t(SP)+,SAVE\n",
+            )
+            .unwrap();
+        let mut plain = Assembler::new(0);
+        plain
+            .assemble(
+                "\tMOVEQ\t#5,D3\n\tMOVE.L\t(A2),D3\n\
+                 \tMOVEM.L\tD0-D3/A0-A2,-(SP)\n\tMOVEM.L\t(SP)+,D0-D3/A0-A2\n",
+            )
+            .unwrap();
+        let a: Vec<u16> = aliased.code.iter().flat_map(|i| i.words.clone()).collect();
+        let p: Vec<u16> = plain.code.iter().flat_map(|i| i.words.clone()).collect();
+        assert_eq!(a, p, "aliased source must encode identically");
+    }
+
+    #[test]
+    fn test_equr_does_not_become_a_symbol() {
+        // An alias names a register, not an address. Defining it as an
+        // ordinary label too would list it in --sym output pointing at the
+        // current PC.
+        let mut asm = Assembler::new(0x1000);
+        asm.assemble("CNT\tEQUR\tD3\n\tMOVEQ\t#0,CNT\n").unwrap();
+        assert!(
+            asm.symbols.get("CNT").is_none(),
+            "EQUR alias must not enter the symbol table"
+        );
+    }
+
+    #[test]
+    fn test_equr_substitutes_whole_identifiers_only() {
+        // An alias named `A` must not rewrite the `A` inside `A0` or a
+        // longer identifier.
+        let mut asm = Assembler::new(0);
+        asm.assemble("A\tEQUR\tD5\nADDR\tEQU\t$20\n\tMOVEQ\t#ADDR,A\n")
+            .unwrap();
+        // MOVEQ #$20,D5 = 0x7A20
+        assert_eq!(asm.code[0].words, vec![0x7A20]);
+    }
+
+    #[test]
+    fn test_label_taking_directives_keep_their_label() {
+        // `tokens::split_line` decides whether `NAME DIR args` is a label
+        // plus a directive. Only directives that genuinely take a label
+        // belong in that list: a name there is also claimed in the operand
+        // position, so `BEQ far` would read as the label `BEQ` followed by
+        // the directive `far`.
+        for (src, want_label, want_mnemonic) in [
+            ("CNT\tEQUR\tD3", Some("CNT"), "equr"),
+            ("SAVE\tREG\tD0-D3", Some("SAVE"), "reg"),
+            ("VAL\tEQU\t5", Some("VAL"), "equ"),
+        ] {
+            let (label, mnemonic, _, _) = m68k_core::tokens::split_line(src);
+            assert_eq!(label.as_deref(), want_label, "label lost in {:?}", src);
+            assert_eq!(mnemonic, want_mnemonic, "wrong mnemonic for {:?}", src);
+            assert!(is_directive_name(want_mnemonic));
+        }
+    }
+
+    #[test]
+    fn test_directive_names_stay_usable_as_labels() {
+        // The reference assembler accepts all of these as ordinary labels;
+        // claiming them unconditionally in split_line broke `BEQ far`.
+        for name in ["far", "near", "auto", "cpu", "reg", "inline"] {
+            let mut asm = Assembler::new(0);
+            let src = format!("\tBEQ\t{}\n{}:\n\tRTS\n", name, name);
+            assert!(
+                asm.assemble(&src).is_ok(),
+                "{:?} must still work as a label",
+                name
+            );
+            assert!(asm.symbols.get(name).is_some(), "{} not defined", name);
+        }
+    }
+
+    #[test]
+    fn test_machine_directive_sets_the_cpu() {
+        // A source declaring `machine 68020` must assemble without -c.
+        let mut asm = Assembler::new(0);
+        asm.assemble("\tMACHINE\t68020\n\tBFCLR\tD0{0:8}\n")
+            .expect("MACHINE must raise the CPU level");
+        assert_eq!(asm.cpu, "68020");
+
+        // And without it, the same instruction is still gated.
+        let mut plain = Assembler::new(0);
+        assert!(plain.assemble("\tBFCLR\tD0{0:8}\n").is_err());
+    }
+
+    #[test]
+    fn test_optimisation_hint_directives_are_accepted() {
+        // NEAR/FAR/AUTO/INLINE control optimisations this assembler does
+        // not perform, but rejecting them stops an entire source dead.
+        for d in ["NEAR", "FAR", "AUTO", "INLINE\n\tNOP\n\tEINLINE"] {
+            let mut asm = Assembler::new(0);
+            let src = format!("\t{}\n\tNOP\n", d);
+            assert!(asm.assemble(&src).is_ok(), "{} must be accepted", d);
+        }
+    }
+
+    #[test]
+    fn test_octal_literals() {
+        // `@17` is the Motorola octal form the reference assembler accepts.
+        // It was not implemented at all, in any of the three number parsers.
+        let mut asm = Assembler::new(0);
+        asm.assemble("    MOVEQ #@17,D0\n    DC.W @17\n    DC.L @777\n")
+            .unwrap();
+        assert_eq!(asm.code[0].words, vec![0x700F]); // @17 = 15
+        assert_eq!(asm.code[1].words, vec![0x000F]);
+        assert_eq!(asm.code[2].words, vec![0x0000, 0x01FF]); // @777 = 511
+
+        // And inside expressions and EQU.
+        let mut asm = Assembler::new(0);
+        asm.assemble("V   EQU @20\n    DC.W V+@10\n").unwrap();
+        assert_eq!(asm.code[0].words, vec![0x0018]); // 16 + 8
     }
 
     #[test]

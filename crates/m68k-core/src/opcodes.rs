@@ -498,6 +498,8 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             parser: ParserType::BitImm,
             fixed_size: None,
         },
+        // CHK.W — size bits 8-7 = 11. The long form below has 10; masking
+        // both out would also match the 00/01 encodings, which are not CHK.
         OpcodePattern {
             mask: 0xF1C0,
             value: 0x4180,
@@ -506,7 +508,19 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: DREG,
             cpu: "68000",
             parser: ParserType::Chk,
-            fixed_size: None,
+            fixed_size: Some("w"),
+        },
+        // CHK.L (68020+). Without this pattern the long form decoded as a
+        // data word, so `CHK.L` did not round-trip at all.
+        OpcodePattern {
+            mask: 0xF1C0,
+            value: 0x4100,
+            mnemonic: "CHK",
+            src_ea: DATA,
+            dst_ea: DREG,
+            cpu: "68020",
+            parser: ParserType::Chk,
+            fixed_size: Some("l"),
         },
         OpcodePattern {
             mask: 0xFF00,

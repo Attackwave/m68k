@@ -142,15 +142,13 @@ pub fn generate_ieee695(instructions: &[AssembledInstruction], symbols: &SymbolT
 pub fn generate_ieee695_sections(sections: &SectionManager, symbols: &SymbolTable) -> Vec<u8> {
     use crate::directives::SectionKind;
 
-    let mut ordered: Vec<_> = sections
+    // Declaration order (see `iter_sections`); `is_empty` rather than
+    // `instructions.is_empty()` so a BSS section holding only `DS` space
+    // still gets a section entry.
+    let ordered: Vec<_> = sections
         .iter_sections()
-        .filter(|(_, s)| !s.instructions.is_empty())
+        .filter(|(_, s)| !s.is_empty())
         .collect();
-    ordered.sort_by(|a, b| {
-        a.1.base_addr()
-            .cmp(&b.1.base_addr())
-            .then(a.0.name().cmp(b.0.name()))
-    });
 
     let parts: Vec<Part> = ordered
         .iter()

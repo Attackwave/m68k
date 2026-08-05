@@ -62,3 +62,10 @@ path = "fuzz_targets/floppy_amigados.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "floppy_amigados_write"
+path = "fuzz_targets/floppy_amigados_write.rs"
+test = false
+doc = false
+bench = false

@@ -53,6 +53,23 @@ impl SectionKind {
 #[derive(Debug, Clone)]
 pub struct Section {
     pub kind: SectionKind,
+    /// The type keyword from `SECTION name,TYPE`, when one was given.
+    ///
+    /// A distinctly named section keeps its name as its identity (the
+    /// reference assembler emits one hunk per name), so `kind` alone cannot
+    /// say whether `SECTION mydata,DATA` is code or data. Without this the
+    /// hunk writer mapped every `Named` section to `HUNK_CODE`, turning a
+    /// declared data section into executable code in the output file.
+    pub declared_kind: Option<SectionKind>,
+    /// Position of this section's first `SECTION` directive in the source.
+    ///
+    /// Sections live in a `HashMap`, whose iteration order is arbitrary, so
+    /// output writers previously sorted by address and then by name. With
+    /// every section based at 0 that reduced to alphabetical order, which
+    /// can put a BSS or data hunk first — and hunk 0 is where `LoadSeg()`
+    /// enters. The reference assembler emits declaration order; this field
+    /// is what lets us do the same.
+    pub order: usize,
     pub origin: u32,
     pub pc: u32,
     pub instructions: Vec<AssembledInstruction>,
@@ -60,16 +77,50 @@ pub struct Section {
 
 impl Section {
     pub fn new(kind: SectionKind, origin: u32) -> Self {
+        Self::with_order(kind, origin, 0)
+    }
+
+    /// Like [`Self::new`], but recording where the section was declared.
+    pub fn with_order(kind: SectionKind, origin: u32, order: usize) -> Self {
         Self {
             kind,
+            declared_kind: None,
+            order,
             origin,
             pc: origin,
             instructions: Vec::new(),
         }
     }
 
+    /// The section kind that output writers should act on: the explicitly
+    /// declared type if there was one, otherwise the kind inferred from the
+    /// section name.
+    pub fn effective_kind(&self) -> &SectionKind {
+        self.declared_kind.as_ref().unwrap_or(&self.kind)
+    }
+
     pub fn size_bytes(&self) -> usize {
         self.instructions.iter().map(|i| i.size_bytes()).sum()
+    }
+
+    /// The section's reserved size, including space that advances the
+    /// location counter without emitting anything — `DS`/`DCB` in a BSS
+    /// section being the normal case.
+    ///
+    /// [`Self::size_bytes`] only sums emitted instructions, so a section
+    /// containing nothing but `DS.B 1024` measured as zero bytes and was
+    /// dropped from the output entirely. Any code referencing a label in it
+    /// then pointed at nothing.
+    pub fn reserved_size(&self) -> usize {
+        let emitted = self.size_bytes();
+        let spanned = self.pc.saturating_sub(self.base_addr()) as usize;
+        emitted.max(spanned)
+    }
+
+    /// Whether this section contributes anything to the output: either
+    /// emitted instructions or reserved space.
+    pub fn is_empty(&self) -> bool {
+        self.instructions.is_empty() && self.pc == self.origin
     }
 
     /// Base address of this section's actual content: the lowest `pc` among
@@ -176,6 +227,9 @@ pub struct SectionManager {
     sections: HashMap<SectionKind, Section>,
     current_section: Option<SectionKind>,
     default_origin: u32,
+    /// Incremented for each newly created section, giving every one a
+    /// stable declaration index despite the HashMap.
+    next_order: usize,
 }
 
 impl SectionManager {
@@ -184,6 +238,7 @@ impl SectionManager {
             sections: HashMap::new(),
             current_section: None,
             default_origin,
+            next_order: 0,
         };
         // Create default text section
         mgr.sections.insert(
@@ -219,9 +274,11 @@ impl SectionManager {
 
     pub fn switch_section(&mut self, kind: SectionKind) {
         if !self.sections.contains_key(&kind) {
+            let order = self.next_order;
+            self.next_order += 1;
             self.sections.insert(
                 kind.clone(),
-                Section::new(kind.clone(), self.default_origin),
+                Section::with_order(kind.clone(), self.default_origin, order),
             );
         }
         self.current_section = Some(kind);
@@ -237,8 +294,15 @@ impl SectionManager {
         self.sections.get(kind)
     }
 
+    /// Iterate sections in the order they were declared in the source.
+    ///
+    /// The backing map is unordered; output writers need a stable order,
+    /// and it has to be declaration order rather than anything derived from
+    /// addresses or names — hunk 0 of an executable is its entry point.
     pub fn iter_sections(&self) -> impl Iterator<Item = (&SectionKind, &Section)> {
-        self.sections.iter()
+        let mut all: Vec<(&SectionKind, &Section)> = self.sections.iter().collect();
+        all.sort_by_key(|(_, s)| s.order);
+        all.into_iter()
     }
 }
 
@@ -452,10 +516,38 @@ pub fn handle_even_pass2(
     }
 }
 
+/// Recognize a Motorola/AmigaDOS section-type keyword.
+///
+/// `SECTION name,TYPE` is how essentially every real Amiga source declares
+/// a section, and the type — not the name — decides what kind it is:
+/// `SECTION mycode,CODE` is a code section despite the name. The memory
+/// attribute suffixes (`_C` chip, `_F` fast, `_P` public) are accepted and
+/// ignored, since this assembler resolves everything to absolute addresses
+/// and never emits the hunk memory flags they control.
+fn section_type_keyword(arg: &str) -> Option<SectionKind> {
+    let upper = arg.trim().to_ascii_uppercase();
+    let base = upper
+        .split_once('_')
+        .map(|(b, _)| b)
+        .unwrap_or(upper.as_str());
+    match base {
+        "CODE" | "TEXT" => Some(SectionKind::Text),
+        "DATA" => Some(SectionKind::Data),
+        "BSS" => Some(SectionKind::Bss),
+        _ => None,
+    }
+}
+
 /// Handle SECTION directive.
 ///
-/// Syntax: `SECTION name` or `SECTION name,origin`
-/// Switches to the named section.
+/// Syntax: `SECTION name`, `SECTION name,TYPE` (the standard Motorola form,
+/// where TYPE is CODE/DATA/BSS with an optional `_C`/`_F`/`_P` suffix), or
+/// `SECTION name,origin` as a local extension.
+///
+/// The type form used to be rejected outright: the second argument was only
+/// ever parsed as an origin expression, so `SECTION code,CODE` failed with
+/// "undefined symbol: CODE" — which is to say the spelling every real Amiga
+/// source uses did not assemble at all.
 pub fn handle_section(
     args: &[String],
     symbols: &SymbolTable,
@@ -468,10 +560,22 @@ pub fn handle_section(
     }
 
     let section_name = args[0].trim();
-    let kind = SectionKind::from_name(section_name);
+    let declared_kind = args.get(1).and_then(|a| section_type_keyword(a));
+    // The *name* is a section's identity, the type only says what kind of
+    // hunk it becomes: the reference assembler emits two separate hunks for
+    // `SECTION alpha,CODE` followed by `SECTION beta,CODE` (verified), so
+    // collapsing both onto SectionKind::Text would merge them wrongly.
+    // A distinctly named section therefore stays Named, and its declared
+    // type is recorded separately for the output writers.
+    let kind = match &declared_kind {
+        Some(k) if SectionKind::from_name(section_name) == *k => k.clone(),
+        Some(_) => SectionKind::Named(section_name.to_string()),
+        None => SectionKind::from_name(section_name),
+    };
 
-    // Optional origin argument
-    if args.len() > 1 {
+    // Optional origin argument — only when the second argument is not a
+    // section type.
+    if args.len() > 1 && declared_kind.is_none() {
         let origin = parse_simple_expr(&args[1], symbols, pc)
             .map_err(|e| AsmError::with_line(format!("invalid SECTION origin: {}", e), line_no))?
             as u32;
@@ -489,7 +593,16 @@ pub fn handle_section(
         }
     }
 
-    sections.switch_section(kind);
+    sections.switch_section(kind.clone());
+
+    // Record the declared type on the (now existing) section so the ELF and
+    // hunk writers can emit a named section as data or BSS rather than
+    // defaulting every one of them to code.
+    if let Some(declared) = declared_kind
+        && let Some(section) = sections.sections.get_mut(&kind)
+    {
+        section.declared_kind = Some(declared);
+    }
 
     Ok(DirectiveResult::with_pc(sections.current_pc()))
 }
@@ -800,6 +913,20 @@ fn tokenize_expr(text: &str, pc: u32) -> Result<Vec<ExprToken>, String> {
             let bin_str: String = chars[start..i].iter().collect();
             let value = i64::from_str_radix(&bin_str, 2)
                 .map_err(|_| format!("invalid binary: %{}", bin_str))?;
+            tokens.push(ExprToken::Num(value));
+            continue;
+        }
+
+        // Octal: @777 (Motorola form, accepted by the reference assembler)
+        if ch == '@' && i + 1 < chars.len() && chars[i + 1].is_digit(8) {
+            let start = i + 1;
+            i += 1;
+            while i < chars.len() && chars[i].is_digit(8) {
+                i += 1;
+            }
+            let oct_str: String = chars[start..i].iter().collect();
+            let value = i64::from_str_radix(&oct_str, 8)
+                .map_err(|_| format!("invalid octal: @{}", oct_str))?;
             tokens.push(ExprToken::Num(value));
             continue;
         }

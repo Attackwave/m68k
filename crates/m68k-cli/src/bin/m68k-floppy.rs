@@ -84,9 +84,156 @@ struct Args {
     /// Recompute and repair the bootblock checksum in place
     #[arg(long)]
     fix_bootblock: bool,
+
+    /// Create a new empty, mountable AmigaDOS disk image at IMAGE with the
+    /// given volume name, then apply any write options below to it
+    #[arg(long, value_name = "VOLUME_NAME")]
+    format: Option<String>,
+
+    /// Use FFS instead of OFS when creating a disk with --format
+    #[arg(long)]
+    ffs: bool,
+
+    /// Write a local file into the image: --add-file LOCAL AMIGA_PATH
+    #[arg(long, num_args = 2, value_names = ["LOCAL", "AMIGA_PATH"])]
+    add_file: Option<Vec<String>>,
+
+    /// Delete a file from the image
+    #[arg(long, value_name = "PATH")]
+    delete_file: Option<String>,
+
+    /// Create a directory in the image
+    #[arg(long, value_name = "PATH")]
+    make_dir: Option<String>,
+
+    /// Delete an empty directory from the image
+    #[arg(long, value_name = "PATH")]
+    delete_dir: Option<String>,
+
+    /// Rename or move an entry: --rename FROM TO
+    #[arg(long, num_args = 2, value_names = ["FROM", "TO"])]
+    rename: Option<Vec<String>>,
+
+    /// Set an entry's comment: --set-comment PATH TEXT
+    #[arg(long, num_args = 2, value_names = ["PATH", "TEXT"])]
+    set_comment: Option<Vec<String>>,
+
+    /// Set an entry's protection bits: --set-protection PATH BITS
+    /// (decimal, or hex with a 0x prefix)
+    #[arg(long, num_args = 2, value_names = ["PATH", "BITS"])]
+    set_protection: Option<Vec<String>>,
+}
+
+/// Whether any option that modifies the filesystem was given.
+fn has_write_ops(args: &Args) -> bool {
+    args.format.is_some()
+        || args.add_file.is_some()
+        || args.delete_file.is_some()
+        || args.make_dir.is_some()
+        || args.delete_dir.is_some()
+        || args.rename.is_some()
+        || args.set_comment.is_some()
+        || args.set_protection.is_some()
+}
+
+/// Apply every requested filesystem modification, in a fixed order, to a
+/// raw image buffer and write it back.
+///
+/// These operate on the raw ADF bytes rather than through the backend
+/// abstraction: IPF is a flux-level format that cannot be written back,
+/// and UAE-extended images have variable-length tracks. A plain
+/// sector-addressable image is the only kind a filesystem writer applies
+/// to, so that is what this requires.
+fn run_write_ops(args: &Args) -> Result<(), String> {
+    use m68k_floppy::adf_writer;
+    use m68k_floppy::amigados_write::AmigaFsWriter;
+
+    let mut image = match &args.format {
+        Some(volume_name) => {
+            let created = if args.ffs {
+                adf_writer::format_empty_ffs_disk(volume_name)
+            } else {
+                adf_writer::format_empty_ofs_disk(volume_name)
+            }
+            .map_err(|e| format!("cannot format image: {}", e))?;
+            eprintln!(
+                "Formatted {} volume {:?} ({} KiB)",
+                if args.ffs { "FFS" } else { "OFS" },
+                volume_name,
+                created.len() / 1024
+            );
+            created
+        }
+        None => std::fs::read(&args.image).map_err(|e| format!("cannot read image: {}", e))?,
+    };
+
+    {
+        let mut fs = AmigaFsWriter::mount(&mut image)
+            .map_err(|e| format!("cannot mount filesystem for writing: {}", e))?;
+
+        if let Some(path) = &args.make_dir {
+            fs.create_dir(path)
+                .map_err(|e| format!("cannot create directory {:?}: {}", path, e))?;
+            eprintln!("Created directory {}", path);
+        }
+
+        if let Some(pair) = &args.add_file {
+            let (local, amiga) = (&pair[0], &pair[1]);
+            let data =
+                std::fs::read(local).map_err(|e| format!("cannot read {:?}: {}", local, e))?;
+            fs.write_file(amiga, &data)
+                .map_err(|e| format!("cannot write {:?}: {}", amiga, e))?;
+            eprintln!("Wrote {} ({} bytes) to {}", local, data.len(), amiga);
+        }
+
+        if let Some(pair) = &args.rename {
+            fs.rename(&pair[0], &pair[1])
+                .map_err(|e| format!("cannot rename {:?}: {}", pair[0], e))?;
+            eprintln!("Renamed {} to {}", pair[0], pair[1]);
+        }
+
+        if let Some(pair) = &args.set_comment {
+            fs.set_comment(&pair[0], &pair[1])
+                .map_err(|e| format!("cannot set comment on {:?}: {}", pair[0], e))?;
+        }
+
+        if let Some(pair) = &args.set_protection {
+            let raw = &pair[1];
+            let bits = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
+                Some(hex) => u32::from_str_radix(hex, 16),
+                None => raw.parse::<u32>(),
+            }
+            .map_err(|e| format!("invalid protection bits {:?}: {}", raw, e))?;
+            fs.set_protection(&pair[0], bits)
+                .map_err(|e| format!("cannot set protection on {:?}: {}", pair[0], e))?;
+        }
+
+        if let Some(path) = &args.delete_file {
+            fs.delete_file(path)
+                .map_err(|e| format!("cannot delete {:?}: {}", path, e))?;
+            eprintln!("Deleted {}", path);
+        }
+
+        if let Some(path) = &args.delete_dir {
+            fs.delete_dir(path)
+                .map_err(|e| format!("cannot delete directory {:?}: {}", path, e))?;
+            eprintln!("Deleted directory {}", path);
+        }
+
+        eprintln!("{} blocks free", fs.free_blocks());
+    }
+
+    adf_writer::write_adf_file(&args.image, &image)
+        .map_err(|e| format!("cannot write image: {}", e))?;
+    eprintln!("Image written to {}", args.image.display());
+    Ok(())
 }
 
 fn run(args: Args) -> Result<(), String> {
+    if has_write_ops(&args) {
+        return run_write_ops(&args);
+    }
+
     if args.fix_bootblock {
         let mut image =
             std::fs::read(&args.image).map_err(|e| format!("cannot read image: {}", e))?;

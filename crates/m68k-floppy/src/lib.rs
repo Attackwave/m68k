@@ -17,6 +17,7 @@
 pub mod adf;
 pub mod adf_writer;
 pub mod amigados;
+pub mod amigados_write;
 pub mod factory;
 pub mod floppy_base;
 pub mod ipf;

@@ -674,15 +674,13 @@ pub fn generate_elf_sections(
     sections: &SectionManager,
     symbols: &crate::assembler::SymbolTable,
 ) -> Vec<u8> {
-    let mut ordered: Vec<(&SectionKind, &Section)> = sections
+    // Declaration order (see `iter_sections`); `is_empty` rather than
+    // `instructions.is_empty()` so a BSS section holding only `DS` space
+    // still gets a section entry.
+    let ordered: Vec<(&SectionKind, &Section)> = sections
         .iter_sections()
-        .filter(|(_, s)| !s.instructions.is_empty())
+        .filter(|(_, s)| !s.is_empty())
         .collect();
-    ordered.sort_by(|a, b| {
-        a.1.base_addr()
-            .cmp(&b.1.base_addr())
-            .then(a.0.name().cmp(b.0.name()))
-    });
 
     let parts: Vec<(String, String, u32, u32, Vec<u8>)> = ordered
         .iter()

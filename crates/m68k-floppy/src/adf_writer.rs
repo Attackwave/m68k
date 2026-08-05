@@ -154,16 +154,29 @@ fn format_empty_disk(size: usize, ffs: bool, disk_name: &str) -> Result<Vec<u8>,
     image[8..12].copy_from_slice(&root_block_num.to_be_bytes());
     fix_bootblock_checksum(&mut image)?;
 
-    // Root block: T_HEADER, ht_size=72, empty hash table, valid-but-empty
-    // bitmap (bm_flag=-1, no bitmap block pointers — a real filesystem
-    // needs actual bitmap blocks marking every free block, which this
-    // minimal empty-disk helper doesn't allocate; a full block-allocator
-    // is out of scope here, matching the "no data blocks are ever
-    // written yet" empty-disk use case), ST_ROOT at the end.
+    // Bitmap blocks go directly after the root block, matching where real
+    // AmigaDOS disks put them (Cybernetix.adf: root 880, bitmap 892 — the
+    // exact offset varies, adjacency does not).
+    let bitmap_pages = crate::amigados_write::Bitmap::pages_needed(total_blocks);
+    let first_bitmap_block = root_block_num + 1;
+    if first_bitmap_block + bitmap_pages > total_blocks {
+        return Err(FloppyError::new(
+            "image is too small to hold its own bitmap blocks",
+        ));
+    }
+
+    // Root block: T_HEADER, ht_size=72, empty hash table, bm_flag=-1 and a
+    // real bitmap page list. Earlier versions left the page list empty,
+    // which produced a disk AmigaDOS mounts but cannot write to: with no
+    // bitmap there is nothing to allocate from.
     let mut root = [0u8; 512];
     root[0..4].copy_from_slice(&(2i32).to_be_bytes()); // type = T_HEADER
     root[0x0C..0x10].copy_from_slice(&(72u32).to_be_bytes()); // ht_size
     root[0x138..0x13C].copy_from_slice(&(-1i32).to_be_bytes()); // bm_flag = valid
+    for i in 0..bitmap_pages as usize {
+        let ptr = first_bitmap_block + i as u32;
+        root[0x13C + i * 4..0x140 + i * 4].copy_from_slice(&ptr.to_be_bytes());
+    }
     write_bcpl_string(&mut root, 0x1B0, disk_name, 30);
     root[0x1FC..0x200].copy_from_slice(&(1i32).to_be_bytes()); // sec_type = ST_ROOT
     let checksum = compute_block_checksum(&root, 0x14);
@@ -171,6 +184,28 @@ fn format_empty_disk(size: usize, ffs: bool, disk_name: &str) -> Result<Vec<u8>,
 
     let root_offset = block_offset(root_block_num);
     image[root_offset..root_offset + 512].copy_from_slice(&root);
+
+    // Bitmap payload: every block free (a set bit means free), then clear
+    // the bits for the blocks this very layout occupies.
+    for i in 0..bitmap_pages {
+        let off = block_offset(first_bitmap_block + i);
+        image[off + 4..off + 512].fill(0xFF);
+    }
+    let bitmap = crate::amigados_write::Bitmap::from_root(&image, root_block_num, total_blocks)?;
+    bitmap.mark_used(&mut image, root_block_num)?;
+    for i in 0..bitmap_pages {
+        bitmap.mark_used(&mut image, first_bitmap_block + i)?;
+    }
+    // Bits past the end of the volume must not read as free. The allocator
+    // range-checks before consulting them, so this is belt-and-braces
+    // against a third-party tool reading the bitmap literally — and it is
+    // what a real AmigaDOS format leaves behind. These bits are cleared
+    // directly rather than through `mark_used`, which rejects out-of-volume
+    // block numbers by design.
+    crate::amigados_write::clear_bits_past_end(&mut image, first_bitmap_block, total_blocks);
+    for i in 0..bitmap_pages {
+        crate::amigados_write::fix_block_checksum(&mut image, first_bitmap_block + i, 0);
+    }
 
     Ok(image)
 }

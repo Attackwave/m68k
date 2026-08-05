@@ -183,7 +183,11 @@ Ebenso: **keine** Direktive, die in `is_directive_name` als bekannt gilt, aber i
 
 - **`ORI.B #x,An`**: Wir akzeptieren es, die Referenz lehnt es als ungültiges Ziel ab. Permissiver zu sein ist kein Korrektheitsproblem, sollte aber bewusst entschieden und dokumentiert sein.
 - **`fileloader.asm`** (Korpus 2) assembliert bei uns, die Referenz bricht mit „branch destination out of range" ab. Unser Verhalten (Word-Form statt Fehler bei disp=0) ist funktional korrekt und nachsichtiger — als Feature dokumentieren.
-- **Schreibunterstützung für AmigaDOS**: `amigados.rs` ist read-only, `adf_writer.rs` kann nur leere Images erzeugen und Bootblöcke reparieren. Dateien *schreiben* fehlt. Ob das gebraucht wird, hängt am Emulator-Workflow.
+- ~~**Schreibunterstützung für AmigaDOS**~~ ✅ **erledigt (2026-08-05)**: neues Modul `amigados_write.rs` mit vollem Funktionsumfang — Blockallokator über echte Bitmap-Blöcke, `write_file`/`delete_file`, `create_dir`/`delete_dir`, `rename` (auch verschiebend), `set_comment`/`set_protection`/`set_volume_name`. OFS und FFS, Extension-Blöcke für Dateien über 72 Datenblöcke.
+
+  **Nebenbefund:** `format_empty_*_disk` erzeugte Disks *ohne* Bitmap-Blöcke (nur `bm_flag=-1`). AmigaOS mountet die, kann aber nichts darauf anlegen — es gibt nichts zu allozieren. Behoben.
+
+  Layout durchgehend empirisch aus `Cybernetix.adf` gelesen statt aus der Doku abgeleitet: Bitmap ab Block 2, gesetztes Bit = frei, Blocktabelle von hinten befüllt, OFS-Datenblock mit 24-Byte-Header. Feldweiser Vergleich einer von uns geschriebenen Datei gegen eine echte: alle vergleichbaren Felder identisch. In eine echte fremde Disk geschrieben — neue Datei korrekt, bestehende unversehrt. 31 neue Tests, neues Fuzz-Target (125k Läufe auf absichtlich korrumpierten Volumes, keine Findings).
 
 ---
 
