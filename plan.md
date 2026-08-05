@@ -50,7 +50,7 @@ Nachgeprüft: 5 Bitfeld-Formen jetzt referenzkonform, FPU unverändert byte-iden
 
 ## P1 — Echte Lücken mit Risiko
 
-### P1.1 MMU-Familie hat **null** Roundtrip-Abdeckung
+### P1.1 MMU-Familie hat **null** Roundtrip-Abdeckung — ✅ erledigt (PR #19)
 
 `crates/m68k-asm/tests/instruction_coverage.rs` deckt ~280 Formen ab, aber `PMOVE`, `PFLUSH`, `PTESTR`, `PTESTW` kommen **kein einziges Mal** vor (verifiziert per grep). Genau dort saß P0.3.
 
@@ -58,7 +58,7 @@ Ebenso fehlen sie in `tests/golden/vectors.json`.
 
 **Aufgabe:** MMU-Formen in `instruction_coverage.rs` ergänzen — `PMOVE` in beide Richtungen für TC/SRP/CRP/TT0/TT1/MMUSR, `PFLUSH` in beiden Formen, `PTESTR`/`PTESTW` mit und ohne `An`. Sollbytes vorher gegen die Referenz erzeugen, nicht aus der PRM ableiten.
 
-### P1.2 `amigados.rs` und `adf_writer.rs` sind nicht gefuzzt
+### P1.2 `amigados.rs` und `adf_writer.rs` sind nicht gefuzzt — ✅ erledigt (PR #20, erweitert in #27)
 
 `fuzz/fuzz_targets/` hat 6 Targets (`disassemble`, `amiga_hunk_parse`, `assembler_pipeline`, `floppy_adf`, `floppy_uae`, `floppy_ipf`) — aber **keines** deckt `amigados.rs` oder `adf_writer.rs` ab.
 
@@ -72,7 +72,7 @@ Das sind genau die Module, in denen im Juli zwei kritische Bugs steckten (Datenb
 
 **Aufgabe:** entweder implementieren (beide Binaries, `-` → stdin lesen; bei `m68k-asm` zusätzlich `-o -` → stdout) oder aus dem README streichen. Implementieren ist vorzuziehen — für Pipelines im Emulator-Workflow ist das nützlich.
 
-### P1.4 `PLPAR`/`PLPAW` sind kodierbar, aber nicht dekodierbar
+### P1.4 `PLPAR`/`PLPAW` sind kodierbar, aber nicht dekodierbar — ✅ erledigt (PR #19)
 
 **Verifiziert:** `PLPAR (A0)` / `PLPAW (A1)` assemblieren korrekt zu `F5C8`/`F589` — byte-identisch zur Referenz. Der Disassembler hat aber **kein Pattern dafür** und gibt stattdessen `cinvl bc,(a0)` / `cinvl ic,(a1)` aus. Der Roundtrip ist damit gebrochen: reassembliert man die Ausgabe, kommen andere Bytes heraus.
 

@@ -81,6 +81,11 @@ pub struct MemoryIndirectOperand {
     /// memory indirection); false for pre-indexed form `([bd,An,Xn],od)`
     /// (index applied before, i.e. inside the brackets).
     pub is_postindexed: bool,
+    /// Whether the operand actually indirects through memory (the bracketed
+    /// forms). A full-format EA without brackets — `(bd,Xn.size*scale)`
+    /// with the base register suppressed — uses the same extension word
+    /// layout but selects I/IS = 0, so the two must be told apart.
+    pub is_indirect: bool,
 }
 
 /// Offset or width field of a bitfield operand: either a data register or a constant.

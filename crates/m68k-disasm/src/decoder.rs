@@ -107,6 +107,95 @@ pub enum DecodeResult {
     DataWord(DataWordInstruction),
 }
 
+/// Which pattern field describes the EA sitting in the opword's standard
+/// bits (mode 5-3, register 2-0), for the parsers that put one there.
+///
+/// The distinction matters: `src_ea`/`dst_ea` follow *operand order*, not
+/// bit position. For `MOVEM D0-D7,-(SP)` the opword's EA field is the
+/// destination and `src_ea` describes the register list, so checking the
+/// wrong field rejects a perfectly ordinary instruction.
+enum StandardEa {
+    Source,
+    Destination,
+}
+
+fn standard_ea_role(parser: ParserType) -> Option<StandardEa> {
+    use StandardEa::{Destination, Source};
+    Some(match parser {
+        ParserType::Move
+        | ParserType::Movea
+        | ParserType::EaReg
+        | ParserType::Adda
+        | ParserType::Chk
+        | ParserType::Lea
+        | ParserType::MoveToCcr
+        | ParserType::MoveToSr
+        | ParserType::Cmpa
+        | ParserType::Cmp
+        | ParserType::Muls
+        | ParserType::Mulu
+        | ParserType::Divs
+        | ParserType::Divu
+        | ParserType::Jmp
+        | ParserType::Jsr
+        | ParserType::Pea
+        | ParserType::MovemMr
+        | ParserType::Callm
+        | ParserType::Chk2Cmp2
+        | ParserType::DivLong
+        | ParserType::MulLong => Source,
+        ParserType::RegEa
+        | ParserType::ImmEa
+        | ParserType::Quick
+        | ParserType::BitReg
+        | ParserType::BitImm
+        | ParserType::MoveFromSr
+        | ParserType::MoveFromCcr
+        | ParserType::Eor
+        | ParserType::Nbcd
+        | ParserType::Neg
+        | ParserType::Negx
+        | ParserType::Not
+        | ParserType::Tas
+        | ParserType::Tst
+        | ParserType::SingleEa
+        | ParserType::Scc
+        | ParserType::MovemRm
+        | ParserType::Cas
+        | ParserType::Clr
+        | ParserType::Cmpi
+        | ParserType::Moves
+        | ParserType::ShiftMem => Destination,
+        _ => return None,
+    })
+}
+
+/// Whether the opword's EA field names an addressing mode this instruction
+/// actually allows.
+///
+/// The patterns have always carried `src_ea`/`dst_ea`, but nothing
+/// consulted them, so the disassembler rendered encodings that do not
+/// exist — `ori.b #$50,a2` out of a data region, for instance, where byte
+/// access to an address register is not an addressing mode at all.
+/// Rejecting the pattern here lets `decode_next` fall through to the next
+/// candidate and ultimately to a `dc.w`, which is what such bytes are.
+///
+/// A category of 0 means "not filled in", not "nothing allowed", so those
+/// patterns are left alone rather than having everything rejected.
+fn ea_field_is_legal_for(op: u16, pat: &m68k_core::opcodes::OpcodePattern) -> bool {
+    let category = match standard_ea_role(pat.parser) {
+        Some(StandardEa::Source) => pat.src_ea,
+        Some(StandardEa::Destination) => pat.dst_ea,
+        None => return true,
+    };
+    if category == 0 {
+        return true;
+    }
+    let mode = ((op >> 3) & 0x7) as u8;
+    let reg = (op & 0x7) as u8;
+    m68k_core::ea_categories::ea_matches(mode, reg, category)
+}
+
 pub fn decode_next(
     stream: &mut InstructionStream,
     cpu_limit: &str,
@@ -122,6 +211,9 @@ pub fn decode_next(
             continue;
         }
         if cpu_level(pat.cpu) > limit_level {
+            continue;
+        }
+        if !ea_field_is_legal_for(op, pat) {
             continue;
         }
         stream.seek(start_offset + 2);
@@ -639,6 +731,14 @@ fn parse_operands(
             operands.push(DecodedOperand::special("ccr"));
             Ok(("move.w".into(), operands, target_addr))
         }
+        ParserType::MoveFromCcr => {
+            let dst_mode = ((op >> 3) & 0x7) as u8;
+            let dst_reg = (op & 0x7) as u8;
+            let dst = decode_ea(dst_mode, dst_reg, "w", stream, inst_pc, cpu)?;
+            operands.push(DecodedOperand::special("ccr"));
+            operands.push(DecodedOperand::from_ea(dst));
+            Ok(("move.w".into(), operands, target_addr))
+        }
         ParserType::MoveFromSr => {
             let dst_mode = ((op >> 3) & 0x7) as u8;
             let dst_reg = (op & 0x7) as u8;
@@ -852,7 +952,10 @@ fn parse_operands(
             let dst = EAOperand::DataReg(dst_reg);
             operands.push(DecodedOperand::from_ea(src));
             operands.push(DecodedOperand::from_ea(dst));
-            Ok((name, operands, target_addr))
+            // The size has to reach the output: a bare `cmp` reassembles at
+            // the default word size, so `cmp.l (a0),d0` (b090) came back as
+            // `cmp.w` (b050) — a real instruction, silently the wrong one.
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Muls => {
             let src_mode = ((op >> 3) & 0x7) as u8;
@@ -1169,9 +1272,23 @@ fn parse_operands(
             let size = if opmode & 0x1 != 0 { "l" } else { "w" };
             let reg = ((op >> 9) & 0x7) as u8;
             let addr_reg = (op & 0x7) as u8;
-            let disp = sign_extend_8(stream.read_word()? as u8);
+            // MOVEP's displacement is a full 16-bit word, not a byte:
+            // `sign_extend_8` threw away the high half, so `0d0a 1234`
+            // decoded as `movep.w $34(a2),d6` — a different address.
+            let disp = sign_extend_16(stream.read_word()?);
             let dreg = DecodedOperand::from_ea(EAOperand::DataReg(reg));
-            let mem = DecodedOperand::from_ea(EAOperand::AddrDisp(addr_reg, disp));
+            // Rendered with an explicit displacement even when it is zero.
+            // `AddrDisp` formats `0(a2)` as `(a2)`, which is right for the
+            // ordinary indirect mode but not here: MOVEP has no such mode,
+            // so the shortened form does not reassemble.
+            // Negative displacements are printed in decimal: the reference
+            // rejects `$fffe(a2)` as out of range for a signed 16-bit
+            // field but takes `-2(a2)`, which encodes to the same bytes.
+            let mem = DecodedOperand::special(if disp < 0 {
+                format!("{}(a{})", disp, addr_reg)
+            } else {
+                format!("${:x}(a{})", disp, addr_reg)
+            });
             if to_mem {
                 operands.push(dreg);
                 operands.push(mem);
@@ -1521,48 +1638,10 @@ fn fpu_fmt_suffix(fmt: u16) -> &'static str {
     }
 }
 
-/// FPU monadic/dyadic arithmetic opclass/opmode (extension word bits 6-0) to mnemonic.
+/// FPU monadic/dyadic arithmetic opclass/opmode (extension word bits 6-0)
+/// to mnemonic. Shares its table with the encoder, in `m68k-core`.
 fn fpu_arith_name(cmd: u16) -> Option<&'static str> {
-    Some(match cmd {
-        0x00 => "fmove",
-        0x01 => "fint",
-        0x02 => "fsinh",
-        0x03 => "fintrz",
-        0x04 => "fsqrt",
-        0x06 => "flognp1",
-        0x08 => "fetoxm1",
-        0x09 => "ftanh",
-        0x0A => "fatan",
-        0x0B => "ftan",
-        0x0C => "fasin",
-        0x0D => "fatanh",
-        0x0E => "fsin",
-        0x0F => "ftentox",
-        0x10 => "ftwotox",
-        0x11 => "fetox",
-        0x12 => "flog10",
-        0x14 => "flog2",
-        0x15 => "flogn",
-        0x18 => "fabs",
-        0x19 => "fcosh",
-        0x1A => "fneg",
-        0x1C => "facos",
-        0x1D => "fcos",
-        0x1E => "fgetexp",
-        0x1F => "fgetman",
-        0x20 => "fdiv",
-        0x21 => "fmod",
-        0x22 => "fadd",
-        0x23 => "fmul",
-        0x24 => "fsgldiv",
-        0x25 => "frem",
-        0x26 => "fscale",
-        0x27 => "fsglmul",
-        0x28 => "fsub",
-        0x38 => "fcmp",
-        0x3A => "ftst",
-        _ => return None,
-    })
+    m68k_core::opcodes::fpu_arith_mnemonic(cmd)
 }
 
 /// "Short" (rounding-precision-forcing) FPU opclass/opmode to mnemonic.
@@ -1902,6 +1981,73 @@ fn format_movem_list(mask: u16) -> String {
     let d_groups = group_regs("d", &regs);
     let a_groups = group_regs("a", &regs);
     [d_groups, a_groups].concat().join("/")
+}
+
+#[cfg(test)]
+mod ea_validation_tests {
+    use super::*;
+
+    /// Decode a single instruction, returning just its mnemonic — or
+    /// `"dc.w"` when the bytes did not resolve to an instruction at all.
+    fn decode_one(bytes: &[u8]) -> String {
+        let mut stream = InstructionStream::new(bytes, 0);
+        match decode_next(&mut stream, "68020") {
+            Ok((_, DecodeResult::Instruction(i))) => i.mnemonic,
+            Ok((_, DecodeResult::DataWord(_))) => "dc.w".to_string(),
+            Err(e) => format!("error: {}", e),
+        }
+    }
+
+    #[test]
+    fn invalid_addressing_modes_decode_as_data() {
+        // `000A 0050` is ORI.B with mode 001 (An) — byte access to an
+        // address register, which is not an addressing mode at all. The
+        // patterns carried the right category all along, but nothing
+        // consulted it, so this rendered as `ori.b #$50,a2`: an
+        // instruction that does not exist, produced from a data region.
+        assert_eq!(decode_one(&[0x00, 0x0A, 0x00, 0x50]), "dc.w");
+        assert_eq!(decode_one(&[0x00, 0x08, 0x00, 0x01]), "dc.w");
+    }
+
+    #[test]
+    fn valid_data_register_forms_still_decode() {
+        // The category test must not be stricter than the hardware. Several
+        // patterns said ALTERABLE_MEMORY where the instruction also accepts
+        // Dn — NBCD, CLR, Scc, TAS, NEG, NOT and MOVE from SR among them.
+        for (bytes, want) in [
+            (vec![0x48, 0x00], "nbcd"),   // NBCD D0
+            (vec![0x42, 0x40], "clr.w"),  // CLR.W D0
+            (vec![0x54, 0xC0], "scc"),    // SCC D0
+            (vec![0x4A, 0xC0], "tas"),    // TAS D0
+            (vec![0x44, 0x40], "neg.w"),  // NEG.W D0
+            (vec![0x46, 0x40], "not.w"),  // NOT.W D0
+            (vec![0x40, 0xC0], "move.w"), // MOVE SR,D0
+            (vec![0x42, 0xC0], "move.w"), // MOVE CCR,D0
+        ] {
+            let got = decode_one(&bytes);
+            assert!(
+                got.starts_with(want),
+                "{:02x?} decoded as {:?}, expected {}",
+                bytes,
+                got,
+                want
+            );
+        }
+    }
+
+    #[test]
+    fn address_register_sources_still_decode() {
+        // ADDA/SUBA/CMPA take *any* addressing mode, An included; their
+        // patterns said DATA, which excludes it, so `adda.l a0,a1` (d3c8)
+        // would have become a data word.
+        for bytes in [
+            vec![0xD3, 0xC8], // ADDA.L A0,A1
+            vec![0x93, 0xC8], // SUBA.L A0,A1
+            vec![0xB3, 0xC8], // CMPA.L A0,A1
+        ] {
+            assert_ne!(decode_one(&bytes), "dc.w", "{:02x?} lost", bytes);
+        }
+    }
 }
 
 #[cfg(test)]

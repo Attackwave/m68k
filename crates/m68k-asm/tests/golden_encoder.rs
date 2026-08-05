@@ -133,10 +133,10 @@ fn parse_operand(s: &str) -> Result<Operand, String> {
         return Ok(Operand::AddrReg(7));
     }
     if s.eq_ignore_ascii_case("CCR") {
-        return Ok(Operand::Immediate(-1));
+        return Ok(Operand::Special("CCR".to_string()));
     }
     if s.eq_ignore_ascii_case("SR") {
-        return Ok(Operand::Immediate(-2));
+        return Ok(Operand::Special("SR".to_string()));
     }
 
     if let Some(rest) = s.strip_prefix('#') {

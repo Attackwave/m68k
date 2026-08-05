@@ -14,6 +14,13 @@ pub struct DisassembledLine {
     pub address: u32,
     pub raw_bytes: Vec<u8>,
     pub text: String,
+    /// Label defined at this address, when one was discovered.
+    ///
+    /// Pass 1 assigns names to branch/jump targets and pass 2 substitutes
+    /// them into operands, but nothing ever emitted the definitions — the
+    /// output referenced 7271 labels and defined none of them, so it could
+    /// not be reassembled at all. Callers print this ahead of `text`.
+    pub label: Option<String>,
     /// True if decoding failed at this address; `text` then holds an
     /// error description instead of formatted instruction/data output.
     pub is_error: bool,
@@ -133,6 +140,7 @@ impl Disassembler {
                         address: inst_pc,
                         raw_bytes: inst.raw_bytes.clone(),
                         text,
+                        label: self.labels.get(&inst_pc).cloned(),
                         is_error: false,
                     });
                 }
@@ -142,6 +150,7 @@ impl Disassembler {
                         address: inst_pc,
                         raw_bytes: dw.raw_bytes.clone(),
                         text,
+                        label: self.labels.get(&inst_pc).cloned(),
                         is_error: false,
                     });
                 }
@@ -150,6 +159,7 @@ impl Disassembler {
                         address: inst_pc,
                         raw_bytes: Vec::new(),
                         text: format!("error at {:08x}: {}", inst_pc, e),
+                        label: self.labels.get(&inst_pc).cloned(),
                         is_error: true,
                     });
                     stream.seek(stream.offset + 2);

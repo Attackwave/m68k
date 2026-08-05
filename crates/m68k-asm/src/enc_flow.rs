@@ -115,13 +115,25 @@ pub fn enc_bsr(target: i32, pc: u32) -> Result<Vec<u16>, AsmError> {
 }
 
 /// Encode DBcc instruction.
+///
+/// Base is `0x50C8 | (cc << 8) | reg` — **not** `0x51C8 | ...`. The often
+/// quoted `0x51C8` is the encoding of `DBF`/`DBRA` specifically, whose
+/// condition code happens to be 1; using it as the base ORs that 1 into
+/// every condition, turning each even code into the odd one above it.
+/// `DBT` (cc=0) came out as `DBF`, `DBHI` (2) as `DBLS` (3), and so on for
+/// all eight even conditions — a loop that never terminates where the
+/// source asked for one that terminates immediately, and vice versa.
+///
+/// This survived because the only test covered `DBF`, the one condition
+/// where both forms agree. Verified against the reference across all
+/// sixteen conditions.
 pub fn enc_dbcc(cond: &str, reg: u8, target: i32, pc: u32) -> Result<Vec<u16>, AsmError> {
     let cc = cond_code(cond)?;
     let disp = target.wrapping_sub(pc as i32);
     if !(-32768..=32767).contains(&disp) {
         return Err(AsmError::new("DBcc displacement out of range"));
     }
-    let op = 0x5100 | ((cc as u16) << 8) | 0x00C8 | (reg as u16);
+    let op = 0x50C8 | ((cc as u16) << 8) | (reg as u16);
     Ok(vec![op, (disp & 0xFFFF) as u16])
 }
 
@@ -252,26 +264,41 @@ pub fn enc_rtd(displacement: u16) -> Result<Vec<u16>, AsmError> {
 ///
 /// MOVEC.L Dn, Cr (Dn → control register, opcode $4E7B, ext = cr|reg<<4)
 /// MOVEC.L Cr, Dn (control register → Dn, opcode $4E7A, ext = cr|reg<<4)
+/// Encode MOVEC.
+///
+/// Extension word layout: **bit 15 selects data (0) or address (1)
+/// register, bits 14-12 hold the register number, bits 11-0 the control
+/// register code**. The register number used to be shifted left by 4
+/// instead of 12, so it landed inside the control-register field:
+/// `movec d1,vbr` encoded as `4e7b 0811` where the hardware (and a real
+/// Kickstart ROM) has `4e7b 1801` — a different control register entirely,
+/// with no diagnostic. Address registers were rejected outright, though
+/// `movec a0,vbr` and `movec a7,usp` are both valid and appear in real
+/// code.
 pub fn enc_movec(src: &Operand, dst: &Operand) -> Result<Vec<u16>, AsmError> {
-    // MOVEC Dn, Cr: 0x4E7B, ext = cr_number | (data_reg << 4)
-    if let Operand::DataReg(rn) = src
-        && let Operand::Immediate(cr) = dst
-    {
-        let op = 0x4E7B;
-        let ext = ((*cr as u16) & 0xFFF) | ((*rn as u16) << 4);
-        return Ok(vec![op, ext]);
+    fn reg_field(op: &Operand) -> Option<u16> {
+        match op {
+            Operand::DataReg(n) => Some((*n as u16) << 12),
+            Operand::AddrReg(n) => Some(0x8000 | ((*n as u16) << 12)),
+            _ => None,
+        }
     }
 
-    // MOVEC Cr, Dn: 0x4E7A, ext = cr_number | (data_reg << 4)
-    if let Operand::DataReg(dst_reg) = dst
-        && let Operand::Immediate(cr) = src
+    // MOVEC Rn,Cr — general register to control register.
+    if let Operand::Immediate(cr) = dst
+        && let Some(reg) = reg_field(src)
     {
-        let op = 0x4E7A;
-        let ext = ((*cr as u16) & 0xFFF) | ((*dst_reg as u16) << 4);
-        return Ok(vec![op, ext]);
+        return Ok(vec![0x4E7B, ((*cr as u16) & 0xFFF) | reg]);
     }
 
-    Err(AsmError::new("MOVEC requires Dn,CR or CR,Dn operands"))
+    // MOVEC Cr,Rn — control register to general register.
+    if let Operand::Immediate(cr) = src
+        && let Some(reg) = reg_field(dst)
+    {
+        return Ok(vec![0x4E7A, ((*cr as u16) & 0xFFF) | reg]);
+    }
+
+    Err(AsmError::new("MOVEC requires Rn,CR or CR,Rn operands"))
 }
 
 /// Encode BKPT instruction.
@@ -590,7 +617,11 @@ pub fn enc_addi(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable, not ALL: the immediate family has no address-register
+    // form at all — `ADDI.W #1,A0` is not an instruction, `ADDA.W #1,A0`
+    // is. With ALL we emitted bytes for the former, which the reference
+    // rejects.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0600 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -619,7 +650,9 @@ pub fn enc_subi(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable — the immediate family has no address-register form
+    // (`ADDA`/`SUBA`/`CMPA` are those); see enc_addi.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0400 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -658,7 +691,9 @@ pub fn enc_andi(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable — the immediate family has no address-register form
+    // (`ADDA`/`SUBA`/`CMPA` are those); see enc_addi.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0200 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -695,7 +730,9 @@ pub fn enc_ori(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable — see enc_addi above: no address-register form exists
+    // for the immediate family.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -729,7 +766,9 @@ pub fn enc_eori(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable — the immediate family has no address-register form
+    // (`ADDA`/`SUBA`/`CMPA` are those); see enc_addi.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0A00 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -822,7 +861,9 @@ pub fn enc_cmpi(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable — the immediate family has no address-register form
+    // (`ADDA`/`SUBA`/`CMPA` are those); see enc_addi.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0C00 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -1097,6 +1138,40 @@ mod tests {
     }
 
     #[test]
+    fn test_dbcc_all_conditions() {
+        // `DBF` (cc=1) is the one condition where the old `0x51C8` base
+        // agreed with the correct `0x50C8`, which is why testing only that
+        // one hid the bug for every even condition. Reference-verified.
+        for (cond, cc) in [
+            ("t", 0u16),
+            ("f", 1),
+            ("hi", 2),
+            ("ls", 3),
+            ("cc", 4),
+            ("cs", 5),
+            ("ne", 6),
+            ("eq", 7),
+            ("vc", 8),
+            ("vs", 9),
+            ("pl", 10),
+            ("mi", 11),
+            ("ge", 12),
+            ("lt", 13),
+            ("gt", 14),
+            ("le", 15),
+        ] {
+            let words = enc_dbcc(cond, 0, 0x100, 0x102).unwrap();
+            assert_eq!(
+                words[0],
+                0x50C8 | (cc << 8),
+                "DB{} encoded as {:#06x}",
+                cond,
+                words[0]
+            );
+        }
+    }
+
+    #[test]
     fn test_jmp_a0() {
         let words = enc_jmp(&Operand::AddrRegIndirect(0), 0, "68000").unwrap();
         assert_eq!(words, vec![0x4ED0]);
@@ -1349,6 +1424,56 @@ mod tests {
         // 0x0300 — it locked in the encoder's own bug, since bits 15-8 are
         // reserved. Reference: `callm #3,(a0)` = `06d0 0003`.
         assert_eq!(words, vec![0x06D0, 0x0003]);
+    }
+
+    #[test]
+    fn immediate_family_rejects_address_registers() {
+        // `ADDI.W #1,A0` is not an instruction — `ADDA.W #1,A0` is. These
+        // encoders used the ALL category, so they emitted bytes for a form
+        // the reference rejects, at every size.
+        let an = Operand::AddrReg(0);
+        let dn = Operand::DataReg(0);
+        for size in ["b", "w", "l"] {
+            assert!(
+                enc_addi(1, &an, size, 0, "68000").is_err(),
+                "ADDI.{} #1,A0 must be rejected",
+                size
+            );
+            assert!(
+                enc_cmpi(1, &an, size, 0, "68000").is_err(),
+                "CMPI.{} #1,A0 must be rejected",
+                size
+            );
+            // A data register stays valid at every size.
+            assert!(enc_addi(1, &dn, size, 0, "68000").is_ok());
+        }
+    }
+
+    #[test]
+    fn test_movec_extension_word_layout() {
+        // bit 15 = A/D, bits 14-12 = register, bits 11-0 = control code.
+        // The register used to be shifted by 4, landing inside the control
+        // field: `movec d1,vbr` produced 4e7b0811 where a real Kickstart
+        // ROM (and the reference) has 4e7b1801 — a different control
+        // register, with no diagnostic.
+        let vbr = Operand::Immediate(0x801);
+        assert_eq!(
+            enc_movec(&Operand::DataReg(1), &vbr).unwrap(),
+            vec![0x4E7B, 0x1801]
+        );
+        assert_eq!(
+            enc_movec(&vbr, &Operand::DataReg(1)).unwrap(),
+            vec![0x4E7A, 0x1801]
+        );
+        // Address registers set bit 15; these were rejected outright.
+        assert_eq!(
+            enc_movec(&Operand::AddrReg(0), &vbr).unwrap(),
+            vec![0x4E7B, 0x8801]
+        );
+        assert_eq!(
+            enc_movec(&Operand::Immediate(0x800), &Operand::AddrReg(7)).unwrap(),
+            vec![0x4E7A, 0xF800]
+        );
     }
 
     #[test]

@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use m68k_core::errors::{AsmError, ErrorCollector};
-use m68k_core::operands::Operand;
+use m68k_core::operands::{MemoryIndirectOperand, Operand};
 use m68k_core::tokens::{is_local_label, split_line};
 
 use crate::directives::{
@@ -501,9 +501,50 @@ fn parse_operand_text(
         ));
     }
 
-    // Absolute address with .W/.L suffix
-    if text.ends_with(".W") || text.ends_with(".L") {
-        let force_long = text.ends_with(".L");
+    // Indexed with the base register suppressed: `(bd,Xn.size*scale)`, and
+    // the explicit `(bd,ZAn,Xn.size*scale)` spelling for the same thing.
+    // This is a 68020 full-format EA that the encoder has always been able
+    // to emit — `MemoryIndirectOperand::base_reg` is an `Option` precisely
+    // for it — but no parser produced one, so the reference assembled
+    // `move.l ($1000,d0.w*8),d1` and we rejected it.
+    if let Some((xn, disp, scale, xn_is_long)) =
+        parse_parens_disp_index_no_base(paren_text, symbols, current_pc)
+    {
+        return Ok(Operand::MemoryIndirect(Box::new(MemoryIndirectOperand {
+            base_reg: None,
+            base_is_pc: false,
+            base_disp: Some(disp),
+            index_reg: Some(xn),
+            index_long: xn_is_long,
+            index_scale: scale,
+            outer_disp: None,
+            is_postindexed: false,
+            is_indirect: false,
+        })));
+    }
+
+    // Absolute address with .W/.L suffix.
+    //
+    // Case-insensitively: this used to test only for the upper-case forms,
+    // so `lea $400.w,a6` silently produced the long encoding while
+    // `lea $400.W,a6` produced the short one. Lower-case suffixes are the
+    // common spelling in real sources, and the mismatch showed up as a
+    // large share of the ROM roundtrip failures.
+    let suffix_upper = {
+        let bytes = text.as_bytes();
+        if bytes.len() >= 2 {
+            let n = bytes.len();
+            if bytes[n - 2] == b'.' {
+                Some(bytes[n - 1].to_ascii_uppercase())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if matches!(suffix_upper, Some(b'W') | Some(b'L')) {
+        let force_long = suffix_upper == Some(b'L');
         let base = text[..text.len() - 2].trim();
         if let Ok(value) = evaluate_expr_str(base, symbols, current_pc)
             && !text.contains('(')
@@ -515,6 +556,29 @@ fn parse_operand_text(
                 Ok(Operand::AbsoluteShort(value as i32))
             };
         }
+    }
+
+    // Parenthesised absolute address: `($1234)`. Every form that puts a
+    // register inside the parens has been tried above, so a remaining
+    // bracketed expression is just an address with redundant parentheses —
+    // which the reference accepts and real listings contain.
+    if let Some(inner) = text
+        .trim()
+        .strip_prefix('(')
+        .and_then(|t| t.strip_suffix(')'))
+        && !inner.contains('(')
+        && !inner.contains(')')
+        && !inner.contains(',')
+        && parse_register(inner.trim()).is_none()
+        && let Ok(value) = evaluate_expr_str(inner, symbols, current_pc)
+    {
+        return Ok(
+            if symbols.optimize_absolute() && (0..=0xFFFF).contains(&value) {
+                Operand::AbsoluteShort(value as i32)
+            } else {
+                Operand::AbsoluteLong(value as i32)
+            },
+        );
     }
 
     // Absolute address: $xxxx or a number/label without a register.
@@ -537,20 +601,25 @@ fn parse_operand_text(
         }
     }
 
-    // Special registers
+    // Special registers.
+    //
+    // These are `Operand::Special`, not marker immediates. They used to be
+    // `Immediate(-1)`/`Immediate(-2)`/`Immediate(0x800)`, which collide
+    // with those values written literally: `MOVE.W #-1,D0` matched the CCR
+    // arm and assembled to 42C0 (`MOVE CCR,D0`) — a different instruction,
+    // silently. `#-2` became `MOVE SR,D0` the same way, and `MOVE.L
+    // #-2,A0` was rejected outright.
     if text.eq_ignore_ascii_case("CCR") {
-        return Ok(Operand::Immediate(-1));
+        return Ok(Operand::Special("CCR".to_string()));
     }
     if text.eq_ignore_ascii_case("SR") {
-        return Ok(Operand::Immediate(-2));
+        return Ok(Operand::Special("SR".to_string()));
     }
     // USP is a control register, not A7: mapping it to AddrReg(7) made
     // `move usp,a0` assemble as a plain `move a7,a0` (0x304F) instead of
-    // the privileged 0x4E68 form, and the USP special cases in the MOVE
-    // dispatcher — which look for this marker — never fired. Uses the
-    // same negative/marker-immediate convention as CCR (-1) and SR (-2).
+    // the privileged 0x4E68 form.
     if text.eq_ignore_ascii_case("USP") {
-        return Ok(Operand::Immediate(0x800));
+        return Ok(Operand::Special("USP".to_string()));
     }
 
     // MOVEC control register names
@@ -937,6 +1006,51 @@ fn parse_parens_disp_pc_index(
 /// Supports optional scale: (d8,An,Xn*1), (d8,An,Xn*2), (d8,An,Xn*4), (d8,An,Xn*8)
 /// Supports optional index size: (d8,An,Xn.W), (d8,An,Xn.L)
 /// Returns (An, Xn, disp, scale, is_long).
+/// Parse `(bd,Xn.size*scale)` — an indexed EA with the base register
+/// suppressed — and the equivalent `(bd,ZAn,Xn.size*scale)` spelling.
+///
+/// Distinguished from `(bd,An,Xn)` by the middle field: either it is
+/// absent, or it names a suppressed base (`ZA0`..`ZA7`, `ZPC`). Returns
+/// the index register, base displacement, scale and index size.
+fn parse_parens_disp_index_no_base(
+    text: &str,
+    symbols: &SymbolTable,
+    pc: u32,
+) -> Option<(u8, i32, u8, bool)> {
+    let trimmed = text.trim();
+    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').collect();
+
+    let (disp_str, xn_full) = match parts.len() {
+        // (bd,Xn)
+        2 => (parts[0].trim(), parts[1].trim()),
+        // (bd,ZAn,Xn) — explicit base suppression
+        3 => {
+            let mid = parts[1].trim().to_uppercase();
+            let suppressed = mid == "ZPC"
+                || (mid.starts_with("ZA") && mid.len() == 3 && mid.as_bytes()[2].is_ascii_digit());
+            if !suppressed {
+                return None;
+            }
+            (parts[0].trim(), parts[2].trim())
+        }
+        _ => return None,
+    };
+
+    // The middle field of the 2-part form must be an index register, not a
+    // base one — `(4,A0)` is a plain displacement and belongs elsewhere.
+    let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
+    let reg = parse_register(&xn_name)?;
+    let xn = index_reg_num(&reg)?;
+    // A bare `(An,Xn)` has already been handled by the caller above; here a
+    // two-part form only qualifies when the first field is not a register.
+    if parts.len() == 2 && parse_register(disp_str).is_some() {
+        return None;
+    }
+    let disp = evaluate_displacement(disp_str, symbols, pc);
+    Some((xn, disp, scale, is_long))
+}
+
 fn parse_parens_disp_reg_index(
     text: &str,
     symbols: &SymbolTable,
@@ -1107,6 +1221,8 @@ fn parse_memory_indirect(
         index_scale,
         outer_disp,
         is_postindexed,
+        // Reached only from the bracketed syntax.
+        is_indirect: true,
     }))
 }
 
@@ -1493,6 +1609,24 @@ pub struct Assembler {
     /// Extra directories searched for `INCLUDE` files (the `-I` paths),
     /// tried after the including file's own directory.
     pub include_paths: Vec<PathBuf>,
+    /// Results of `IFD`/`IFND` as decided in pass 1, keyed by source line.
+    ///
+    /// These test whether a symbol is *defined yet*, which is inherently
+    /// position-dependent — but by pass 2 the symbol table holds every
+    /// symbol in the file, so re-evaluating flips the answer. That broke
+    /// the include-guard idiom every Amiga system header uses:
+    ///
+    /// ```text
+    /// IFND EXEC_TYPES_I
+    /// EXEC_TYPES_I SET 1
+    ///   ... header body ...
+    /// ENDC
+    /// ```
+    ///
+    /// Pass 1 correctly took the branch; pass 2 saw `EXEC_TYPES_I` already
+    /// defined and skipped the entire body, so the header contributed
+    /// nothing. Recording pass 1's verdict keeps both passes consistent.
+    conditional_results: HashMap<usize, bool>,
     /// `EQUR` register aliases and `REG` register lists, keyed by
     /// upper-cased name.
     ///
@@ -1616,6 +1750,7 @@ impl Assembler {
             line_pcs: Vec::new(),
             source_root: PathBuf::from("."),
             include_paths: Vec::new(),
+            conditional_results: HashMap::new(),
             register_aliases: HashMap::new(),
             included_files: std::collections::HashSet::new(),
             conditional_stack: Vec::new(),
@@ -1663,6 +1798,44 @@ impl Assembler {
     }
 
     /// Evaluate a conditional directive name and its argument.
+    /// Whether a conditional's answer depends on how far assembly has got.
+    ///
+    /// `IFD`/`IFND` ask whether a symbol is defined *yet*; every other form
+    /// evaluates an expression whose value is the same in both passes.
+    fn conditional_is_position_dependent(name: &str) -> bool {
+        matches!(name, "ifdef" | "ifndef" | "ifd" | "ifnd")
+    }
+
+    /// Evaluate a conditional in pass 1 and remember the answer.
+    fn eval_conditional_pass1(
+        &mut self,
+        name: &str,
+        arg: &str,
+        line_no: usize,
+    ) -> Result<bool, AsmError> {
+        let result = self.eval_conditional(name, arg, line_no)?;
+        if Self::conditional_is_position_dependent(name) {
+            self.conditional_results.insert(line_no, result);
+        }
+        Ok(result)
+    }
+
+    /// Evaluate a conditional in a later pass, reusing pass 1's answer for
+    /// the position-dependent forms.
+    fn eval_conditional_later(
+        &self,
+        name: &str,
+        arg: &str,
+        line_no: usize,
+    ) -> Result<bool, AsmError> {
+        if Self::conditional_is_position_dependent(name)
+            && let Some(cached) = self.conditional_results.get(&line_no)
+        {
+            return Ok(*cached);
+        }
+        self.eval_conditional(name, arg, line_no)
+    }
+
     fn eval_conditional(&self, name: &str, arg: &str, line_no: usize) -> Result<bool, AsmError> {
         match name {
             "ifdef" | "ifndef" | "ifd" | "ifnd" => {
@@ -2083,8 +2256,14 @@ impl Assembler {
                     let actual = operands1.get(idx).cloned().unwrap_or_default();
                     subs.push((format!("\\{}", pname), actual));
                 }
-                // \@ → unique number
-                subs.push(("\\@".to_string(), format!("{:04X}", unique_id)));
+                // \@ → unique label fragment, with a leading underscore so
+                // the result is a valid identifier even when `\@` is used
+                // as a *prefix*. The Amiga system headers do exactly that
+                // (`\@BITDEF SET 1<<\3` in exec/types.i), and a bare
+                // `0001BITDEF` is not a legal label — it parsed as an
+                // unknown mnemonic and stopped the assembly. The reference
+                // substitutes `_000001` for the same reason.
+                subs.push(("\\@".to_string(), format!("_{:06}", unique_id)));
 
                 // Label on invocation line becomes an EQU
                 if let Some(ref lbl) = lbl1 {
@@ -2278,7 +2457,7 @@ impl Assembler {
                 match name.as_str() {
                     "ifc" | "ifnc" => {
                         let arg = args.join(",");
-                        let result = self.eval_conditional(name, &arg, line.line_no)?;
+                        let result = self.eval_conditional_pass1(name, &arg, line.line_no)?;
                         let active = self.is_conditional_active() && result;
                         self.conditional_stack.push(active);
                         if let Some(ref label) = line.label {
@@ -2296,7 +2475,7 @@ impl Assembler {
                     "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef"
                     | "ifndef" | "ifd" | "ifnd" => {
                         let arg = args.first().map(|s| s.as_str()).unwrap_or("");
-                        let result = self.eval_conditional(name, arg, line.line_no)?;
+                        let result = self.eval_conditional_pass1(name, arg, line.line_no)?;
                         let active = self.is_conditional_active() && result;
                         self.conditional_stack.push(active);
                         if let Some(ref label) = line.label {
@@ -2942,7 +3121,7 @@ impl Assembler {
                         let arg = args.join(",");
                         let active = cond_stack.last().copied().unwrap_or(true);
                         let result = self
-                            .eval_conditional(name, &arg, line.line_no)
+                            .eval_conditional_later(name, &arg, line.line_no)
                             .unwrap_or(false);
                         cond_stack.push(active && result);
                         skip = true;
@@ -2952,7 +3131,7 @@ impl Assembler {
                         let arg = args.first().map(|s| s.as_str()).unwrap_or("");
                         let active = cond_stack.last().copied().unwrap_or(true);
                         let result = self
-                            .eval_conditional(name, arg, line.line_no)
+                            .eval_conditional_later(name, arg, line.line_no)
                             .unwrap_or(false);
                         cond_stack.push(active && result);
                         skip = true;
@@ -3138,7 +3317,7 @@ impl Assembler {
                 match name.as_str() {
                     "ifc" | "ifnc" => {
                         let arg = args.join(",");
-                        let result = self.eval_conditional(name, &arg, line.line_no)?;
+                        let result = self.eval_conditional_later(name, &arg, line.line_no)?;
                         let active = self.is_conditional_active() && result;
                         self.conditional_stack.push(active);
                         continue;
@@ -3146,7 +3325,7 @@ impl Assembler {
                     "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef"
                     | "ifndef" | "ifd" | "ifnd" => {
                         let arg = args.first().map(|s| s.as_str()).unwrap_or("");
-                        let result = self.eval_conditional(name, arg, line.line_no)?;
+                        let result = self.eval_conditional_later(name, arg, line.line_no)?;
                         let active = self.is_conditional_active() && result;
                         self.conditional_stack.push(active);
                         continue;
@@ -3273,17 +3452,24 @@ impl Assembler {
         m68k_core::cpu_gate::check_mnemonic_cpu(&mnemonic.to_uppercase(), &self.cpu)
             .map_err(|msg| AsmError::with_line(msg, line.line_no))?;
 
-        // Parse operands
-        let src = if !operand_texts.is_empty() {
-            parse_operand_text(&operand_texts[0], &self.symbols, pc).ok()
-        } else {
-            None
+        // Parse operands. A parse failure is kept rather than discarded:
+        // by pass 2 every symbol is known, so an operand that still fails
+        // to parse is a real error — usually an undefined symbol. Reporting
+        // "MOVE requires source and destination" for `move.l #UNDEF,d1`
+        // sent the reader looking at the wrong thing entirely; the
+        // reference names the missing symbol. The error is surfaced only if
+        // encoding actually fails, since the branch paths below legitimately
+        // work with an unparsed operand.
+        let mut operand_error: Option<AsmError> = None;
+        let mut parse_operand = |text: &str| match parse_operand_text(text, &self.symbols, pc) {
+            Ok(op) => Some(op),
+            Err(e) => {
+                operand_error.get_or_insert(e);
+                None
+            }
         };
-        let dst = if operand_texts.len() > 1 {
-            parse_operand_text(&operand_texts[1], &self.symbols, pc).ok()
-        } else {
-            None
-        };
+        let src = operand_texts.first().and_then(|t| parse_operand(t));
+        let dst = operand_texts.get(1).and_then(|t| parse_operand(t));
 
         // For branch instructions, the target operand is the first (and only) operand
         // but the encoder expects it as dst
@@ -3533,7 +3719,13 @@ impl Assembler {
                 pc,
                 &self.cpu,
             )
-            .map_err(|e| AsmError::with_line(e.message, line.line_no))?,
+            .map_err(|e| {
+                // If an operand failed to parse, that is the real cause;
+                // the encoder only sees a missing operand and reports the
+                // instruction's shape, which points at the wrong thing.
+                let cause = operand_error.take().unwrap_or(e);
+                AsmError::with_line(cause.message, line.line_no)
+            })?,
         };
         let word_count = words.len();
 
@@ -5452,12 +5644,14 @@ local\\@ EQU $
 ",
         );
         assert!(result.is_ok(), "assembly failed: {:?}", result.err());
-        // First expansion generates local0001 EQU $ (0x1000)
-        // Second expansion generates local0002 EQU $ (0x1002)
-        assert!(asm.symbols.resolve("local0001").is_ok());
-        assert!(asm.symbols.resolve("local0002").is_ok());
-        assert_eq!(asm.symbols.resolve("local0001").unwrap(), 0x1000);
-        assert_eq!(asm.symbols.resolve("local0002").unwrap(), 0x1002);
+        // `\@` expands to `_000001`, `_000002`, ... — with a leading
+        // underscore so the fragment is a valid identifier when used as a
+        // *prefix* too, which the Amiga system headers rely on. The
+        // reference substitutes the same shape.
+        assert!(asm.symbols.resolve("local_000001").is_ok());
+        assert!(asm.symbols.resolve("local_000002").is_ok());
+        assert_eq!(asm.symbols.resolve("local_000001").unwrap(), 0x1000);
+        assert_eq!(asm.symbols.resolve("local_000002").unwrap(), 0x1002);
     }
 
     /// Regression: a macro invoking another macro previously errored with
@@ -6868,6 +7062,84 @@ mymexc MACRO
     }
 
     #[test]
+    fn test_absolute_short_suffix_is_case_insensitive() {
+        // `.w` forces the absolute-short encoding. The check tested only
+        // for the upper-case spelling, so `lea $400.w,a6` silently emitted
+        // the 6-byte long form while `.W` emitted the 4-byte short one.
+        for src in ["\tLEA\t$400.w,A6\n", "\tLEA\t$400.W,A6\n"] {
+            let mut asm = Assembler::new(0);
+            asm.assemble(src).unwrap();
+            assert_eq!(asm.code[0].words, vec![0x4DF8, 0x0400], "for {:?}", src);
+        }
+        for src in ["\tLEA\t$400.l,A6\n", "\tLEA\t$400.L,A6\n"] {
+            let mut asm = Assembler::new(0);
+            asm.assemble(src).unwrap();
+            assert_eq!(asm.code[0].words, vec![0x4DF9, 0x0000, 0x0400]);
+        }
+    }
+
+    #[test]
+    fn test_include_guard_survives_both_passes() {
+        // `IFND SYM` / `SYM SET 1` is the guard every Amiga system header
+        // uses. Pass 1 took the branch correctly, but pass 2 saw the symbol
+        // already defined and skipped the body — so the header contributed
+        // nothing at all. Reference: 7001 4e75.
+        let mut asm = Assembler::new(0);
+        asm.assemble("\tIFND SYM\nSYM\tSET 1\n\tMOVEQ #1,D0\n\tENDC\n\tRTS\n")
+            .unwrap();
+        let words: Vec<u16> = asm.code.iter().flat_map(|i| i.words.clone()).collect();
+        assert_eq!(words, vec![0x7001, 0x4E75], "guarded block was skipped");
+
+        // The same holds when the SET comes after the block.
+        let mut asm = Assembler::new(0);
+        asm.assemble("\tIFND SYM\n\tMOVEQ #1,D0\n\tENDC\nSYM\tSET 1\n\tRTS\n")
+            .unwrap();
+        let words: Vec<u16> = asm.code.iter().flat_map(|i| i.words.clone()).collect();
+        assert_eq!(words, vec![0x7001, 0x4E75]);
+    }
+
+    #[test]
+    fn test_special_registers_do_not_collide_with_literal_values() {
+        // CCR/SR/USP used to be marker immediates (-1, -2, 0x800), so
+        // `MOVE.W #-1,D0` matched the CCR arm and assembled to 42C0 —
+        // `MOVE CCR,D0`, a different instruction, silently.
+        // Reference: move.w #-1,d0 = 303c ffff, move.w ccr,d0 = 42c0.
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68020");
+        asm.assemble("\tMOVE.W #-1,D0\n\tMOVE.W #-2,D0\n\tMOVE.W CCR,D0\n\tMOVE.W SR,D0\n")
+            .unwrap();
+        let words: Vec<Vec<u16>> = asm.code.iter().map(|i| i.words.clone()).collect();
+        assert_eq!(words[0], vec![0x303C, 0xFFFF], "MOVE.W #-1 became MOVE CCR");
+        assert_eq!(words[1], vec![0x303C, 0xFFFE], "MOVE.W #-2 became MOVE SR");
+        assert_eq!(words[2], vec![0x42C0]);
+        assert_eq!(words[3], vec![0x40C0]);
+    }
+
+    #[test]
+    fn test_byte_immediate_occupies_only_the_low_byte() {
+        // The extension word's high byte is zero for a byte immediate.
+        // Reference: move.b #-1,d0 = 103c 00ff, not 103c ffff.
+        let mut asm = Assembler::new(0);
+        asm.assemble("\tMOVE.B #-1,D0\n").unwrap();
+        assert_eq!(asm.code[0].words, vec![0x103C, 0x00FF]);
+    }
+
+    #[test]
+    fn test_undefined_symbol_is_named_in_the_error() {
+        // By pass 2 every symbol is known, so an operand that still fails
+        // to parse is a real error. Reporting the instruction's shape
+        // ("MOVE requires source and destination") pointed at the wrong
+        // thing entirely.
+        let mut asm = Assembler::new(0);
+        let err = asm.assemble("\tMOVE.L #NOSUCHSYM,D1\n").unwrap_err();
+        assert!(
+            err.message.contains("NOSUCHSYM"),
+            "error should name the missing symbol, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn test_octal_literals() {
         // `@17` is the Motorola octal form the reference assembler accepts.
         // It was not implemented at all, in any of the three number parsers.
@@ -7155,8 +7427,12 @@ mymexc MACRO
 
     #[test]
     fn test_dbne_with_label_target() {
+        // DBNE is condition code 6, so the opword is 0x56C9. This test
+        // asserted 0x57C9 — the encoding of DBEQ — because the encoder
+        // used 0x51C8 as its base, which ORs DBF's condition bit into
+        // every even condition. Reference: `dbne d1,lbl` = `56c9 fffe`.
         let bytes = assemble_source_with_cpu("LOOP:\n    DBNE D1,LOOP\n", "68000");
-        assert_eq!(bytes, vec![0x57, 0xC9, 0xFF, 0xFE]);
+        assert_eq!(bytes, vec![0x56, 0xC9, 0xFF, 0xFE]);
     }
 
     #[test]

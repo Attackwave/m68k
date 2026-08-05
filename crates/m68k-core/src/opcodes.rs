@@ -36,6 +36,7 @@ pub enum ParserType {
     Lea,
     AbcdSbcd,
     MoveToCcr,
+    MoveFromCcr,
     MoveFromSr,
     MoveToSr,
     ImmCcr,
@@ -174,7 +175,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             mask: 0xF0C0,
             value: 0xD0C0,
             mnemonic: "ADDA",
-            src_ea: DATA,
+            src_ea: ALL, // ADDA/SUBA/CMPA take any mode, An included,
             dst_ea: AREG,
             cpu: "68000",
             parser: ParserType::Adda,
@@ -423,7 +424,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0140,
             mnemonic: "BCHG",
             src_ea: DREG,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT, // BCHG/BCLR/BSET write; only BTST may be PC-relative,
             cpu: "68000",
             parser: ParserType::BitReg,
             fixed_size: None,
@@ -433,7 +434,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0180,
             mnemonic: "BCLR",
             src_ea: DREG,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT, // BCHG/BCLR/BSET write; only BTST may be PC-relative,
             cpu: "68000",
             parser: ParserType::BitReg,
             fixed_size: None,
@@ -443,7 +444,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x01C0,
             mnemonic: "BSET",
             src_ea: DREG,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT, // BCHG/BCLR/BSET write; only BTST may be PC-relative,
             cpu: "68000",
             parser: ParserType::BitReg,
             fixed_size: None,
@@ -463,7 +464,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0840,
             mnemonic: "BCHG",
             src_ea: IMM,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT, // BCHG/BCLR/BSET write; only BTST may be PC-relative,
             cpu: "68000",
             parser: ParserType::BitImm,
             fixed_size: None,
@@ -473,7 +474,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0880,
             mnemonic: "BCLR",
             src_ea: IMM,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT, // BCHG/BCLR/BSET write; only BTST may be PC-relative,
             cpu: "68000",
             parser: ParserType::BitImm,
             fixed_size: None,
@@ -483,7 +484,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x08C0,
             mnemonic: "BSET",
             src_ea: IMM,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT, // BCHG/BCLR/BSET write; only BTST may be PC-relative,
             cpu: "68000",
             parser: ParserType::BitImm,
             fixed_size: None,
@@ -527,7 +528,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x4200,
             mnemonic: "CLR",
             src_ea: 0,
-            dst_ea: ALTERABLE_MEMORY,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::Clr,
             fixed_size: None,
@@ -546,7 +547,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             mask: 0xF0C0,
             value: 0xB0C0,
             mnemonic: "CMPA",
-            src_ea: DATA,
+            src_ea: ALL, // ADDA/SUBA/CMPA take any mode, An included,
             dst_ea: AREG,
             cpu: "68000",
             parser: ParserType::Cmpa,
@@ -557,7 +558,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0C00,
             mnemonic: "CMPI",
             src_ea: IMM,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::Cmpi,
             fixed_size: None,
@@ -607,7 +608,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0xB100,
             mnemonic: "EOR",
             src_ea: DREG,
-            dst_ea: ALTERABLE_MEMORY,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::Eor,
             fixed_size: None,
@@ -725,7 +726,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x003C,
             mnemonic: "ORI",
             src_ea: IMM,
-            dst_ea: 0,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::ImmCcr,
             fixed_size: None,
@@ -745,7 +746,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x023C,
             mnemonic: "ANDI",
             src_ea: IMM,
-            dst_ea: 0,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::ImmCcr,
             fixed_size: None,
@@ -765,7 +766,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0A3C,
             mnemonic: "EORI",
             src_ea: IMM,
-            dst_ea: 0,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::ImmCcr,
             fixed_size: None,
@@ -785,7 +786,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0600,
             mnemonic: "ADDI",
             src_ea: IMM,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT, // the immediate family has no An form
             cpu: "68000",
             parser: ParserType::ImmEa,
             fixed_size: None,
@@ -795,7 +796,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0400,
             mnemonic: "SUBI",
             src_ea: IMM,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT, // the immediate family has no An form
             cpu: "68000",
             parser: ParserType::ImmEa,
             fixed_size: None,
@@ -805,7 +806,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0200,
             mnemonic: "ANDI",
             src_ea: IMM,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT, // the immediate family has no An form
             cpu: "68000",
             parser: ParserType::ImmEa,
             fixed_size: None,
@@ -815,7 +816,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0000,
             mnemonic: "ORI",
             src_ea: IMM,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT, // the immediate family has no An form
             cpu: "68000",
             parser: ParserType::ImmEa,
             fixed_size: None,
@@ -825,7 +826,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0A00,
             mnemonic: "EORI",
             src_ea: IMM,
-            dst_ea: ALL,
+            dst_ea: DATA_ALT, // the immediate family has no An form
             cpu: "68000",
             parser: ParserType::ImmEa,
             fixed_size: None,
@@ -1053,11 +1054,24 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             parser: ParserType::Move,
             fixed_size: None,
         },
+        // MOVE CCR,<ea> (68010+) — the read direction. No pattern existed
+        // for it, so `42C0` decoded as a data word even though the
+        // assembler emits exactly those bytes for `MOVE CCR,D0`.
+        OpcodePattern {
+            mask: 0xFFC0,
+            value: 0x42C0,
+            mnemonic: "MOVE",
+            src_ea: 0,
+            dst_ea: DATA_ALT,
+            cpu: "68010",
+            parser: ParserType::MoveFromCcr,
+            fixed_size: Some("w"),
+        },
         OpcodePattern {
             mask: 0xFFC0,
             value: 0x44C0,
             mnemonic: "MOVE",
-            src_ea: DATA,
+            src_ea: DATA | IMM,
             dst_ea: 0,
             cpu: "68000",
             parser: ParserType::MoveToCcr,
@@ -1068,7 +1082,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x40C0,
             mnemonic: "MOVE",
             src_ea: 0,
-            dst_ea: ALTERABLE_MEMORY,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::MoveFromSr,
             fixed_size: None,
@@ -1077,7 +1091,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             mask: 0xFFC0,
             value: 0x46C0,
             mnemonic: "MOVE",
-            src_ea: CONTROL,
+            src_ea: DATA | IMM,
             dst_ea: 0,
             cpu: "68000",
             parser: ParserType::MoveToSr,
@@ -1162,7 +1176,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x4800,
             mnemonic: "NBCD",
             src_ea: 0,
-            dst_ea: ALTERABLE_MEMORY,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::Nbcd,
             fixed_size: None,
@@ -1172,7 +1186,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x4400,
             mnemonic: "NEG",
             src_ea: 0,
-            dst_ea: ALTERABLE_MEMORY,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::Neg,
             fixed_size: None,
@@ -1182,7 +1196,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x4000,
             mnemonic: "NEGX",
             src_ea: 0,
-            dst_ea: ALTERABLE_MEMORY,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::Negx,
             fixed_size: None,
@@ -1212,7 +1226,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x4600,
             mnemonic: "NOT",
             src_ea: 0,
-            dst_ea: ALTERABLE_MEMORY,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::Not,
             fixed_size: None,
@@ -1361,7 +1375,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x50C0,
             mnemonic: "Scc",
             src_ea: 0,
-            dst_ea: ALTERABLE_MEMORY,
+            dst_ea: DATA_ALT, // Scc writes a data register too (`SCC D0`)
             cpu: "68000",
             parser: ParserType::Scc,
             fixed_size: None,
@@ -1390,7 +1404,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             mask: 0xF0C0,
             value: 0x90C0,
             mnemonic: "SUBA",
-            src_ea: DATA,
+            src_ea: ALL, // ADDA/SUBA/CMPA take any mode, An included,
             dst_ea: AREG,
             cpu: "68000",
             parser: ParserType::Adda,
@@ -1441,7 +1455,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x4AC0,
             mnemonic: "TAS",
             src_ea: 0,
-            dst_ea: ALTERABLE_MEMORY,
+            dst_ea: DATA_ALT,
             cpu: "68000",
             parser: ParserType::Tas,
             fixed_size: None,
@@ -1663,4 +1677,72 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             fixed_size: None,
         },
     ]
+}
+
+/// FPU arithmetic opclass/opmode codes (extension word bits 6-0).
+///
+/// The single source of truth for both directions. The assembler and the
+/// disassembler each used to carry their own copy, and six entries had
+/// drifted apart from the hardware in *both* copies identically: `FTAN`
+/// sat at 0x0B (unassigned) while 0x0F held `FTENTOX`, and the
+/// exponential/logarithm group was rotated by one. Every affected
+/// instruction assembled to a different but perfectly valid FPU operation
+/// — `FETOX` emitting `FTWOTOX`, `FLOGN` emitting `FLOG10` — with no
+/// diagnostic anywhere, because the two tables agreed with each other.
+///
+/// Verified entry by entry against the reference assembler.
+pub const FPU_ARITH_OPS: &[(u16, &str)] = &[
+    (0x00, "fmove"),
+    (0x01, "fint"),
+    (0x02, "fsinh"),
+    (0x03, "fintrz"),
+    (0x04, "fsqrt"),
+    (0x06, "flognp1"),
+    (0x08, "fetoxm1"),
+    (0x09, "ftanh"),
+    (0x0A, "fatan"),
+    (0x0C, "fasin"),
+    (0x0D, "fatanh"),
+    (0x0E, "fsin"),
+    (0x0F, "ftan"),
+    (0x10, "fetox"),
+    (0x11, "ftwotox"),
+    (0x12, "ftentox"),
+    (0x14, "flogn"),
+    (0x15, "flog10"),
+    (0x16, "flog2"),
+    (0x18, "fabs"),
+    (0x19, "fcosh"),
+    (0x1A, "fneg"),
+    (0x1C, "facos"),
+    (0x1D, "fcos"),
+    (0x1E, "fgetexp"),
+    (0x1F, "fgetman"),
+    (0x20, "fdiv"),
+    (0x21, "fmod"),
+    (0x22, "fadd"),
+    (0x23, "fmul"),
+    (0x24, "fsgldiv"),
+    (0x25, "frem"),
+    (0x26, "fscale"),
+    (0x27, "fsglmul"),
+    (0x28, "fsub"),
+    (0x38, "fcmp"),
+    (0x3A, "ftst"),
+];
+
+/// Opcode for an FPU arithmetic mnemonic (case-insensitive).
+pub fn fpu_arith_code(mnemonic: &str) -> Option<u16> {
+    FPU_ARITH_OPS
+        .iter()
+        .find(|(_, n)| n.eq_ignore_ascii_case(mnemonic))
+        .map(|(c, _)| *c)
+}
+
+/// Mnemonic for an FPU arithmetic opcode.
+pub fn fpu_arith_mnemonic(code: u16) -> Option<&'static str> {
+    FPU_ARITH_OPS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, n)| *n)
 }

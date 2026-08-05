@@ -180,10 +180,39 @@ pub fn enc_shift_reg(
         "roxr" => 0xE010,
         _ => return Err(AsmError::new("unknown shift mnemonic")),
     };
+    // The immediate count field is 3 bits with 8 encoded as 0, so only
+    // 1..=8 is representable. `count & 0x7` used to wrap anything else
+    // silently: `asl.b #9,d0` assembled as a shift by 1 and `#0` as a
+    // shift by 8. The reference rejects both. Larger shifts need the
+    // register form (`asl.b d1,d0`), which allows 0..=63.
+    if !(1..=8).contains(&count) {
+        return Err(AsmError::new(format!(
+            "shift count {} is outside the range 1..8 \
+             (use the register form for a larger or variable count)",
+            count
+        )));
+    }
     let c = if count == 8 { 0 } else { count & 0x7 };
     Ok(vec![
         base | ((sz as u16) << 6) | ((c as u16) << 9) | (dst_reg as u16),
     ])
+}
+
+#[cfg(test)]
+mod shift_count_tests {
+    use super::*;
+
+    #[test]
+    fn immediate_shift_count_is_range_checked() {
+        // The 3-bit field encodes 1..=8 (with 8 as 0), so anything else
+        // used to wrap: `#9` became a shift by 1, `#0` a shift by 8.
+        assert!(enc_shift_reg("asl", 0, 0, "b").is_err());
+        assert!(enc_shift_reg("asl", 9, 0, "b").is_err());
+        assert!(enc_shift_reg("asl", 16, 0, "b").is_err());
+        // Reference: asl.b #1,d0 = e300, asl.b #8,d0 = e100.
+        assert_eq!(enc_shift_reg("asl", 1, 0, "b").unwrap(), vec![0xE300]);
+        assert_eq!(enc_shift_reg("asl", 8, 0, "b").unwrap(), vec![0xE100]);
+    }
 }
 
 /// Encode the register-count shift/rotate form `<shift>.<size> Dn,Dm`,
