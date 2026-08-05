@@ -21,6 +21,20 @@ pub fn encode_ea(
             Ok((mode, reg, vec![]))
         }
         Operand::AddrReg(n) => {
+            // An address register has no byte-sized access on any 68k: the
+            // register is always written in full, so the byte form simply
+            // does not exist in the encoding. Most instructions already
+            // excluded AREG through their EA category, but MOVE (which
+            // allows every mode) and the immediate family did not, so
+            // `move.b a0,d0` and `ori.b #1,a0` produced bytes for an
+            // instruction the CPU does not have. The reference rejects
+            // both. Enforced here rather than per encoder, since the rule
+            // holds for every one of them.
+            if size.eq_ignore_ascii_case("b") {
+                return Err(AsmError::new(
+                    "byte-sized operations cannot address an address register",
+                ));
+            }
             let (mode, reg) = (1, *n);
             check_ea(mode, reg, allowed)?;
             Ok((mode, reg, vec![]))
@@ -371,6 +385,29 @@ fn encode_full_ea(
     }
 
     Ok((mode, reg, ext_words))
+}
+
+#[cfg(test)]
+mod address_register_strictness_tests {
+    use super::*;
+    use m68k_core::ea_categories::ea::ALL;
+
+    #[test]
+    fn byte_size_cannot_reach_an_address_register() {
+        // An address register is always written in full; the byte form
+        // does not exist in the encoding. MOVE (which allows every mode)
+        // and the immediate family let this through, so `move.b a0,d0`
+        // and `ori.b #1,a0` produced bytes for a non-instruction.
+        let an = Operand::AddrReg(0);
+        assert!(encode_ea(&an, "b", 0, ALL, "68000").is_err());
+        // Word and long remain valid.
+        assert!(encode_ea(&an, "w", 0, ALL, "68000").is_ok());
+        assert!(encode_ea(&an, "l", 0, ALL, "68000").is_ok());
+        // Indirection through an address register is unaffected: it is the
+        // *register* that has no byte form, not memory reached through it.
+        let ind = Operand::AddrRegIndirect(0);
+        assert!(encode_ea(&ind, "b", 0, ALL, "68000").is_ok());
+    }
 }
 
 #[cfg(test)]

@@ -617,7 +617,11 @@ pub fn enc_addi(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable, not ALL: the immediate family has no address-register
+    // form at all — `ADDI.W #1,A0` is not an instruction, `ADDA.W #1,A0`
+    // is. With ALL we emitted bytes for the former, which the reference
+    // rejects.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0600 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -646,7 +650,9 @@ pub fn enc_subi(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable — the immediate family has no address-register form
+    // (`ADDA`/`SUBA`/`CMPA` are those); see enc_addi.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0400 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -685,7 +691,9 @@ pub fn enc_andi(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable — the immediate family has no address-register form
+    // (`ADDA`/`SUBA`/`CMPA` are those); see enc_addi.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0200 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -722,7 +730,9 @@ pub fn enc_ori(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable — see enc_addi above: no address-register form exists
+    // for the immediate family.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -756,7 +766,9 @@ pub fn enc_eori(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable — the immediate family has no address-register form
+    // (`ADDA`/`SUBA`/`CMPA` are those); see enc_addi.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0A00 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -849,7 +861,9 @@ pub fn enc_cmpi(
         "l" => 2,
         _ => return Err(AsmError::new("invalid size")),
     };
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // Data alterable — the immediate family has no address-register form
+    // (`ADDA`/`SUBA`/`CMPA` are those); see enc_addi.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0C00 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
     if size == "b" {
@@ -1410,6 +1424,29 @@ mod tests {
         // 0x0300 — it locked in the encoder's own bug, since bits 15-8 are
         // reserved. Reference: `callm #3,(a0)` = `06d0 0003`.
         assert_eq!(words, vec![0x06D0, 0x0003]);
+    }
+
+    #[test]
+    fn immediate_family_rejects_address_registers() {
+        // `ADDI.W #1,A0` is not an instruction — `ADDA.W #1,A0` is. These
+        // encoders used the ALL category, so they emitted bytes for a form
+        // the reference rejects, at every size.
+        let an = Operand::AddrReg(0);
+        let dn = Operand::DataReg(0);
+        for size in ["b", "w", "l"] {
+            assert!(
+                enc_addi(1, &an, size, 0, "68000").is_err(),
+                "ADDI.{} #1,A0 must be rejected",
+                size
+            );
+            assert!(
+                enc_cmpi(1, &an, size, 0, "68000").is_err(),
+                "CMPI.{} #1,A0 must be rejected",
+                size
+            );
+            // A data register stays valid at every size.
+            assert!(enc_addi(1, &dn, size, 0, "68000").is_ok());
+        }
     }
 
     #[test]
