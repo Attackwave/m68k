@@ -1221,6 +1221,8 @@ fn evaluate_simple_number(text: &str) -> Option<i32> {
         i32::from_str_radix(hex, 16).ok()?
     } else if let Some(bin) = body.strip_prefix('%') {
         i32::from_str_radix(bin, 2).ok()?
+    } else if let Some(oct) = body.strip_prefix('@') {
+        i32::from_str_radix(oct, 8).ok()?
     } else {
         body.parse::<i32>().ok()?
     };
@@ -6478,6 +6480,111 @@ mymexc MACRO
         // architecture; the fix belongs with a broader pass-1 estimation pass.
         let bytes = assemble_source_with_cpu("    CAS.W D0,D1,(A0)\nlabel:\n    NOP\n", "68020");
         assert_eq!(bytes, vec![0x0C, 0xD0, 0x00, 0x40, 0x4E, 0x71]);
+    }
+
+    #[test]
+    fn test_section_with_type_keyword() {
+        // `SECTION name,TYPE` is how essentially every real Amiga source
+        // declares a section. It used to be rejected outright: the second
+        // argument was only ever parsed as an origin expression, so this
+        // failed with "undefined symbol: CODE".
+        for src in [
+            "    SECTION code,CODE\n    NOP\n",
+            "    SECTION data,DATA\n    DC.W 1\n",
+            "    SECTION bss,BSS\n    DS.B 4\n",
+            "    SECTION mycode,CODE_C\n    NOP\n",
+            "    SECTION mydata,DATA_F\n    DC.W 1\n",
+        ] {
+            let mut asm = Assembler::new(0);
+            assert!(
+                asm.assemble(src).is_ok(),
+                "SECTION with a type keyword must assemble: {:?}",
+                src
+            );
+        }
+    }
+
+    #[test]
+    fn test_section_type_keyword_beats_the_name() {
+        // `SECTION mydata,DATA` is a data section even though its name is
+        // not one of the well-known ones. Without this the hunk writer
+        // emitted it as HUNK_CODE — declared data becoming executable code.
+        use crate::directives::SectionKind;
+        let mut asm = Assembler::new(0);
+        asm.assemble("    SECTION mydata,DATA\n    DC.W 1\n")
+            .unwrap();
+        let section = asm
+            .sections
+            .get_section(&SectionKind::Named("mydata".to_string()))
+            .expect("named section must exist");
+        assert_eq!(section.effective_kind(), &SectionKind::Data);
+    }
+
+    #[test]
+    fn test_section_origin_form_still_works() {
+        // The numeric second argument is a local extension the reference
+        // assembler does not accept; keep it working regardless.
+        let mut asm = Assembler::new(0);
+        asm.assemble("    SECTION foo,$1000\n    NOP\n").unwrap();
+        assert_eq!(asm.code[0].pc, 0x1000);
+    }
+
+    #[test]
+    fn test_sections_keep_declaration_order() {
+        // Output writers used to sort by address and then by name. With
+        // every section based at 0 that became alphabetical order, which
+        // can put a data or BSS hunk at index 0 — where LoadSeg() enters.
+        let mut asm = Assembler::new(0);
+        asm.assemble("    SECTION zdata,DATA\n    DC.W 1\n    SECTION acode,CODE\n    RTS\n")
+            .unwrap();
+        // The implicit default `text` section exists but stays empty, and
+        // output writers filter it out — so compare what actually ships.
+        let names: Vec<&str> = asm
+            .sections
+            .iter_sections()
+            .filter(|(_, s)| !s.is_empty())
+            .map(|(k, _)| k.name())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["zdata", "acode"],
+            "sections must iterate in declaration order, not sorted by name"
+        );
+    }
+
+    #[test]
+    fn test_bss_section_with_only_ds_is_not_empty() {
+        // A BSS section holding nothing but reservations has no
+        // instructions, so it was filtered out of every output format and
+        // vanished — code referencing a label in it pointed at nothing.
+        use crate::directives::SectionKind;
+        let mut asm = Assembler::new(0);
+        asm.assemble("    SECTION code,CODE\n    RTS\n    SECTION vars,BSS\nbuf:    DS.B 1024\n")
+            .unwrap();
+        let bss = asm
+            .sections
+            .get_section(&SectionKind::Named("vars".to_string()))
+            .expect("bss section must exist");
+        assert!(bss.instructions.is_empty(), "DS emits no instructions");
+        assert!(!bss.is_empty(), "but the section is not empty");
+        assert_eq!(bss.reserved_size(), 1024);
+    }
+
+    #[test]
+    fn test_octal_literals() {
+        // `@17` is the Motorola octal form the reference assembler accepts.
+        // It was not implemented at all, in any of the three number parsers.
+        let mut asm = Assembler::new(0);
+        asm.assemble("    MOVEQ #@17,D0\n    DC.W @17\n    DC.L @777\n")
+            .unwrap();
+        assert_eq!(asm.code[0].words, vec![0x700F]); // @17 = 15
+        assert_eq!(asm.code[1].words, vec![0x000F]);
+        assert_eq!(asm.code[2].words, vec![0x0000, 0x01FF]); // @777 = 511
+
+        // And inside expressions and EQU.
+        let mut asm = Assembler::new(0);
+        asm.assemble("V   EQU @20\n    DC.W V+@10\n").unwrap();
+        assert_eq!(asm.code[0].words, vec![0x0018]); // 16 + 8
     }
 
     #[test]

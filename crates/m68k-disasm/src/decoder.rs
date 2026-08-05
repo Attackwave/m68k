@@ -589,14 +589,18 @@ fn parse_operands(
             Ok((name, operands, target_addr))
         }
         ParserType::Chk => {
+            // Size comes from the matched pattern (bits 8-7: 11 = word,
+            // 10 = long), not assumed to be word — CHK.L is a distinct
+            // encoding, not a suffix on the same opcode.
+            let size = pat.fixed_size.unwrap_or("w");
             let src_mode = ((op >> 3) & 0x7) as u8;
             let src_reg = (op & 0x7) as u8;
             let dst_reg = ((op >> 9) & 0x7) as u8;
-            let src = decode_ea(src_mode, src_reg, "w", stream, inst_pc, cpu)?;
+            let src = decode_ea(src_mode, src_reg, size, stream, inst_pc, cpu)?;
             let dst = EAOperand::DataReg(dst_reg);
             operands.push(DecodedOperand::from_ea(src));
             operands.push(DecodedOperand::from_ea(dst));
-            Ok((name, operands, target_addr))
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Lea => {
             let src_mode = ((op >> 3) & 0x7) as u8;
@@ -1088,17 +1092,19 @@ fn parse_operands(
             Ok((name, operands, target_addr))
         }
         ParserType::Callm => {
-            // CALLM (68020): 0x06C0 | ea, followed by a word holding the
-            // argument count in bits 15-8 (matching the encoder's
-            // `arg_val << 8`), not the low byte.
+            // CALLM (68020): 0x06C0 | ea, followed by a word whose *low*
+            // byte holds the argument count; bits 15-8 are reserved.
+            //
+            // This previously read bits 15-8, matching an encoder that
+            // wrote them there. Both sides being wrong in the same way is
+            // why the roundtrip test passed: it only proves the two agree
+            // with each other, not with the hardware. The reference
+            // assembler settles it — `callm #4,(a0)` = `06d0 0004`.
             let ext = stream.read_word()?;
             let mode = ((op >> 3) & 0x7) as u8;
             let reg = (op & 0x7) as u8;
             let ea = decode_ea(mode, reg, "b", stream, inst_pc, cpu)?;
-            operands.push(DecodedOperand::special(format!(
-                "#${:x}",
-                (ext >> 8) & 0xFF
-            )));
+            operands.push(DecodedOperand::special(format!("#${:x}", ext & 0xFF)));
             operands.push(DecodedOperand::from_ea(ea));
             Ok((name, operands, target_addr))
         }

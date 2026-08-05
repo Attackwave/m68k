@@ -283,9 +283,41 @@ pub fn enc_bkpt(vector: u8) -> Result<Vec<u16>, AsmError> {
 }
 
 /// Encode CHK instruction.
-pub fn enc_chk(src: &Operand, dst_reg: u8, pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    let (src_mode, src_reg, src_ext) = encode_ea(src, "w", pc, DATA, cpu)?;
-    let op = 0x4180 | ((dst_reg as u16) << 9) | ((src_mode as u16) << 3) | (src_reg as u16);
+/// Encode CHK.
+///
+/// The size lives in bits 8-7: **3 = word, 2 = long** (not 0/1, and not in
+/// the usual bits 7-6 slot). This used to hardcode the word form, so
+/// `CHK.L d1,d2` silently assembled as `CHK.W` — no error, just the wrong
+/// operand size at run time. Verified against the reference assembler:
+/// `chk.w d1,d2` = `4581`, `chk.l d1,d2` = `4501`.
+pub fn enc_chk(
+    src: &Operand,
+    dst_reg: u8,
+    size: &str,
+    pc: u32,
+    cpu: &str,
+) -> Result<Vec<u16>, AsmError> {
+    let size_bits: u16 = match size {
+        "w" => 3,
+        "l" => {
+            if cpu == "68000" || cpu == "68010" {
+                return Err(AsmError::new("CHK.L requires 68020 or later"));
+            }
+            2
+        }
+        other => {
+            return Err(AsmError::new(format!(
+                "invalid size for CHK: .{} (only .w and .l exist)",
+                other
+            )));
+        }
+    };
+    let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, DATA, cpu)?;
+    let op = 0x4000
+        | ((dst_reg as u16) << 9)
+        | (size_bits << 7)
+        | ((src_mode as u16) << 3)
+        | (src_reg as u16);
     let mut words = vec![op];
     words.extend(src_ext);
     Ok(words)
@@ -892,7 +924,11 @@ pub fn enc_callm(arg: &Operand, ea: &Operand, pc: u32, cpu: &str) -> Result<Vec<
     };
     let (ea_mode, ea_reg, ea_ext) = encode_ea(ea, "b", pc, CONTROL, cpu)?;
     let op = 0x06C0 | ((ea_mode as u16) << 3) | (ea_reg as u16);
-    let mut words = vec![op, ((arg_val as u16) << 8)];
+    // The argument count sits in the *low* byte of the extension word; bits
+    // 15-8 are reserved and zero. Shifting it left by 8 put it in the
+    // reserved half, so `CALLM #4` encoded the value 1024 instead of 4.
+    // Verified against the reference: `callm #4,(a0)` = `06d0 0004`.
+    let mut words = vec![op, arg_val as u16];
     words.extend(ea_ext);
     Ok(words)
 }
@@ -1308,8 +1344,34 @@ mod tests {
             "68020",
         )
         .unwrap();
-        // 0x06C0 | (2 << 3) | 0 = 0x06D0
-        assert_eq!(words, vec![0x06D0, 0x0300]);
+        // 0x06C0 | (2 << 3) | 0 = 0x06D0, then the argument count in the
+        // extension word's *low* byte. This test previously asserted
+        // 0x0300 — it locked in the encoder's own bug, since bits 15-8 are
+        // reserved. Reference: `callm #3,(a0)` = `06d0 0003`.
+        assert_eq!(words, vec![0x06D0, 0x0003]);
+    }
+
+    #[test]
+    fn test_chk_size_bits() {
+        // Size lives in bits 8-7: 3 = word, 2 = long. `CHK.L` used to
+        // assemble as `CHK.W` with no diagnostic at all.
+        // Reference: chk.w d1,d2 = 4581, chk.l d1,d2 = 4501.
+        let w = enc_chk(&Operand::DataReg(1), 2, "w", 0, "68020").unwrap();
+        assert_eq!(w, vec![0x4581]);
+        let l = enc_chk(&Operand::DataReg(1), 2, "l", 0, "68020").unwrap();
+        assert_eq!(l, vec![0x4501]);
+        // And with a memory source: chk.w (a0),d3 = 4790, chk.l = 4710.
+        let mw = enc_chk(&Operand::AddrRegIndirect(0), 3, "w", 0, "68020").unwrap();
+        assert_eq!(mw, vec![0x4790]);
+        let ml = enc_chk(&Operand::AddrRegIndirect(0), 3, "l", 0, "68020").unwrap();
+        assert_eq!(ml, vec![0x4710]);
+    }
+
+    #[test]
+    fn test_chk_long_requires_68020() {
+        assert!(enc_chk(&Operand::DataReg(1), 2, "l", 0, "68000").is_err());
+        assert!(enc_chk(&Operand::DataReg(1), 2, "l", 0, "68010").is_err());
+        assert!(enc_chk(&Operand::DataReg(1), 2, "w", 0, "68000").is_ok());
     }
 
     #[test]

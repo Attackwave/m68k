@@ -53,18 +53,23 @@ fn push_name(buf: &mut Vec<u8>, name: &str) {
 /// writer's section ordering. Returns an empty `Vec` if there are no
 /// non-empty sections.
 pub fn generate_hunk_exe(sections: &SectionManager, symbols: &SymbolTable) -> Vec<u8> {
-    let mut ordered: Vec<(&SectionKind, &Section)> = sections
+    // A BSS section holding nothing but `DS` reservations has no
+    // instructions at all, so filtering on `instructions.is_empty()` dropped
+    // it from the executable — code referencing a label in it then pointed
+    // at nothing. `is_empty()` also accounts for reserved space.
+    // Declaration order, straight from `iter_sections` — no re-sorting.
+    // Sorting by base address and then by name looked reasonable, but every
+    // section starts at 0 unless the source says otherwise, so it collapsed
+    // to alphabetical: `SECTION zdata,DATA` before `SECTION acode,CODE`
+    // would put a data hunk at index 0, which is where `LoadSeg()` enters.
+    // The reference assembler emits declaration order (verified).
+    let ordered: Vec<(&SectionKind, &Section)> = sections
         .iter_sections()
-        .filter(|(_, s)| !s.instructions.is_empty())
+        .filter(|(_, s)| !s.is_empty())
         .collect();
     if ordered.is_empty() {
         return Vec::new();
     }
-    ordered.sort_by(|a, b| {
-        a.1.base_addr()
-            .cmp(&b.1.base_addr())
-            .then(a.0.name().cmp(b.0.name()))
-    });
 
     let hunk_count = ordered.len();
     let mut out = Vec::new();
@@ -78,15 +83,19 @@ pub fn generate_hunk_exe(sections: &SectionManager, symbols: &SymbolTable) -> Ve
     // Hunk size table: each hunk's byte length in longwords (top 2 bits
     // reserved for memory-type flags, left at 0 = "any/public memory").
     for (_, section) in &ordered {
-        let size_bytes = section.to_bytes().len();
-        push_u32(&mut out, (size_bytes.div_ceil(4)) as u32);
+        // `reserved_size`, not `to_bytes().len()`: a BSS section's `DS`
+        // space emits no bytes but still occupies the hunk.
+        push_u32(&mut out, (section.reserved_size().div_ceil(4)) as u32);
     }
 
     for (kind, section) in &ordered {
         let data = section.to_bytes();
-        let word_count = data.len().div_ceil(4);
+        let word_count = section.reserved_size().div_ceil(4);
 
-        let hunk_type = match kind {
+        // `effective_kind` honours an explicit `SECTION name,TYPE`: a named
+        // section declared DATA or BSS must not be emitted as HUNK_CODE just
+        // because its name is not one of the well-known ones.
+        let hunk_type = match section.effective_kind() {
             SectionKind::Bss => HUNK_BSS,
             SectionKind::Data => HUNK_DATA,
             SectionKind::Text | SectionKind::Named(_) => HUNK_CODE,
@@ -103,7 +112,9 @@ pub fn generate_hunk_exe(sections: &SectionManager, symbols: &SymbolTable) -> Ve
         }
 
         let base = section.base_addr();
-        let end = base + section.to_bytes().len() as u32;
+        // Reserved size again, so a label pointing into a BSS section's `DS`
+        // space still falls inside the range and keeps its HUNK_SYMBOL entry.
+        let end = base + section.reserved_size() as u32;
         let section_symbols: Vec<(&str, u32)> = symbols
             .iter()
             .filter(|(_, entry)| {

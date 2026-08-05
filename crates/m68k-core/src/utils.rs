@@ -3,6 +3,7 @@
 /// Parse a number from string, supporting multiple formats:
 /// - `$FF` or `0xFF` for hex
 /// - `%1010` for binary
+/// - `@777` for octal
 /// - `42` for decimal
 pub fn parse_number(s: &str) -> Result<i64, String> {
     let s = s.trim();
@@ -12,6 +13,11 @@ pub fn parse_number(s: &str) -> Result<i64, String> {
         i64::from_str_radix(stripped, 16).map_err(|e| format!("invalid hex: {}", e))
     } else if let Some(stripped) = s.strip_prefix('%') {
         i64::from_str_radix(stripped, 2).map_err(|e| format!("invalid binary: {}", e))
+    } else if let Some(stripped) = s.strip_prefix('@') {
+        // Motorola octal. Supported by the reference assembler and used in
+        // older Amiga sources; it was missing here entirely, so `@17`
+        // failed to parse rather than yielding 15.
+        i64::from_str_radix(stripped, 8).map_err(|e| format!("invalid octal: {}", e))
     } else if s.len() == 2 && s.starts_with('\'') {
         Ok(s.as_bytes()[1] as i64)
     } else {

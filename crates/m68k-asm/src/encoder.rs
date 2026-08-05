@@ -946,7 +946,9 @@ pub fn encode_instruction(
 
         // CHK
         "CHK" => match (src, dst) {
-            (Some(s), Some(Operand::DataReg(rn))) => enc_chk(s, *rn, pc + 4, cpu),
+            (Some(s), Some(Operand::DataReg(rn))) => {
+                enc_chk(s, *rn, size.unwrap_or("w"), pc + 4, cpu)
+            }
             _ => Err(AsmError::new("CHK requires source and Dn")),
         },
 
