@@ -11,6 +11,15 @@ use crate::enc_math::*;
 use crate::enc_mmu::*;
 use crate::enc_move::*;
 
+/// Whether an operand names a given special register (`CCR`, `SR`, `USP`).
+///
+/// These are `Operand::Special`, not marker immediates: encoding them as
+/// `Immediate(-1)`/`(-2)`/`(0x800)` made those literal values collide with
+/// the markers, so `MOVE.W #-1,D0` assembled as `MOVE CCR,D0`.
+fn is_special(op: &Operand, name: &str) -> bool {
+    matches!(op, Operand::Special(n) if n.eq_ignore_ascii_case(name))
+}
+
 /// FPU arithmetic-instruction opclass/opmode field (extension word bits 6-0).
 ///
 /// Delegates to the shared table in `m68k-core`; the assembler and the
@@ -594,7 +603,9 @@ pub fn encode_instruction(
             // destination fall through to the generic MOVE path, which
             // treated the SR marker as an absolute address and emitted
             // e.g. 0x3F3C FFFE for `move.w sr,-(sp)`.
-            if let (Some(Operand::Immediate(-2)), Some(d)) = (src, dst) {
+            if let (Some(s0), Some(d)) = (src, dst)
+                && is_special(s0, "SR")
+            {
                 let (mode, reg, ext) = crate::ea_encode::encode_ea(
                     d,
                     "w",
@@ -614,7 +625,9 @@ pub fn encode_instruction(
             // MOVE path, which treated `Immediate(-1)` as an ordinary
             // immediate: `MOVE.W CCR,D0` silently assembled to 303C FFFF
             // (`MOVE.W #-1,D0`) instead of 42C0.
-            if let (Some(Operand::Immediate(-1)), Some(d)) = (src, dst) {
+            if let (Some(s0), Some(d)) = (src, dst)
+                && is_special(s0, "CCR")
+            {
                 if cpu == "68000" {
                     return Err(AsmError::new("MOVE from CCR requires 68010 or later"));
                 }
@@ -629,7 +642,9 @@ pub fn encode_instruction(
                 words.extend(ext);
                 return Ok(words);
             }
-            if let (Some(s), Some(Operand::Immediate(-1))) = (src, dst) {
+            if let (Some(s), Some(d0)) = (src, dst)
+                && is_special(d0, "CCR")
+            {
                 let (mode, reg, ext) = crate::ea_encode::encode_ea(
                     s,
                     "w",
@@ -641,7 +656,9 @@ pub fn encode_instruction(
                 words.extend(ext);
                 return Ok(words);
             }
-            if let (Some(s), Some(Operand::Immediate(-2))) = (src, dst) {
+            if let (Some(s), Some(d0)) = (src, dst)
+                && is_special(d0, "SR")
+            {
                 let (mode, reg, ext) = crate::ea_encode::encode_ea(
                     s,
                     "w",
@@ -659,20 +676,28 @@ pub fn encode_instruction(
             // treated the -1/-2 CCR/SR marker as an ordinary absolute
             // destination address and emitted `39fc <imm> fffe`.
             // verified against reference encodings: 0x46FC/0x44FC + immediate.
-            if let (Some(Operand::Immediate(v)), Some(Operand::Immediate(-2))) = (src, dst) {
+            if let (Some(Operand::Immediate(v)), Some(d0)) = (src, dst)
+                && is_special(d0, "SR")
+            {
                 return Ok(vec![0x46FC, *v as u16]);
             }
-            if let (Some(Operand::Immediate(v)), Some(Operand::Immediate(-1))) = (src, dst) {
+            if let (Some(Operand::Immediate(v)), Some(d0)) = (src, dst)
+                && is_special(d0, "CCR")
+            {
                 return Ok(vec![0x44FC, *v as u16]);
             }
             // MOVE.L An, USP -> from USP (0x4E60 | An)
             // Assembler convention: MOVE An,USP = move from USP to An
-            if let (Some(Operand::AddrReg(rn)), Some(Operand::Immediate(0x800))) = (src, dst) {
+            if let (Some(Operand::AddrReg(rn)), Some(d0)) = (src, dst)
+                && is_special(d0, "USP")
+            {
                 return Ok(vec![0x4E60 | (*rn as u16)]);
             }
             // MOVE.L USP, An -> to USP (0x4E68 | An)
             // Assembler convention: MOVE USP,An = move An to USP
-            if let (Some(Operand::Immediate(0x800)), Some(Operand::AddrReg(rn))) = (src, dst) {
+            if let (Some(s0), Some(Operand::AddrReg(rn))) = (src, dst)
+                && is_special(s0, "USP")
+            {
                 return Ok(vec![0x4E68 | (*rn as u16)]);
             }
             match (src, dst) {
@@ -777,10 +802,10 @@ pub fn encode_instruction(
             match (src, dst) {
                 // -1 marks CCR and -2 marks SR (see parse_operand_text);
                 // matching any immediate meant both used the same opcode.
-                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-1))) => {
+                (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "CCR") => {
                     enc_andi_ccr_sr(*v as u16, false)
                 }
-                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-2))) => {
+                (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "SR") => {
                     enc_andi_ccr_sr(*v as u16, true)
                 }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_andi(*v, d, sz, pc + 4, cpu),
@@ -790,10 +815,10 @@ pub fn encode_instruction(
         "ORI" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
-                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-1))) => {
+                (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "CCR") => {
                     enc_ori_ccr_sr(*v as u16, false)
                 }
-                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-2))) => {
+                (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "SR") => {
                     enc_ori_ccr_sr(*v as u16, true)
                 }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_ori(*v, d, sz, pc + 4, cpu),
@@ -803,10 +828,10 @@ pub fn encode_instruction(
         "EORI" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
-                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-1))) => {
+                (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "CCR") => {
                     enc_eori_ccr_sr(*v as u16, false)
                 }
-                (Some(Operand::Immediate(v)), Some(Operand::Immediate(-2))) => {
+                (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "SR") => {
                     enc_eori_ccr_sr(*v as u16, true)
                 }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_eori(*v, d, sz, pc + 4, cpu),
@@ -1325,12 +1350,12 @@ mod tests {
     /// `MOVE.W CCR,(A0)` -> 42D0, `MOVE.W D0,CCR` -> 44C0.
     #[test]
     fn test_move_from_ccr() {
-        const CCR: Operand = Operand::Immediate(-1);
+        let ccr = Operand::Special("CCR".to_string());
 
         let words = encode_instruction(
             "MOVE",
             Some("w"),
-            Some(&CCR),
+            Some(&ccr),
             Some(&Operand::DataReg(0)),
             0,
             "68010",
@@ -1341,7 +1366,7 @@ mod tests {
         let words = encode_instruction(
             "MOVE",
             Some("w"),
-            Some(&CCR),
+            Some(&ccr),
             Some(&Operand::AddrRegIndirect(0)),
             0,
             "68010",
@@ -1355,7 +1380,7 @@ mod tests {
             "MOVE",
             Some("w"),
             Some(&Operand::DataReg(0)),
-            Some(&CCR),
+            Some(&ccr),
             0,
             "68010",
         )
@@ -1368,7 +1393,7 @@ mod tests {
             encode_instruction(
                 "MOVE",
                 Some("w"),
-                Some(&CCR),
+                Some(&ccr),
                 Some(&Operand::DataReg(0)),
                 0,
                 "68000"
@@ -1632,7 +1657,7 @@ mod tests {
     fn test_encode_move_an_to_usp() {
         // MOVE A0,USP → from USP (0x4E60 | 0 = 0x4E60)
         let src = Operand::AddrReg(0);
-        let dst = Operand::Immediate(0x800);
+        let dst = Operand::Special("USP".to_string());
         let words =
             encode_instruction("MOVE", Some("l"), Some(&src), Some(&dst), 0, "68000").unwrap();
         assert_eq!(words, vec![0x4E60]);
@@ -1641,7 +1666,7 @@ mod tests {
     #[test]
     fn test_encode_move_usp_to_an() {
         // MOVE USP,A0 → to USP (0x4E68 | 0 = 0x4E68)
-        let src = Operand::Immediate(0x800);
+        let src = Operand::Special("USP".to_string());
         let dst = Operand::AddrReg(0);
         let words =
             encode_instruction("MOVE", Some("l"), Some(&src), Some(&dst), 0, "68000").unwrap();

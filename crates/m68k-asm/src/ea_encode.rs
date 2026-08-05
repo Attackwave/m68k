@@ -206,10 +206,15 @@ fn encode_immediate(value: i64, size: &str) -> Result<Vec<u16>, AsmError> {
     };
     match sz {
         "b" => {
-            if value > 255 {
+            if !(-128..=255).contains(&value) {
                 return Err(AsmError::new("byte immediate out of range"));
             }
-            Ok(vec![to_word(value as i32)])
+            // A byte immediate occupies the *low* byte of its extension
+            // word; the high byte is zero. Passing the value straight
+            // through emitted `FFFF` for `#-1` where the reference has
+            // `00FF` — the same instruction on paper, but two bytes that
+            // differ from what every other assembler produces.
+            Ok(vec![(value & 0xFF) as u16])
         }
         "w" => {
             if value < 0 {
