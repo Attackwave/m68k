@@ -252,26 +252,41 @@ pub fn enc_rtd(displacement: u16) -> Result<Vec<u16>, AsmError> {
 ///
 /// MOVEC.L Dn, Cr (Dn → control register, opcode $4E7B, ext = cr|reg<<4)
 /// MOVEC.L Cr, Dn (control register → Dn, opcode $4E7A, ext = cr|reg<<4)
+/// Encode MOVEC.
+///
+/// Extension word layout: **bit 15 selects data (0) or address (1)
+/// register, bits 14-12 hold the register number, bits 11-0 the control
+/// register code**. The register number used to be shifted left by 4
+/// instead of 12, so it landed inside the control-register field:
+/// `movec d1,vbr` encoded as `4e7b 0811` where the hardware (and a real
+/// Kickstart ROM) has `4e7b 1801` — a different control register entirely,
+/// with no diagnostic. Address registers were rejected outright, though
+/// `movec a0,vbr` and `movec a7,usp` are both valid and appear in real
+/// code.
 pub fn enc_movec(src: &Operand, dst: &Operand) -> Result<Vec<u16>, AsmError> {
-    // MOVEC Dn, Cr: 0x4E7B, ext = cr_number | (data_reg << 4)
-    if let Operand::DataReg(rn) = src
-        && let Operand::Immediate(cr) = dst
-    {
-        let op = 0x4E7B;
-        let ext = ((*cr as u16) & 0xFFF) | ((*rn as u16) << 4);
-        return Ok(vec![op, ext]);
+    fn reg_field(op: &Operand) -> Option<u16> {
+        match op {
+            Operand::DataReg(n) => Some((*n as u16) << 12),
+            Operand::AddrReg(n) => Some(0x8000 | ((*n as u16) << 12)),
+            _ => None,
+        }
     }
 
-    // MOVEC Cr, Dn: 0x4E7A, ext = cr_number | (data_reg << 4)
-    if let Operand::DataReg(dst_reg) = dst
-        && let Operand::Immediate(cr) = src
+    // MOVEC Rn,Cr — general register to control register.
+    if let Operand::Immediate(cr) = dst
+        && let Some(reg) = reg_field(src)
     {
-        let op = 0x4E7A;
-        let ext = ((*cr as u16) & 0xFFF) | ((*dst_reg as u16) << 4);
-        return Ok(vec![op, ext]);
+        return Ok(vec![0x4E7B, ((*cr as u16) & 0xFFF) | reg]);
     }
 
-    Err(AsmError::new("MOVEC requires Dn,CR or CR,Dn operands"))
+    // MOVEC Cr,Rn — control register to general register.
+    if let Operand::Immediate(cr) = src
+        && let Some(reg) = reg_field(dst)
+    {
+        return Ok(vec![0x4E7A, ((*cr as u16) & 0xFFF) | reg]);
+    }
+
+    Err(AsmError::new("MOVEC requires Rn,CR or CR,Rn operands"))
 }
 
 /// Encode BKPT instruction.
@@ -1349,6 +1364,33 @@ mod tests {
         // 0x0300 — it locked in the encoder's own bug, since bits 15-8 are
         // reserved. Reference: `callm #3,(a0)` = `06d0 0003`.
         assert_eq!(words, vec![0x06D0, 0x0003]);
+    }
+
+    #[test]
+    fn test_movec_extension_word_layout() {
+        // bit 15 = A/D, bits 14-12 = register, bits 11-0 = control code.
+        // The register used to be shifted by 4, landing inside the control
+        // field: `movec d1,vbr` produced 4e7b0811 where a real Kickstart
+        // ROM (and the reference) has 4e7b1801 — a different control
+        // register, with no diagnostic.
+        let vbr = Operand::Immediate(0x801);
+        assert_eq!(
+            enc_movec(&Operand::DataReg(1), &vbr).unwrap(),
+            vec![0x4E7B, 0x1801]
+        );
+        assert_eq!(
+            enc_movec(&vbr, &Operand::DataReg(1)).unwrap(),
+            vec![0x4E7A, 0x1801]
+        );
+        // Address registers set bit 15; these were rejected outright.
+        assert_eq!(
+            enc_movec(&Operand::AddrReg(0), &vbr).unwrap(),
+            vec![0x4E7B, 0x8801]
+        );
+        assert_eq!(
+            enc_movec(&Operand::Immediate(0x800), &Operand::AddrReg(7)).unwrap(),
+            vec![0x4E7A, 0xF800]
+        );
     }
 
     #[test]

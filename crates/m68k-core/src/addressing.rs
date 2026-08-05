@@ -165,11 +165,15 @@ impl OperandTrait for EAOperand {
                 format_disp(*disp as i32, Some(reg), Some((idx_reg, idx_size, scale)))
             }
             EAOperand::AbsoluteShort(addr) => {
+                // The `.w` suffix is what makes this round-trip: without it
+                // the output is indistinguishable from an absolute-long
+                // operand, and reassembling turns a 4-byte instruction into
+                // a 6-byte one. Both the assembler here and the reference
+                // accept the suffix on a bare address and on a label alike.
                 let se = sign_extend_16(*addr) as u32;
-                if let Some(label) = labels.get(&se) {
-                    label.clone()
-                } else {
-                    format!("${:08x}", se)
+                match labels.get(&se) {
+                    Some(label) => format!("{}.w", label),
+                    None => format!("${:08x}.w", se),
                 }
             }
             EAOperand::AbsoluteLong(addr) => {

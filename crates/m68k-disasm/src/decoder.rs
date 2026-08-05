@@ -852,7 +852,10 @@ fn parse_operands(
             let dst = EAOperand::DataReg(dst_reg);
             operands.push(DecodedOperand::from_ea(src));
             operands.push(DecodedOperand::from_ea(dst));
-            Ok((name, operands, target_addr))
+            // The size has to reach the output: a bare `cmp` reassembles at
+            // the default word size, so `cmp.l (a0),d0` (b090) came back as
+            // `cmp.w` (b050) — a real instruction, silently the wrong one.
+            Ok((format!("{}.{}", name, size), operands, target_addr))
         }
         ParserType::Muls => {
             let src_mode = ((op >> 3) & 0x7) as u8;

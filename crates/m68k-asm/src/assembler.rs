@@ -501,9 +501,28 @@ fn parse_operand_text(
         ));
     }
 
-    // Absolute address with .W/.L suffix
-    if text.ends_with(".W") || text.ends_with(".L") {
-        let force_long = text.ends_with(".L");
+    // Absolute address with .W/.L suffix.
+    //
+    // Case-insensitively: this used to test only for the upper-case forms,
+    // so `lea $400.w,a6` silently produced the long encoding while
+    // `lea $400.W,a6` produced the short one. Lower-case suffixes are the
+    // common spelling in real sources, and the mismatch showed up as a
+    // large share of the ROM roundtrip failures.
+    let suffix_upper = {
+        let bytes = text.as_bytes();
+        if bytes.len() >= 2 {
+            let n = bytes.len();
+            if bytes[n - 2] == b'.' {
+                Some(bytes[n - 1].to_ascii_uppercase())
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    };
+    if matches!(suffix_upper, Some(b'W') | Some(b'L')) {
+        let force_long = suffix_upper == Some(b'L');
         let base = text[..text.len() - 2].trim();
         if let Ok(value) = evaluate_expr_str(base, symbols, current_pc)
             && !text.contains('(')
@@ -6864,6 +6883,23 @@ mymexc MACRO
             let mut asm = Assembler::new(0);
             let src = format!("\t{}\n\tNOP\n", d);
             assert!(asm.assemble(&src).is_ok(), "{} must be accepted", d);
+        }
+    }
+
+    #[test]
+    fn test_absolute_short_suffix_is_case_insensitive() {
+        // `.w` forces the absolute-short encoding. The check tested only
+        // for the upper-case spelling, so `lea $400.w,a6` silently emitted
+        // the 6-byte long form while `.W` emitted the 4-byte short one.
+        for src in ["\tLEA\t$400.w,A6\n", "\tLEA\t$400.W,A6\n"] {
+            let mut asm = Assembler::new(0);
+            asm.assemble(src).unwrap();
+            assert_eq!(asm.code[0].words, vec![0x4DF8, 0x0400], "for {:?}", src);
+        }
+        for src in ["\tLEA\t$400.l,A6\n", "\tLEA\t$400.L,A6\n"] {
+            let mut asm = Assembler::new(0);
+            asm.assemble(src).unwrap();
+            assert_eq!(asm.code[0].words, vec![0x4DF9, 0x0000, 0x0400]);
         }
     }
 
