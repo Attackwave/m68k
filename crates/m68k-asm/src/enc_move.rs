@@ -91,6 +91,75 @@ pub fn enc_moveq(data: i8, dst_reg: u8) -> Result<Vec<u16>, AsmError> {
     Ok(vec![op])
 }
 
+/// Encode MOVEQ from a full-width immediate, rejecting values the 8-bit
+/// field cannot hold.
+///
+/// The caller used to cast with `as i8`, which wraps silently: `MOVEQ
+/// #256,D0` assembled as `MOVEQ #0` and `MOVEQ #-129,D0` as `MOVEQ #127`
+/// — the loaded value simply became a different one, with no diagnostic.
+/// The reference rejects both.
+pub fn enc_moveq_checked(data: i64, dst_reg: u8) -> Result<Vec<u16>, AsmError> {
+    // Accepted either as a signed byte (`#-1`) or as the 32-bit pattern it
+    // loads (`#$FFFFFFFF`) — the reference takes both, and the
+    // disassembler prints the latter, so rejecting it would break the
+    // roundtrip. What must still fail is a value that simply does not fit,
+    // such as `#256` or `#-129`.
+    let fits_signed_byte = (-128..=127).contains(&data);
+    // An unsigned byte (`#$FF`) or the sign-extended 32-bit pattern it
+    // loads (`#$FFFFFFFF`) are both spellings of the same encoding.
+    let fits_unsigned_byte = (128..=255).contains(&data);
+    let fits_as_u32_pattern = (0..=0xFFFF_FFFF).contains(&data) && {
+        let sign_extended = (data as u32) as i32;
+        (-128..=127).contains(&sign_extended)
+    };
+    if !fits_signed_byte && !fits_unsigned_byte && !fits_as_u32_pattern {
+        return Err(AsmError::new(format!(
+            "MOVEQ operand {} is outside the range -128..127 \
+             (use MOVE.L for a full 32-bit immediate)",
+            data
+        )));
+    }
+    enc_moveq(data as u32 as i32 as i8, dst_reg)
+}
+
+#[cfg(test)]
+mod moveq_range_tests {
+    use super::*;
+
+    #[test]
+    fn moveq_rejects_values_that_do_not_fit() {
+        // These used to wrap silently via `as i8`: #256 loaded 0 and #-129
+        // loaded 127. The value the program got was simply a different one,
+        // with no diagnostic. The reference rejects both.
+        assert!(enc_moveq_checked(256, 0).is_err());
+        assert!(enc_moveq_checked(-129, 0).is_err());
+        assert!(enc_moveq_checked(0x100, 0).is_err());
+    }
+
+    #[test]
+    fn moveq_accepts_every_spelling_of_a_byte() {
+        // Signed, unsigned, and the sign-extended 32-bit pattern are all
+        // the same encoding, and the reference takes all three. The
+        // disassembler prints the last form, so rejecting it would break
+        // the roundtrip.
+        for (input, want) in [
+            (-1i64, 0x70FFu16),
+            (0xFFFF_FFFF, 0x70FF),
+            (0xFF, 0x70FF),
+            (127, 0x707F),
+            (-128, 0x7080),
+            (0, 0x7000),
+        ] {
+            assert_eq!(
+                enc_moveq_checked(input, 0).unwrap(),
+                vec![want],
+                "for operand {}",
+                input
+            );
+        }
+    }
+}
+
 /// Encode MOVEM instruction (register to memory).
 pub fn enc_movem_rm(
     reg_mask: u16,

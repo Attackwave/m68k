@@ -688,7 +688,7 @@ pub fn encode_instruction(
             }
         }
         "MOVEQ" => match (src, dst) {
-            (Some(Operand::Immediate(v)), Some(Operand::DataReg(rn))) => enc_moveq(*v as i8, *rn),
+            (Some(Operand::Immediate(v)), Some(Operand::DataReg(rn))) => enc_moveq_checked(*v, *rn),
             _ => Err(AsmError::new("MOVEQ requires immediate and Dn")),
         },
         "MOVEM" => {
