@@ -60,6 +60,15 @@ pub fn enc_bcc_sized(
     // 68020+ 32-bit form, so a genuine short displacement of exactly those
     // values must be promoted to the word form instead of colliding with
     // those markers. Byte range is -128..=127; the low bound is included.
+    //
+    // A branch to the immediately following instruction (disp==0) therefore
+    // assembles to the 4-byte word form, which jumps to `pc_after_opword+0`
+    // — the next instruction — and is correct. `vasm` instead warns
+    // ("short-branch to following instruction turned into a nop") and emits
+    // a 2-byte `lea (a6),a6`. Both behave identically at run time; ours is
+    // two bytes larger and keeps the instruction the source asked for
+    // rather than substituting a different one. Deliberate divergence,
+    // settled 2026-08-06 (plan.md P3).
     if allow_short && (-128..=127).contains(&disp) && disp != 0 && disp != -1 {
         let op = 0x6000 | ((cc as u16) << 8) | ((disp as u8) as u16);
         Ok(vec![op])
@@ -97,6 +106,12 @@ pub fn enc_bsr(target: i32, pc: u32) -> Result<Vec<u16>, AsmError> {
     let disp = target.wrapping_sub(pc as i32);
 
     // See enc_bcc above: disp==0/-1 collide with the word/long form markers.
+    //
+    // `BSR` to the following instruction is accepted here and assembles to
+    // the word form. `vasm` rejects it outright (error 2029), but unlike a
+    // zero-distance `BRA` it is not a no-op: it pushes the return address,
+    // which is a real and occasionally intentional effect. Being permissive
+    // is correct. Deliberate divergence, settled 2026-08-06 (plan.md P3).
     if (-128..=127).contains(&disp) && disp != 0 && disp != -1 {
         let op = 0x6100 | ((disp as u8) as u16);
         Ok(vec![op])
@@ -1089,6 +1104,33 @@ fn get_abs_addr(op: &Operand) -> Result<u32, AsmError> {
 mod tests {
     use super::*;
 
+    /// A branch to the immediately following instruction cannot use the
+    /// byte form, whose zero displacement is the word-form marker. It
+    /// becomes the word form, which jumps to `pc_after_opword+0` — the
+    /// next instruction — and is correct.
+    ///
+    /// `vasm` substitutes a 2-byte `lea (a6),a6` and warns instead. Both
+    /// behave identically; this pins our choice down so it cannot drift
+    /// back silently. Settled 2026-08-06 (plan.md P3).
+    #[test]
+    fn test_zero_distance_branch_uses_word_form_not_a_nop() {
+        // Target == pc_after_opword, i.e. the next instruction.
+        let words = enc_bcc("t", 0x1002, 0x1002, "68000").unwrap();
+        assert_eq!(words, vec![0x6000, 0x0000]);
+
+        // Same for a conditional branch.
+        let words = enc_bcc("eq", 0x1002, 0x1002, "68000").unwrap();
+        assert_eq!(words, vec![0x6700, 0x0000]);
+    }
+
+    /// `BSR` to the following instruction is accepted, unlike in `vasm`
+    /// (error 2029). It is not a no-op: it pushes the return address.
+    #[test]
+    fn test_zero_distance_bsr_is_accepted() {
+        let words = enc_bsr(0x1002, 0x1002).unwrap();
+        assert_eq!(words, vec![0x6100, 0x0000]);
+    }
+
     #[test]
     fn test_bra_byte() {
         // BRA.S label with disp=-2 (0xFE = -2)
@@ -1426,6 +1468,11 @@ mod tests {
         assert_eq!(words, vec![0x06D0, 0x0003]);
     }
 
+    /// Also settles plan.md P3, which recorded us as accepting
+    /// `ORI.B #x,An` where the reference rejects it. That divergence is
+    /// gone: re-verified against `vasmm68k_mot` on 2026-08-06 for
+    /// ORI/ANDI/EORI/ADDI/SUBI/CMPI in all three sizes — both reject
+    /// every combination.
     #[test]
     fn immediate_family_rejects_address_registers() {
         // `ADDI.W #1,A0` is not an instruction — `ADDA.W #1,A0` is. These

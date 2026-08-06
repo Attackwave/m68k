@@ -181,8 +181,18 @@ Ebenso: **keine** Direktive, die in `is_directive_name` als bekannt gilt, aber i
 
 ## P3 — Offene Fragen, bewusst nicht entschieden
 
-- **`ORI.B #x,An`**: Wir akzeptieren es, die Referenz lehnt es als ungültiges Ziel ab. Permissiver zu sein ist kein Korrektheitsproblem, sollte aber bewusst entschieden und dokumentiert sein.
-- **`fileloader.asm`** (Korpus 2) assembliert bei uns, die Referenz bricht mit „branch destination out of range" ab. Unser Verhalten (Word-Form statt Fehler bei disp=0) ist funktional korrekt und nachsichtiger — als Feature dokumentieren.
+- ~~**`ORI.B #x,An`**~~ ✅ **gegenstandslos (2026-08-06)**: Die Divergenz existiert nicht mehr. Sie verschwand mit der Adressregister-Byte-Regel in `ea_encode.rs` (PR #28) — ein Adressregister hat auf keinem 68k einen Byte-Zugriff, und die Immediate-Familie nutzt ohnehin `DATA_ALT`, das AREG in jeder Größe ausschließt. Gegen `vasmm68k_mot` neu geprüft für ORI/ANDI/EORI/ADDI/SUBI/CMPI × `.b`/`.w`/`.l`: **beide lehnen alle 18 Kombinationen ab**. Abgesichert durch `immediate_family_rejects_address_registers` (`enc_flow.rs`).
+
+- ~~**Nulldistanz-Branch**~~ ✅ **entschieden: bewusste Abweichung (2026-08-06)**. Der ursprüngliche `fileloader.asm`-Befund ließ sich nicht reproduzieren — die Datei nutzt AmigaOS-Symbole (`MODE_OLDFILE`, `_LVOOpen`) ohne Includes und scheitert bei *beiden* Assemblern, bei der Referenz schon an `moveq #ERROR_HANDLE_FILE_OPEN,d0`. Der Sachverhalt dahinter ist aber real und direkt messbar:
+
+  | | Referenz | wir |
+  |---|---|---|
+  | `bra.s` auf Folgeinstruktion | Warnung, ersetzt durch `lea (a6),a6` (2 B) | `6000 0000` Word-Form (4 B) |
+  | `beq.s`/`bne.s` dito | Warnung, dieselbe Ersetzung | Word-Form |
+  | `bsr.s` dito | **error 2029, abgelehnt** | Word-Form, akzeptiert |
+  | `dbra` dito | identisch | identisch |
+
+  Die Byte-Form scheidet zwingend aus: disp==0 ist das Word-Form-Markerbyte. Unsere Word-Form springt auf `pc_after_opword+0` = die Folgeinstruktion und ist damit korrekt — verifiziert per Roundtrip. **Entscheidung: so lassen.** Wir geben die Instruktion aus, die die Quelle verlangt, statt sie durch eine andere zu ersetzen; das kostet zwei Bytes. Bei `BSR` ist unser Verhalten sogar sachlich besser: der Sprung ist *kein* No-Op, er legt die Rücksprungadresse ab, und das kann beabsichtigt sein. Dokumentiert an `enc_bcc`/`enc_bsr`, abgesichert durch `test_zero_distance_branch_uses_word_form_not_a_nop` und `test_zero_distance_bsr_is_accepted`.
 - ~~**Schreibunterstützung für AmigaDOS**~~ ✅ **erledigt (2026-08-05)**: neues Modul `amigados_write.rs` mit vollem Funktionsumfang — Blockallokator über echte Bitmap-Blöcke, `write_file`/`delete_file`, `create_dir`/`delete_dir`, `rename` (auch verschiebend), `set_comment`/`set_protection`/`set_volume_name`. OFS und FFS, Extension-Blöcke für Dateien über 72 Datenblöcke.
 
   **Nebenbefund:** `format_empty_*_disk` erzeugte Disks *ohne* Bitmap-Blöcke (nur `bm_flag=-1`). AmigaOS mountet die, kann aber nichts darauf anlegen — es gibt nichts zu allozieren. Behoben.
