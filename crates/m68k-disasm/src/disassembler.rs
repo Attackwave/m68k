@@ -84,8 +84,12 @@ pub fn parse_pc_trace(text: &str) -> Result<Vec<u32>, (usize, String)> {
 /// table by [`Disassembler::seed_entry_points_from_pointer_tables`].
 ///
 /// Isolated longwords that happen to look like in-image addresses are
-/// common in both code and data; four in a row are not.
-const MIN_POINTER_TABLE: usize = 4;
+/// common in both code and data; three in a row are not.
+///
+/// Three rather than four because a 3-way `switch` is an entirely
+/// ordinary thing to write, and `tests/programs/jump_table.s` is exactly
+/// that. Requiring four silently missed it.
+const MIN_POINTER_TABLE: usize = 3;
 
 /// Shortest run of printable bytes taken as a deliberate string.
 ///
@@ -435,34 +439,48 @@ impl Disassembler {
         let end = self.origin.saturating_add(self.data.len() as u32);
         let is_in_image = |v: u32| v >= self.origin && v < end && v.is_multiple_of(2);
 
-        // Longword offsets whose value points back into the image.
-        let mut pointer_at: Vec<bool> = vec![false; self.data.len() / 4];
+        // Whether a longword read at each *word* offset points into the
+        // image.
+        //
+        // Scanning on a longword grid instead would only ever see tables
+        // whose distance from `origin` is a multiple of four, and nothing
+        // makes that true: a table follows whatever code precedes it.
+        // `tests/programs/jump_table.s` puts one at origin+$1a, which the
+        // longword grid missed entirely — the threshold was not the only
+        // reason that file's table went unrecognized.
+        let word_slots = self.data.len().saturating_sub(3).div_ceil(2);
+        let mut pointer_at: Vec<bool> = vec![false; word_slots];
         for (i, slot) in pointer_at.iter_mut().enumerate() {
-            let raw = &self.data[i * 4..i * 4 + 4];
+            let raw = &self.data[i * 2..i * 2 + 4];
             *slot = is_in_image(u32::from_be_bytes(raw.try_into().unwrap()));
         }
 
         // Collect every run of at least MIN_POINTER_TABLE consecutive
-        // pointer slots, and take each run's values as entry points.
+        // pointers and take their values as entry points. Consecutive
+        // means two word slots apart, since one pointer spans two of them;
+        // a run is therefore walked in steps of 2.
         let mut found: Vec<u32> = Vec::new();
-        let mut i = 0usize;
-        while i < pointer_at.len() {
-            if !pointer_at[i] {
-                i += 1;
+        for start in 0..pointer_at.len() {
+            // Only start a run where one cannot already be in progress,
+            // so each table is reported once from its true first entry.
+            if !pointer_at[start] || (start >= 2 && pointer_at[start - 2]) {
                 continue;
             }
-            let start = i;
-            while i < pointer_at.len() && pointer_at[i] {
-                i += 1;
+            let mut end = start;
+            while end + 2 < pointer_at.len() && pointer_at[end + 2] {
+                end += 2;
             }
-            if i - start >= MIN_POINTER_TABLE {
-                for j in start..i {
-                    let raw = &self.data[j * 4..j * 4 + 4];
+            let count = (end - start) / 2 + 1;
+            if count >= MIN_POINTER_TABLE {
+                for j in (start..=end).step_by(2) {
+                    let raw = &self.data[j * 2..j * 2 + 4];
                     found.push(u32::from_be_bytes(raw.try_into().unwrap()));
                 }
             }
         }
 
+        found.sort_unstable();
+        found.dedup();
         self.entry_points.extend(found);
     }
 
@@ -688,8 +706,16 @@ impl Disassembler {
             if run > 0 {
                 // Never run past code the trace proved is real.
                 let span = self.clamp_to_traced(addr, run);
-                stream.seek(offset + span);
-                return Ok(Err(DataKind::Text));
+                // Clamping can cut the run below the length that justified
+                // calling it a string in the first place, which is how the
+                // `rts` tail of a routine became `dc.b "Nu"` — two
+                // printable bytes ending exactly where traced code
+                // resumes. Re-check, and let the truncated remainder
+                // decode as the code it is.
+                if span >= MIN_STRING_RUN {
+                    stream.seek(offset + span);
+                    return Ok(Err(DataKind::Text));
+                }
             }
         }
 
