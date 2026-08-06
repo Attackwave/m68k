@@ -144,53 +144,95 @@ fn every_corpus_program_is_byte_complete() {
     }
 }
 
-/// Finding 1 (`tests/programs/README.md`): a three-entry jump table — an
-/// entirely ordinary `switch` size — is not recognized, because
-/// `MIN_POINTER_TABLE` requires four consecutive pointers. Its longwords
-/// render as `ori.b` instead.
+/// Finding 1, now fixed: a three-entry jump table is recognized, and its
+/// targets get labels.
 ///
-/// This test states what happens *today*, deliberately: it is the
-/// reproduction case for the finding. When the threshold is revisited,
-/// this test should be inverted to assert `dc.l` and a resolved label,
-/// which is exactly the signal that the finding was addressed.
+/// Two separate causes, both real. `MIN_POINTER_TABLE` demanded four
+/// consecutive pointers, and a 3-way `switch` is ordinary. Worse, the
+/// scan walked a *longword* grid, so it could only ever see tables whose
+/// distance from the origin is a multiple of four — this table sits at
+/// origin+$1a and was invisible regardless of the threshold.
 #[test]
-fn jump_table_of_three_entries_is_not_yet_recognized() {
-    let lines = run(
-        include_str!("../../../tests/programs/jump_table.s"),
-        true, // even with --scan-tables
-    );
+fn three_entry_jump_table_is_recognized_and_labelled() {
+    let lines = run(include_str!("../../../tests/programs/jump_table.s"), true);
 
-    // The table starts at $101a; case0 is at $100e.
+    // The table is at $101a; the three cases are at $100e/$1012/$1016.
+    for (i, addr) in [0x101au32, 0x101e, 0x1022].iter().enumerate() {
+        let text = text_at(&lines, *addr);
+        assert!(
+            text.starts_with("dc.l"),
+            "table entry {} at {:08x} decoded as code: {:?}",
+            i,
+            addr,
+            text
+        );
+        assert!(
+            text.contains("label"),
+            "table entry {} at {:08x} should name its target: {:?}",
+            i,
+            addr,
+            text
+        );
+    }
+
+    // Each dispatch target carries a label definition, so the listing
+    // reassembles to the same table rather than to raw addresses.
+    for addr in [0x100eu32, 0x1012, 0x1016] {
+        assert!(
+            line_at(&lines, addr).is_some_and(|l| l.label.is_some()),
+            "dispatch target {:08x} has no label",
+            addr
+        );
+    }
+}
+
+/// Finding 2, half fixed: a string run clamped against traced code must
+/// still be long enough to *be* a string.
+///
+/// `clamp_to_traced` cuts a run where proven code resumes, which could
+/// leave two bytes — and those were emitted as `dc.b "Nu"`, swallowing
+/// the `rts` tail of a routine. The minimum length is now re-checked
+/// after clamping, so the remainder decodes as the code it is.
+#[test]
+fn clamped_string_run_below_minimum_is_not_text() {
+    // With `negate` given as an entry point, the trace claims $101c, so
+    // the run starting at $101a is clamped to two bytes.
+    let mut asm = Assembler::new(ORIGIN);
+    asm.set_cpu("68000");
+    let bytes = asm
+        .assemble_bytes(include_str!("../../../tests/programs/pc_relative_data.s"))
+        .expect("corpus program failed to assemble");
+    let mut disasm = Disassembler::new(bytes, ORIGIN);
+    disasm.set_cpu("68000");
+    disasm.add_entry_points([ORIGIN, 0x101c]);
+    let lines = disasm.disassemble();
+
     assert_eq!(
         text_at(&lines, 0x101a),
-        "ori.b   #$0e, d0",
-        "if this now says `dc.l`, the 3-entry threshold was fixed — \
-         invert this test (see tests/programs/README.md finding 1)"
+        "rts",
+        "a two-byte clamped run was emitted as text"
     );
 }
 
-/// Finding 2: text detection can swallow real code. In
-/// `pc_relative_data.s` the bytes `4e75 4440 4e75` are `rts; neg.w d0;
-/// rts` — all printable ("NuD@Nu") — and the `dc.w 1,2,3,4` after them
-/// supplies the NUL terminator the heuristic requires.
+/// The other half of finding 2 is *not* fixed, and cannot be by this
+/// mechanism: with only the program's own entry point, nothing proves
+/// `negate` is code, and `4e75 4440 4e75` ("NuD@Nu") is a genuine
+/// NUL-terminated printable run over the length threshold.
 ///
-/// The cause is reachability: `negate` is reached only through the pointer
-/// table, so the walk never claims those bytes, and unclaimed bytes are
-/// what the text test may judge. Like the test above, this records
-/// today's behaviour as the reproduction case.
+/// Recorded rather than left implicit: this is the residual false
+/// positive of text detection, and the honest fix is better reachability
+/// (an entry point, a trace), not a stricter string test — which would
+/// start losing real strings instead.
 #[test]
-fn text_detection_can_swallow_unreached_code() {
+fn unreachable_printable_code_is_still_misread_as_text() {
     let lines = run(
         include_str!("../../../tests/programs/pc_relative_data.s"),
         false,
     );
 
-    // $101a is `rts`, the tail of `double`, which is real code.
-    let at = text_at(&lines, 0x101a);
     assert!(
-        at.contains("NuD@Nu"),
-        "if this is now `rts`, the swallowing was fixed — invert this \
-         test (see tests/programs/README.md finding 2); got {:?}",
-        at
+        text_at(&lines, 0x101a).contains("NuD@Nu"),
+        "if this is now code, reachability improved — update \
+         tests/programs/README.md finding 2"
     );
 }

@@ -25,28 +25,42 @@ visible in ROM measurements: on a ROM nobody knows which answer is right.
 
 ## Findings
 
-Run against `m68k-disasm` at the time of writing (`--entry $1000`):
+**1. A 3-way jump table was not recognized — fixed.** Two independent
+causes, and the second was the worse one:
 
-**1. A 3-way jump table is not recognized.** `MIN_POINTER_TABLE` requires
-four consecutive in-image pointers; `jump_table.s` has three, which is an
-entirely ordinary `switch` size. Its table renders as `ori.b #$0e,d0`.
-Lowering the threshold to 3 takes the Kickstart 1.3 count from 10 tables /
-87 targets to 24 / 129 — whether those extra ones are real cannot be
-decided on a ROM, but can be decided here.
+- `MIN_POINTER_TABLE` demanded four consecutive in-image pointers. Three
+  is an entirely ordinary `switch` size. Now 3.
+- The scan walked a **longword grid**, so it could only ever see tables
+  whose distance from the origin is a multiple of four. Nothing makes that
+  true — a table follows whatever code precedes it. `jump_table.s` puts
+  one at origin+`$1a`, which was invisible at *any* threshold. The scan
+  now walks a word grid.
 
-**2. Text detection can swallow real code.** In `pc_relative_data.s` the
-bytes `4e75 4440 4e75` are `rts; neg.w d0; rts` — all printable
-(`"NuD@Nu"`) — and the `dc.w 1,2,3,4` that follows supplies the NUL
-terminator the heuristic requires. Two real instructions are lost.
+Both were needed: fixing only the threshold would have left this file
+still broken, which is exactly the kind of half-fix a ROM measurement
+would have hidden.
 
-The cause is reachability, not the heuristic itself: `negate` is reached
-only through the pointer table, so the walk never claims it, and unclaimed
-bytes are what the text test is allowed to judge. Recognizing the table
-would fix this too.
+**2. Text detection could swallow real code — half fixed.** In
+`pc_relative_data.s` the bytes `4e75 4440 4e75` are `rts; neg.w d0; rts`
+— all printable (`"NuD@Nu"`) — and the `dc.w` after them supplies the NUL
+terminator the heuristic requires.
+
+Fixed part: `clamp_to_traced` cuts a run where proven code resumes, which
+could leave two bytes, and those were emitted as `dc.b "Nu"`. The minimum
+length is now re-checked *after* clamping.
+
+Not fixed, and not fixable this way: with only the program's own entry
+point, nothing proves `negate` is code, and the run is a genuine
+NUL-terminated printable sequence over the threshold. The honest remedy is
+better reachability — an entry point, a PC trace — not a stricter string
+test, which would start losing real strings instead.
 
 **3. Pure code stays pure.** `nested_loops.s` yields zero `dc.*` lines.
 Worth pinning down: the heuristics must not invent data in ordinary code,
 and that direction of error is easy to introduce while fixing the others.
+
+Kickstart 1.3 roundtrip is unchanged by both fixes (OK 80.7%, MISMATCH
+424), while `--scan-tables` now recovers 348 more lines of code there.
 
 ## Adding a program
 
