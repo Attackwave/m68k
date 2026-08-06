@@ -6,6 +6,7 @@ use std::process;
 use clap::Parser;
 use m68k_core::amiga_hunk::{SectionKind, read_hunk_executable};
 use m68k_disasm::disassembler::{Disassembler, parse_pc_trace};
+use m68k_disasm::tracer::{Tracer, format_pc_trace};
 
 /// Layout facts recovered from an Amiga Hunk executable's own metadata,
 /// handed to the disassembler so it need not infer them from the bytes.
@@ -61,6 +62,19 @@ struct Args {
     /// format used by Oxore/m68k-disasm.
     #[arg(short = 't', long = "pc-trace", value_name = "FILE")]
     pc_trace: Option<PathBuf>,
+
+    /// Abstractly execute the program from its entry points to discover
+    /// code, resolving computed jumps (`jsr (a5)`) that a static walk
+    /// cannot follow. Intended for linked executables, which are
+    /// self-contained; a ROM's computed jumps read OS tables that only
+    /// exist at run time, so this finds little there.
+    #[arg(long = "auto-trace")]
+    auto_trace: bool,
+
+    /// With --auto-trace, write the discovered PC trace to this file (in
+    /// the `--pc-trace` format) instead of only using it internally.
+    #[arg(long = "write-trace", value_name = "FILE")]
+    write_trace: Option<PathBuf>,
 }
 
 fn parse_address(s: &str) -> Result<u32, String> {
@@ -151,6 +165,57 @@ fn run(args: Args) -> Result<(), String> {
     };
 
     let image_len = image.len();
+    let extra_entries = args
+        .entries
+        .iter()
+        .map(|e| parse_address(e))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Every entry point known before disassembly starts, so --auto-trace
+    // can execute from all of them rather than only the explicit ones.
+    let all_entries: Vec<u32> = hunk_info
+        .as_ref()
+        .and_then(|i| i.entry)
+        .into_iter()
+        .chain(extra_entries.iter().copied())
+        .collect();
+
+    // Trace before the image is handed to the disassembler, which takes
+    // ownership of it.
+    let auto_trace_pcs = if args.auto_trace {
+        if all_entries.is_empty() {
+            return Err(
+                "--auto-trace needs an entry point: pass --entry, or use a hunk executable \
+                 (which supplies its own)"
+                    .to_string(),
+            );
+        }
+        let mut tracer = Tracer::new(&image, base_addr);
+        tracer.set_cpu(&args.cpu);
+        let result = tracer.trace(all_entries.iter().copied());
+        if result.hit_step_limit {
+            eprintln!("warning: --auto-trace stopped at its step limit; the trace is partial");
+        }
+        if !result.unresolved_indirect.is_empty() {
+            eprintln!(
+                "note: {} computed jump(s) could not be resolved ({} were); \
+                 code reached only through those is missing from the trace",
+                result.unresolved_indirect.len(),
+                result.resolved_indirect.len()
+            );
+        }
+        if let Some(path) = &args.write_trace {
+            fs::write(path, format_pc_trace(&result.pcs))
+                .map_err(|e| format!("cannot write '{}': {}", path.display(), e))?;
+        }
+        Some(result.pcs)
+    } else {
+        if args.write_trace.is_some() {
+            return Err("--write-trace requires --auto-trace".to_string());
+        }
+        None
+    };
+
     let mut disasm = Disassembler::new(image, base_addr);
     disasm.add_known_labels(known_labels);
     if let Some(info) = hunk_info {
@@ -158,12 +223,10 @@ fn run(args: Args) -> Result<(), String> {
         disasm.add_data_ranges(info.data_ranges);
         disasm.add_entry_points(info.entry);
     }
-    let extra_entries = args
-        .entries
-        .iter()
-        .map(|e| parse_address(e))
-        .collect::<Result<Vec<_>, _>>()?;
     disasm.add_entry_points(extra_entries);
+    if let Some(pcs) = auto_trace_pcs {
+        disasm.add_pc_trace(pcs);
+    }
     if args.scan_tables {
         disasm.seed_entry_points_from_pointer_tables();
     }
