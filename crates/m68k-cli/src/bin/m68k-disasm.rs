@@ -5,6 +5,7 @@ use std::process;
 
 use clap::Parser;
 use m68k_core::amiga_hunk::{SectionKind, read_hunk_executable};
+use m68k_core::amiga_lvo::Library;
 use m68k_disasm::disassembler::{Disassembler, parse_pc_trace};
 
 /// Layout facts recovered from an Amiga Hunk executable's own metadata,
@@ -61,6 +62,14 @@ struct Args {
     /// format used by Oxore/m68k-disasm.
     #[arg(short = 't', long = "pc-trace", value_name = "FILE")]
     pc_trace: Option<PathBuf>,
+
+    /// Annotate `jsr -$xx(a6)` calls with AmigaOS routine names from this
+    /// library (exec, dos, graphics, intuition). The library must be named
+    /// because the offset alone is ambiguous — `-$1e` is exec/Supervisor
+    /// but dos/Input — and which base a program keeps in a6 usually cannot
+    /// be decided from the instruction.
+    #[arg(long = "lvo", value_name = "LIBRARY")]
+    lvo: Option<String>,
 }
 
 fn parse_address(s: &str) -> Result<u32, String> {
@@ -191,6 +200,16 @@ fn run(args: Args) -> Result<(), String> {
             ));
         }
     }
+    if let Some(name) = &args.lvo {
+        let library = Library::parse(name).ok_or_else(|| {
+            format!(
+                "unknown library '{}' (known: {})",
+                name,
+                Library::names().join(", ")
+            )
+        })?;
+        disasm.set_lvo_library(library);
+    }
     disasm.set_cpu(&args.cpu);
 
     for line in disasm.disassemble() {
@@ -215,7 +234,12 @@ fn run(args: Args) -> Result<(), String> {
         } else {
             print!("{:08x}:  ", line.address);
         }
-        println!("{}", line.text);
+        match &line.comment {
+            // Rendered as a trailing comment so the instruction text stays
+            // exactly what the assembler accepts.
+            Some(note) => println!("{:<40} ; {}", line.text, note),
+            None => println!("{}", line.text),
+        }
     }
 
     Ok(())

@@ -2,7 +2,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use m68k_core::addressing::InstructionStream;
+use m68k_core::addressing::{EAOperand, InstructionStream};
+use m68k_core::amiga_lvo::{self, Library};
 
 use crate::decoder::{DecodeResult, decode_next};
 
@@ -185,6 +186,13 @@ pub struct DisassembledLine {
     /// True if decoding failed at this address; `text` then holds an
     /// error description instead of formatted instruction/data output.
     pub is_error: bool,
+    /// Explanatory note for this line, e.g. the AmigaOS routine a
+    /// `jsr -$xx(a6)` calls.
+    ///
+    /// Kept out of `text` rather than appended to it, so the instruction
+    /// text stays exactly what the assembler would accept; callers render
+    /// this as a trailing comment.
+    pub comment: Option<String>,
 }
 
 /// Orchestrates the two-pass disassembly of an m68k binary: pass 1 scans
@@ -204,6 +212,9 @@ pub struct Disassembler {
     /// Addresses a caller knows execution can begin at (a hunk's entry
     /// point, a ROM's reset vector, an explicit `--entry` flag).
     entry_points: Vec<u32>,
+    /// Library whose vector offsets name `jsr -$xx(a6)` calls, when the
+    /// caller knows which base the program keeps in `a6`.
+    lvo_library: Option<Library>,
     /// Program counter values observed during a real execution, supplied
     /// by [`Disassembler::add_pc_trace`]. Each is an instruction start
     /// that actually ran, so unlike anything derived from the bytes it
@@ -227,6 +238,7 @@ impl Disassembler {
             known_labels: HashMap::new(),
             data_ranges: Vec::new(),
             entry_points: Vec::new(),
+            lvo_library: None,
             pc_trace: HashSet::new(),
             traced: HashSet::new(),
         }
@@ -285,6 +297,90 @@ impl Disassembler {
     /// computed jumps, any handler entered from outside the image.
     pub fn add_entry_points<I: IntoIterator<Item = u32>>(&mut self, entries: I) {
         self.entry_points.extend(entries);
+    }
+
+    /// Name `jsr -$xx(a6)` calls using `library`'s vector offsets.
+    ///
+    /// AmigaOS calls dominate the computed jumps in real executables —
+    /// across four hunk binaries `jsr -$xx(a6)` outnumbers `jsr (an)` by
+    /// roughly ten to one. Their targets are inside the library, outside
+    /// the image, so nothing recovers *code* for them; naming them
+    /// recovers the meaning, which is what a reader is after.
+    ///
+    /// The library must be named because the offset alone is ambiguous:
+    /// `-$1e` is `Supervisor` in exec and `Open` in dos. Which base a
+    /// program keeps in `a6` generally cannot be decided from the
+    /// instruction, so guessing would put confident wrong names in the
+    /// listing.
+    pub fn set_lvo_library(&mut self, library: Library) {
+        self.lvo_library = Some(library);
+    }
+
+    /// The routine an instruction calls, if it is a library call and the
+    /// library in `a6` is known at that point.
+    ///
+    /// Matches `jsr`/`jmp` with a negative displacement off `a6` — the
+    /// AmigaOS calling convention. A positive displacement is an ordinary
+    /// structure access, not a vector, and is left alone.
+    ///
+    /// `current` is the library most recently loaded into `a6`, which
+    /// [`Disassembler::pass2_format`] tracks as it walks. Without that,
+    /// a single library setting mislabels calls: in a real executable
+    /// `movea.l $4.w,a6; jsr -$126(a6)` is `exec/FindTask`, while a
+    /// `jsr -$1e(a6)` further down against a DOS base is `dos/Open`.
+    /// Naming both from one setting would put confident wrong names in
+    /// the listing, which is worse than none.
+    fn lvo_comment(
+        &self,
+        inst: &crate::decoder::DecodedInstruction,
+        current: Option<Library>,
+    ) -> Option<String> {
+        let library = current.or(self.lvo_library)?;
+        let stem = mnemonic_stem(&inst.mnemonic);
+        if stem != "jsr" && stem != "jmp" {
+            return None;
+        }
+        let EAOperand::AddrDisp(6, disp) = inst.operands.first()?.ea.as_ref()? else {
+            return None;
+        };
+        if *disp >= 0 {
+            return None;
+        }
+        let offset = u16::try_from(disp.unsigned_abs()).ok()?;
+        amiga_lvo::lookup(library, offset).map(|name| name.to_string())
+    }
+
+    /// Which library an instruction loads into `a6`, when that is
+    /// decidable from the instruction alone.
+    ///
+    /// Only `movea.l $4.w,a6` is: absolute address 4 is `ExecBase`, by
+    /// definition and without exception. Every other source — a variable,
+    /// a saved copy — holds whatever the program put there at run time,
+    /// so it clears the tracked library rather than guessing. That is why
+    /// a `--lvo` setting still exists: it supplies the answer for the
+    /// stretches this cannot determine.
+    fn library_loaded_into_a6(
+        inst: &crate::decoder::DecodedInstruction,
+    ) -> Option<Option<Library>> {
+        let stem = mnemonic_stem(&inst.mnemonic);
+        if stem != "movea" && stem != "move" {
+            return None;
+        }
+        // Destination must be a6.
+        if !matches!(
+            inst.operands.get(1).and_then(|o| o.ea.as_ref()),
+            Some(EAOperand::AddrReg(6))
+        ) {
+            return None;
+        }
+        Some(match inst.operands.first().and_then(|o| o.ea.as_ref()) {
+            // `$4.w` — ExecBase.
+            Some(EAOperand::AbsoluteShort(4)) | Some(EAOperand::AbsoluteLong(4)) => {
+                Some(Library::Exec)
+            }
+            // Anything else: a6 now holds something this cannot name.
+            _ => None,
+        })
     }
 
     /// Supply program counter values recorded during a real execution of
@@ -735,6 +831,10 @@ impl Disassembler {
     fn pass2_format(&self) -> Vec<DisassembledLine> {
         let mut lines = Vec::new();
         let mut stream = InstructionStream::new(&self.data, self.origin);
+        // The library currently in a6, where the code said so outright.
+        // Reset at each label, since a jump into that address arrives with
+        // whatever the caller had, not with what the preceding line left.
+        let mut current_library: Option<Library> = None;
 
         while stream.remaining() >= 2 {
             let inst_pc = stream.current_pc();
@@ -751,16 +851,25 @@ impl Disassembler {
                         raw_bytes: raw,
                         label: self.labels.get(&inst_pc).cloned(),
                         is_error: false,
+                        comment: None,
                     });
                 }
                 Ok(Ok(DecodeResult::Instruction(inst))) => {
                     let text = inst.format(&self.labels);
+                    if self.labels.contains_key(&inst_pc) {
+                        current_library = None;
+                    }
+                    let comment = self.lvo_comment(&inst, current_library);
+                    if let Some(loaded) = Self::library_loaded_into_a6(&inst) {
+                        current_library = loaded;
+                    }
                     lines.push(DisassembledLine {
                         address: inst_pc,
                         raw_bytes: inst.raw_bytes.clone(),
                         text,
                         label: self.labels.get(&inst_pc).cloned(),
                         is_error: false,
+                        comment,
                     });
                 }
                 Ok(Ok(DecodeResult::DataWord(dw))) => {
@@ -771,6 +880,7 @@ impl Disassembler {
                         text,
                         label: self.labels.get(&inst_pc).cloned(),
                         is_error: false,
+                        comment: None,
                     });
                 }
                 Err(e) => {
@@ -780,6 +890,7 @@ impl Disassembler {
                         text: format!("error at {:08x}: {}", inst_pc, e),
                         label: self.labels.get(&inst_pc).cloned(),
                         is_error: true,
+                        comment: None,
                     });
                     stream.seek(stream.offset + 2);
                 }
@@ -800,6 +911,7 @@ impl Disassembler {
                 raw_bytes: raw,
                 label: self.labels.get(&addr).cloned(),
                 is_error: false,
+                comment: None,
             });
         }
 
@@ -1429,6 +1541,85 @@ mod tests {
 
         assert_eq!(disasm.labels().get(&0x1004), Some(&"label0".to_string()));
         assert_eq!(lines[1].label, Some("label0".to_string()));
+    }
+
+    /// `movea.l $4.w,a6` is ExecBase by definition, so the calls that
+    /// follow can be named without the caller saying anything.
+    #[test]
+    fn exec_base_load_names_the_calls_that_follow() {
+        // movea.l $4.w,a6 ; jsr -$126(a6) ; rts
+        let bytes = vec![
+            0x2C, 0x78, 0x00, 0x04, // movea.l $0004.w,a6
+            0x4E, 0xAE, 0xFE, 0xDA, // jsr -$126(a6)
+            0x4E, 0x75, // rts
+        ];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        let lines = disasm.disassemble();
+
+        let call = lines.iter().find(|l| l.address == 0x1004).unwrap();
+        assert_eq!(call.comment.as_deref(), Some("FindTask"));
+    }
+
+    /// The regression this design exists for: with a6 holding something
+    /// the code did not name, a call must stay unannotated rather than be
+    /// labelled from a blanket setting. Applying `--lvo dos` to
+    /// `jsr -$126(a6)` after an ExecBase load called it `FGetC`; it is
+    /// `FindTask`.
+    #[test]
+    fn a_known_base_beats_the_configured_library() {
+        let bytes = vec![
+            0x2C, 0x78, 0x00, 0x04, // movea.l $0004.w,a6  -> ExecBase
+            0x4E, 0xAE, 0xFE, 0xDA, // jsr -$126(a6)
+            0x4E, 0x75, // rts
+        ];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        disasm.set_lvo_library(Library::Dos); // deliberately wrong for this call
+        let lines = disasm.disassemble();
+
+        let call = lines.iter().find(|l| l.address == 0x1004).unwrap();
+        assert_eq!(
+            call.comment.as_deref(),
+            Some("FindTask"),
+            "the tracked ExecBase must win over the configured library"
+        );
+    }
+
+    /// Loading a6 from anywhere else clears the tracked library: the value
+    /// is whatever the program put there at run time.
+    #[test]
+    fn unknown_base_load_clears_the_tracked_library() {
+        let bytes = vec![
+            0x2C, 0x78, 0x00, 0x04, // movea.l $0004.w,a6  -> ExecBase
+            0x2C, 0x79, 0x00, 0x00, 0x20, 0x00, // movea.l $2000,a6 -> unknown
+            0x4E, 0xAE, 0xFE, 0xDA, // jsr -$126(a6)
+            0x4E, 0x75, // rts
+        ];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        let lines = disasm.disassemble();
+
+        let call = lines.iter().find(|l| l.address == 0x100a).unwrap();
+        assert_eq!(
+            call.comment, None,
+            "a6 no longer holds a base this can name"
+        );
+    }
+
+    /// A positive displacement off a6 is an ordinary structure access, not
+    /// a library vector.
+    #[test]
+    fn positive_displacement_is_not_a_library_call() {
+        let bytes = vec![
+            0x2C, 0x78, 0x00, 0x04, // movea.l $0004.w,a6
+            0x4E, 0xAE, 0x00, 0x22, // jsr $22(a6)
+            0x4E, 0x75,
+        ];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        let lines = disasm.disassemble();
+
+        assert_eq!(
+            lines.iter().find(|l| l.address == 0x1004).unwrap().comment,
+            None
+        );
     }
 
     #[test]
