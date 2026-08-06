@@ -69,6 +69,16 @@ pub struct Section {
     pub data: Vec<u8>,
     /// `(name, address)` pairs from this hunk's `HUNK_SYMBOL` block.
     pub symbols: Vec<(String, u32)>,
+    /// Absolute addresses (already offset by this hunk's load address) of
+    /// every 32-bit longword patched by a `HUNK_RELOC32`/`HUNK_RELOC32SHORT`
+    /// entry targeting any hunk.
+    ///
+    /// Each entry marks four bytes that hold a relocated pointer, which is
+    /// data by definition — the linker said so. A disassembler can use this
+    /// to avoid decoding pointer tables as instructions, and to treat the
+    /// pointed-to addresses as code entry points when the target is a
+    /// `Code` hunk. Sorted ascending and deduplicated.
+    pub relocs: Vec<u32>,
 }
 
 /// A parsed and relocated Amiga executable.
@@ -89,6 +99,20 @@ impl HunkExecutable {
             .iter()
             .flat_map(|s| s.symbols.iter().cloned())
             .collect()
+    }
+
+    /// Absolute addresses of every relocated 32-bit pointer across all
+    /// hunks, ascending. Each marks four bytes of pointer data rather than
+    /// code — see [`Section::relocs`].
+    pub fn all_relocs(&self) -> Vec<u32> {
+        let mut all: Vec<u32> = self
+            .sections
+            .iter()
+            .flat_map(|s| s.relocs.clone())
+            .collect();
+        all.sort_unstable();
+        all.dedup();
+        all
     }
 }
 
@@ -167,9 +191,14 @@ impl<'a> Reader<'a> {
 /// given offset within hunk `i`'s content (both `HUNK_RELOC32` and
 /// `HUNK_RELOC32SHORT` boil down to this once their counts/offsets are
 /// read, just with different on-disk integer widths).
+///
+/// Each patched location is also recorded in `reloc_sites[i]` as an
+/// absolute address, so callers can tell which longwords hold pointers
+/// rather than code.
 fn apply_relocations(
     contents: &mut [Vec<u8>],
     offsets: &[u32],
+    reloc_sites: &mut [Vec<u32>],
     i: usize,
     target_hunk: usize,
     reloc_offsets: &[u32],
@@ -188,6 +217,9 @@ fn apply_relocations(
         let addend = u32::from_be_bytes(contents[i][offset..offset + 4].try_into().unwrap());
         let resolved = addend.wrapping_add(offsets[target_hunk]);
         contents[i][offset..offset + 4].copy_from_slice(&resolved.to_be_bytes());
+        // `offset` is bounded by the hunk's own length, which the layout
+        // loop already proved fits above `offsets[i]` without overflowing.
+        reloc_sites[i].push(offsets[i].wrapping_add(offset as u32));
     }
     Ok(())
 }
@@ -276,6 +308,7 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
     let mut kinds: Vec<Option<SectionKind>> = vec![None; hunk_count];
     let mut names: Vec<Option<String>> = vec![None; hunk_count];
     let mut symbols: Vec<Vec<(String, u32)>> = vec![Vec::new(); hunk_count];
+    let mut reloc_sites: Vec<Vec<u32>> = vec![Vec::new(); hunk_count];
 
     let mut i = 0usize;
     let mut pending_name: Option<String> = None;
@@ -322,7 +355,14 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
                 }
                 let target_hunk = r.u32()? as usize;
                 let offsets_list = (0..count).map(|_| r.u32()).collect::<Result<Vec<_>, _>>()?;
-                apply_relocations(&mut contents, &offsets, i, target_hunk, &offsets_list)?;
+                apply_relocations(
+                    &mut contents,
+                    &offsets,
+                    &mut reloc_sites,
+                    i,
+                    target_hunk,
+                    &offsets_list,
+                )?;
             },
             HUNK_RELOC32SHORT | HUNK_RELOC32SHORT_V39 => {
                 let mut total = 0usize;
@@ -343,7 +383,14 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
                     let offsets_list = (0..count)
                         .map(|_| r.u16().map(|v| v as u32))
                         .collect::<Result<Vec<_>, _>>()?;
-                    apply_relocations(&mut contents, &offsets, i, target_hunk, &offsets_list)?;
+                    apply_relocations(
+                        &mut contents,
+                        &offsets,
+                        &mut reloc_sites,
+                        i,
+                        target_hunk,
+                        &offsets_list,
+                    )?;
                 }
             }
             HUNK_SYMBOL => {
@@ -394,6 +441,16 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
             address: offsets[idx],
             data: std::mem::take(&mut contents[idx]),
             symbols: std::mem::take(&mut symbols[idx]),
+            relocs: {
+                // A malformed file may list the same offset twice, and
+                // separate HUNK_RELOC32 blocks (one per target hunk) each
+                // contribute to the same hunk in file order, not address
+                // order — so sort and dedup rather than trusting the file.
+                let mut sites = std::mem::take(&mut reloc_sites[idx]);
+                sites.sort_unstable();
+                sites.dedup();
+                sites
+            },
         })
         .collect::<Vec<_>>();
 
@@ -604,6 +661,38 @@ mod tests {
         // patches the address field (offset 2) to point at the data hunk.
         let patched = u32::from_be_bytes(code.data[2..6].try_into().unwrap());
         assert_eq!(patched, data.address);
+    }
+
+    /// The reloc offsets were previously consumed by `apply_relocations`
+    /// and dropped, so nothing downstream could tell which longwords hold
+    /// relocated pointers rather than code. They are now retained as
+    /// absolute addresses.
+    #[test]
+    fn reloc_sites_are_retained_as_absolute_addresses() {
+        let exe = read_hunk_executable(TWO_HUNK_EXE_WITH_RELOC, 0x4000).unwrap();
+
+        // The single relocation patches offset 2 of the code hunk, which
+        // loads at 0x4000 — so the pointer longword sits at 0x4002.
+        assert_eq!(exe.sections[0].relocs, vec![0x4002]);
+        // The data hunk holds the pointed-to value, not a pointer itself.
+        assert!(exe.sections[1].relocs.is_empty());
+        assert_eq!(exe.all_relocs(), vec![0x4002]);
+    }
+
+    /// Reloc addresses must follow the load base, like symbols do.
+    #[test]
+    fn reloc_sites_move_with_load_base() {
+        let exe = read_hunk_executable(TWO_HUNK_EXE_WITH_RELOC, 0x10000).unwrap();
+        assert_eq!(exe.all_relocs(), vec![0x10002]);
+    }
+
+    /// An executable with no relocation hunks at all must report none,
+    /// rather than e.g. inheriting a stale list from another hunk.
+    #[test]
+    fn executable_without_relocs_reports_none() {
+        let exe = read_hunk_executable(SINGLE_HUNK_EXE, 0x1000).unwrap();
+        assert!(exe.all_relocs().is_empty());
+        assert!(exe.sections[0].relocs.is_empty());
     }
 
     #[test]
