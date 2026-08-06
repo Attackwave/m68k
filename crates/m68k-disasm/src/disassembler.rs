@@ -44,6 +44,38 @@ enum DataKind {
     Word,
 }
 
+/// Parse a PC trace table: one program counter value per line.
+///
+/// The format is the one `Oxore/m68k-disasm` uses, so trace files can be
+/// shared between the two tools: decimal by default, one value per line.
+/// `0x`/`$` prefixed hexadecimal is also accepted, since that is what
+/// most emulator logging patches emit without extra formatting work.
+/// Blank lines, `#` and `;` comments, and surrounding whitespace are
+/// ignored.
+///
+/// Returns the line number (1-based) and text of the first line that is
+/// neither blank, a comment, nor a number — a malformed trace should be
+/// reported rather than silently disassembled with most of it missing.
+pub fn parse_pc_trace(text: &str) -> Result<Vec<u32>, (usize, String)> {
+    let mut pcs = Vec::new();
+    for (i, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let parsed = if let Some(hex) = line.strip_prefix("0x").or_else(|| line.strip_prefix('$')) {
+            u32::from_str_radix(hex, 16)
+        } else {
+            line.parse::<u32>()
+        };
+        match parsed {
+            Ok(pc) => pcs.push(pc),
+            Err(_) => return Err((i + 1, line.to_string())),
+        }
+    }
+    Ok(pcs)
+}
+
 /// Shortest run of consecutive in-image longword pointers taken as a jump
 /// table by [`Disassembler::seed_entry_points_from_pointer_tables`].
 ///
@@ -169,10 +201,16 @@ pub struct Disassembler {
     /// Addresses a caller knows execution can begin at (a hunk's entry
     /// point, a ROM's reset vector, an explicit `--entry` flag).
     entry_points: Vec<u32>,
-    /// Instruction starts proven reachable by following control flow from
-    /// `entry_points`; filled by [`Disassembler::trace_reachable_code`] at
-    /// the start of [`Disassembler::disassemble`]. Empty when no entry
-    /// points were supplied, which reduces both passes to a linear scan.
+    /// Program counter values observed during a real execution, supplied
+    /// by [`Disassembler::add_pc_trace`]. Each is an instruction start
+    /// that actually ran, so unlike anything derived from the bytes it
+    /// cannot be a false positive.
+    pc_trace: HashSet<u32>,
+    /// Instruction starts proven reachable: the union of `pc_trace` and
+    /// what [`Disassembler::trace_reachable_code`] reaches from
+    /// `entry_points`, filled at the start of
+    /// [`Disassembler::disassemble`]. Empty when the caller supplied
+    /// neither, which reduces both passes to a linear scan.
     traced: HashSet<u32>,
 }
 
@@ -186,6 +224,7 @@ impl Disassembler {
             known_labels: HashMap::new(),
             data_ranges: Vec::new(),
             entry_points: Vec::new(),
+            pc_trace: HashSet::new(),
             traced: HashSet::new(),
         }
     }
@@ -243,6 +282,37 @@ impl Disassembler {
     /// computed jumps, any handler entered from outside the image.
     pub fn add_entry_points<I: IntoIterator<Item = u32>>(&mut self, entries: I) {
         self.entry_points.extend(entries);
+    }
+
+    /// Supply program counter values recorded during a real execution of
+    /// this image, e.g. from an emulator.
+    ///
+    /// This is the strongest evidence available about what is code, and
+    /// the only kind that does not degrade on the constructs static
+    /// analysis cannot see: a PC that was observed executing settles
+    /// `jmp (a6)` and jump-table targets without having to reason about
+    /// them at all. Every value is taken as an instruction start, and
+    /// each is also used as a trace entry point, so straight-line code
+    /// between two recorded PCs is recovered without needing a sample for
+    /// every instruction.
+    ///
+    /// Values outside the image and odd values are ignored: the 68000
+    /// fetches instructions word-aligned, so an odd PC cannot be an
+    /// instruction start and indicates a trace taken from a different
+    /// image or a mis-parsed file.
+    pub fn add_pc_trace<I: IntoIterator<Item = u32>>(&mut self, pcs: I) {
+        let end = self.origin.saturating_add(self.data.len() as u32);
+        self.pc_trace.extend(
+            pcs.into_iter()
+                .filter(|pc| pc.is_multiple_of(2) && *pc >= self.origin && *pc < end),
+        );
+    }
+
+    /// How many PC trace values were kept — i.e. fell inside the image and
+    /// were word-aligned. Lets a caller tell "no trace given" from "a
+    /// trace that does not match this image".
+    pub fn pc_trace_len(&self) -> usize {
+        self.pc_trace.len()
     }
 
     /// Seed entry points from longword-aligned pointer tables found in the
@@ -342,6 +412,10 @@ impl Disassembler {
     /// the CLI's prior inline behavior.
     pub fn disassemble(&mut self) -> Vec<DisassembledLine> {
         self.traced = self.trace_reachable_code();
+        // Recorded PCs are instruction starts by observation, so they hold
+        // even where the walk above declined to follow (an undecodable
+        // word, a target it could not resolve).
+        self.traced.extend(self.pc_trace.iter().copied());
         self.pass1_discover_labels();
         self.pass2_format()
     }
@@ -361,7 +435,16 @@ impl Disassembler {
     /// is why callers must name those as entry points themselves.
     fn trace_reachable_code(&self) -> HashSet<u32> {
         let mut reached: HashSet<u32> = HashSet::new();
-        let mut queue: Vec<u32> = self.entry_points.clone();
+        // Every recorded PC is also a place to walk from: a trace samples
+        // where execution was, not every instruction it passed through, so
+        // walking each one recovers the straight-line code between samples
+        // and the branches leading out of it.
+        let mut queue: Vec<u32> = self
+            .entry_points
+            .iter()
+            .chain(self.pc_trace.iter())
+            .copied()
+            .collect();
 
         while let Some(start) = queue.pop() {
             let Some(offset) = self.offset_of(start) else {
@@ -474,6 +557,26 @@ impl Disassembler {
         // is only the narrower question of whether *these* bytes look
         // deliberately like data; everything else falls through to a
         // linear decode, exactly as before tracing existed.
+        // A longword pointing at a proven instruction start, sitting where
+        // no proven instruction is, is a jump-table entry — the table the
+        // `jmp (a1)` read its target from. This is what makes a PC trace
+        // pay off twice: the recorded PCs say what is code, and thereby
+        // also identify the tables dispatching to it, which a linear
+        // decode renders as invented arithmetic. Unlike
+        // `seed_entry_points_from_pointer_tables` this needs no run of
+        // several entries, because the evidence per entry is far stronger:
+        // the target is known-executed code, not merely a plausible
+        // address.
+        if !self.traced.is_empty()
+            && !self.traced.contains(&addr)
+            && stream.remaining() >= 4
+            && let Ok(raw) = <[u8; 4]>::try_from(&self.data[stream.offset..stream.offset + 4])
+            && self.traced.contains(&u32::from_be_bytes(raw))
+        {
+            stream.seek(stream.offset + 4);
+            return Ok(Err(DataKind::Pointer));
+        }
+
         // Only meaningful once a trace has run: without entry points every
         // address is "unreached", and short printable runs are common in
         // ordinary code — `nop; rts` is `4E 71 4E 75`, four printable
@@ -1178,6 +1281,85 @@ mod tests {
         disasm.seed_entry_points_from_pointer_tables();
 
         assert!(disasm.entry_points.is_empty());
+    }
+
+    #[test]
+    fn test_parse_pc_trace_accepts_decimal_hex_and_comments() {
+        let text = "512\n518\n\n# a comment\n0x1000\n$2000\n; another\n  520  \n";
+        assert_eq!(
+            parse_pc_trace(text).unwrap(),
+            vec![512, 518, 0x1000, 0x2000, 520]
+        );
+    }
+
+    /// A malformed trace must be reported, not silently half-ignored:
+    /// disassembling with most of the trace missing looks like the option
+    /// having no effect.
+    #[test]
+    fn test_parse_pc_trace_reports_bad_line() {
+        let (line, text) = parse_pc_trace("512\nnot-a-number\n520\n").unwrap_err();
+        assert_eq!(line, 2);
+        assert_eq!(text, "not-a-number");
+    }
+
+    /// Recorded PCs are instruction starts by observation. This is the
+    /// case static analysis cannot reach: a routine entered only through a
+    /// computed jump.
+    #[test]
+    fn test_pc_trace_recovers_code_no_static_analysis_can_reach() {
+        // entry: jmp (a0) — target unknowable statically; then a routine
+        // at 0x1004 that nothing branches to, then a string.
+        let mut bytes = vec![
+            0x4E, 0xD0, // jmp (a0)
+            0x4E, 0x71, // nop (unreachable statically)
+            0x4E, 0x71, // 0x1004: nop
+            0x4E, 0x75, // rts
+        ];
+        bytes.extend_from_slice(b"Hi!!\x00\x00");
+
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        disasm.add_entry_points([0x1000]);
+        disasm.add_pc_trace([0x1004]);
+        let lines = disasm.disassemble();
+
+        // The traced PC is decoded as code...
+        let at = |a: u32| {
+            lines
+                .iter()
+                .find(|l| l.address == a)
+                .map(|l| l.text.trim().to_string())
+        };
+        assert_eq!(at(0x1004).as_deref(), Some("nop"));
+        // ...and the walk continues from it to the following rts.
+        assert_eq!(at(0x1006).as_deref(), Some("rts"));
+        // The string is still recognized as data.
+        assert!(at(0x1008).is_some_and(|t| t.contains("Hi!!")));
+    }
+
+    /// PCs outside the image or at odd addresses cannot be instruction
+    /// starts on m68k and are dropped rather than trusted.
+    #[test]
+    fn test_pc_trace_rejects_odd_and_out_of_range_values() {
+        let bytes = vec![0x4E, 0x71, 0x4E, 0x75];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        disasm.add_pc_trace([0x1001, 0x9999, 0x1002]);
+
+        assert_eq!(disasm.pc_trace_len(), 1);
+    }
+
+    /// A trace alone, with no entry points, must be enough to switch on
+    /// tracing — otherwise `-t` without `--entry` would silently do
+    /// nothing.
+    #[test]
+    fn test_pc_trace_alone_enables_tracing() {
+        let mut bytes = vec![0x4E, 0x75];
+        bytes.extend_from_slice(b"Test\x00\x00");
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        disasm.add_pc_trace([0x1000]);
+        let lines = disasm.disassemble();
+
+        assert_eq!(lines[0].text.trim(), "rts");
+        assert!(lines[1].text.contains("Test"));
     }
 
     #[test]

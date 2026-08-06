@@ -5,7 +5,7 @@ use std::process;
 
 use clap::Parser;
 use m68k_core::amiga_hunk::{SectionKind, read_hunk_executable};
-use m68k_disasm::disassembler::Disassembler;
+use m68k_disasm::disassembler::{Disassembler, parse_pc_trace};
 
 /// Layout facts recovered from an Amiga Hunk executable's own metadata,
 /// handed to the disassembler so it need not infer them from the bytes.
@@ -53,6 +53,14 @@ struct Args {
     /// plausible-looking longwords need not be a real table.
     #[arg(long = "scan-tables")]
     scan_tables: bool,
+
+    /// PC trace table: a file of program counter values recorded while the
+    /// image actually ran (one per line, decimal or $hex). The strongest
+    /// evidence of what is code — it settles computed jumps and jump
+    /// tables that no static analysis can follow. Compatible with the
+    /// format used by Oxore/m68k-disasm.
+    #[arg(short = 't', long = "pc-trace", value_name = "FILE")]
+    pc_trace: Option<PathBuf>,
 }
 
 fn parse_address(s: &str) -> Result<u32, String> {
@@ -142,6 +150,7 @@ fn run(args: Args) -> Result<(), String> {
         (data, start_addr, Vec::new())
     };
 
+    let image_len = image.len();
     let mut disasm = Disassembler::new(image, base_addr);
     disasm.add_known_labels(known_labels);
     if let Some(info) = hunk_info {
@@ -157,6 +166,30 @@ fn run(args: Args) -> Result<(), String> {
     disasm.add_entry_points(extra_entries);
     if args.scan_tables {
         disasm.seed_entry_points_from_pointer_tables();
+    }
+    if let Some(path) = &args.pc_trace {
+        let text = fs::read_to_string(path)
+            .map_err(|e| format!("cannot read '{}': {}", path.display(), e))?;
+        let pcs = parse_pc_trace(&text).map_err(|(line, text)| {
+            format!("{}:{}: not a PC value: {}", path.display(), line, text)
+        })?;
+        let before = pcs.len();
+        disasm.add_pc_trace(pcs);
+        // A trace recorded against a different image (or a different load
+        // address) silently contributes nothing, which would look like the
+        // option being ignored; say so rather than leaving the user to
+        // wonder why the output did not change.
+        let kept = disasm.pc_trace_len();
+        if kept == 0 && before > 0 {
+            return Err(format!(
+                "none of the {} PC values in '{}' fall inside the image \
+                 (${:08x}..${:08x}) — wrong trace, or wrong --address?",
+                before,
+                path.display(),
+                base_addr,
+                base_addr.saturating_add(image_len as u32)
+            ));
+        }
     }
     disasm.set_cpu(&args.cpu);
 
