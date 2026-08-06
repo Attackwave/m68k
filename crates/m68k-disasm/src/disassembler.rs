@@ -42,6 +42,9 @@ enum DataKind {
     Text,
     /// Anything else the caller declared as data — rendered as `dc.w`.
     Word,
+    /// A single leftover byte at the end of an odd-length image, which
+    /// cannot be part of an opword — rendered as `dc.b`.
+    Byte,
 }
 
 /// Parse a PC trace table: one program counter value per line.
@@ -645,6 +648,12 @@ impl Disassembler {
                 Err(_) => break,
             }
         }
+        // Pass 2 emits a trailing odd byte as its own line, so it is a line
+        // start here too — otherwise a branch to it would be rejected as
+        // landing mid-instruction and lose its label.
+        if scan_stream.remaining() == 1 {
+            line_starts.insert(scan_stream.current_pc());
+        }
 
         // Branch/jump targets outside the decoded range, or that land
         // mid-instruction rather than on one of pass 2's actual line
@@ -715,6 +724,7 @@ impl Disassembler {
                 }
                 format!("dc.b     {}", parts.join(","))
             }
+            DataKind::Byte => format!("dc.b     ${:02x}", raw.first().copied().unwrap_or(0)),
             _ => {
                 let value = u16::from_be_bytes([raw[0], *raw.get(1).unwrap_or(&0)]);
                 format!("dc.w     ${:04x}", value)
@@ -774,6 +784,23 @@ impl Disassembler {
                     stream.seek(stream.offset + 2);
                 }
             }
+        }
+
+        // An odd-length image leaves one byte the loop above cannot take:
+        // it needs a full word to attempt a decode. Emitting it as `dc.b`
+        // keeps the listing byte-complete, which is what makes the output
+        // reassemble to the original — previously the last byte of any
+        // odd-sized input was silently dropped.
+        if stream.remaining() == 1 {
+            let addr = stream.current_pc();
+            let raw = vec![self.data[stream.offset]];
+            lines.push(DisassembledLine {
+                address: addr,
+                text: self.format_data(&raw, DataKind::Byte),
+                raw_bytes: raw,
+                label: self.labels.get(&addr).cloned(),
+                is_error: false,
+            });
         }
 
         lines
@@ -1360,6 +1387,48 @@ mod tests {
 
         assert_eq!(lines[0].text.trim(), "rts");
         assert!(lines[1].text.contains("Test"));
+    }
+
+    /// Regression: both passes need a full word to attempt a decode, so
+    /// the last byte of an odd-length image was silently dropped and the
+    /// listing could not reassemble to the original.
+    #[test]
+    fn test_odd_length_image_emits_trailing_byte() {
+        let bytes = vec![0x4E, 0x71, 0x4E, 0x75, 0xFF];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        let lines = disasm.disassemble();
+
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[2].address, 0x1004);
+        assert_eq!(lines[2].raw_bytes, vec![0xFF]);
+        assert_eq!(lines[2].text.trim(), "dc.b     $ff");
+        // Byte-complete: the raw bytes across all lines are the input.
+        let total: usize = lines.iter().map(|l| l.raw_bytes.len()).sum();
+        assert_eq!(total, 5);
+    }
+
+    /// A one-byte image produced no output at all.
+    #[test]
+    fn test_single_byte_image_is_not_dropped() {
+        let bytes = vec![0xFF];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        let lines = disasm.disassemble();
+
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].text.trim(), "dc.b     $ff");
+    }
+
+    /// The trailing byte is a line start, so a branch to it keeps its
+    /// label rather than being rejected as landing mid-instruction.
+    #[test]
+    fn test_branch_to_trailing_byte_gets_a_label() {
+        // bra.w -> 0x1004, which is the trailing odd byte.
+        let bytes = vec![0x60, 0x00, 0x00, 0x02, 0xFF];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        let lines = disasm.disassemble();
+
+        assert_eq!(disasm.labels().get(&0x1004), Some(&"label0".to_string()));
+        assert_eq!(lines[1].label, Some("label0".to_string()));
     }
 
     #[test]
