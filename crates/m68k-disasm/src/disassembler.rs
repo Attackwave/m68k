@@ -592,7 +592,12 @@ impl Disassembler {
                 let mut parts: Vec<String> = Vec::new();
                 let mut quoted = String::new();
                 for &b in raw {
-                    if is_string_byte(b) && b != b'"' {
+                    // Only *printable* bytes go inside the quotes. Tab,
+                    // newline and carriage return count as string content
+                    // for run detection, but emitting them literally would
+                    // break the line in two and produce output that cannot
+                    // be reassembled.
+                    if (0x20..=0x7E).contains(&b) && b != b'"' {
                         quoted.push(b as char);
                     } else {
                         if !quoted.is_empty() {
