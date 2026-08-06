@@ -282,14 +282,25 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
     }
     // Likewise, each hunk's own size (in longwords, so already x4 above)
     // is attacker-controlled — the loop below allocates one Vec<u8> per
-    // hunk of exactly that size, so bound the *sum* against the file
-    // size before doing so (a single oversized hunk, or many moderate
-    // ones summing past the file, would otherwise still allocate up to
-    // 4 GB per hunk).
+    // hunk of exactly that size, so the sum needs bounding before doing
+    // so (a single oversized hunk, or many moderate ones summing past the
+    // file, would otherwise still allocate up to 4 GB per hunk).
+    //
+    // The bound cannot be the file size itself: a BSS hunk declares its
+    // size in the header and contributes *no* bytes to the file, which is
+    // its whole purpose. Real executables are routinely larger in memory
+    // than on disk — vbcc's test binary declares 4340 bytes across three
+    // hunks in a 3804-byte file — and rejecting those was wrong. Allow a
+    // generous multiple of the file size instead, which still refuses the
+    // crafted headers this check exists for.
+    const MAX_MEMORY_TO_FILE_RATIO: u64 = 64;
     let total_hunk_bytes: u64 = hunk_sizes.iter().map(|&s| s as u64).sum();
-    if total_hunk_bytes > data.len() as u64 {
+    let budget = (data.len() as u64)
+        .saturating_mul(MAX_MEMORY_TO_FILE_RATIO)
+        .max(1 << 20);
+    if total_hunk_bytes > budget {
         return Err(HunkError::new(format!(
-            "total hunk size {} exceeds file size {}",
+            "total hunk size {} implausible for a {}-byte file",
             total_hunk_bytes,
             data.len()
         )));
@@ -542,6 +553,39 @@ mod tests {
 
         let err = read_hunk_executable(&buf, 0x1000).unwrap_err();
         assert!(err.0.contains("hunk size"), "unexpected error: {}", err.0);
+    }
+
+    /// A BSS hunk declares its size in the header and contributes no bytes
+    /// to the file, so a real executable is routinely larger in memory
+    /// than on disk. Bounding declared size by the file size rejected
+    /// those: vbcc's test binary declares 4340 bytes across three hunks in
+    /// a 3804-byte file and could not be read at all.
+    #[test]
+    fn accepts_bss_hunk_larger_than_the_file() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&[0x00, 0x00, 0x03, 0xf3]); // HUNK_HEADER
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // no resident libs
+        buf.extend_from_slice(&2u32.to_be_bytes()); // hunk_count
+        buf.extend_from_slice(&0u32.to_be_bytes()); // first_hunk
+        buf.extend_from_slice(&1u32.to_be_bytes()); // last_hunk
+        buf.extend_from_slice(&1u32.to_be_bytes()); // hunk 0: 1 longword of code
+        buf.extend_from_slice(&64u32.to_be_bytes()); // hunk 1: 256 bytes of BSS
+        // HUNK_CODE with one longword: rts + padding
+        buf.extend_from_slice(&HUNK_CODE.to_be_bytes());
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.extend_from_slice(&[0x4E, 0x75, 0x4E, 0x71]);
+        buf.extend_from_slice(&HUNK_END.to_be_bytes());
+        // HUNK_BSS declares its length but carries no data.
+        buf.extend_from_slice(&HUNK_BSS.to_be_bytes());
+        buf.extend_from_slice(&64u32.to_be_bytes());
+        buf.extend_from_slice(&HUNK_END.to_be_bytes());
+
+        let exe = read_hunk_executable(&buf, 0x1000).unwrap();
+        assert_eq!(exe.sections.len(), 2);
+        assert_eq!(exe.sections[1].kind, SectionKind::Bss);
+        // The BSS hunk occupies address space beyond the file's own length.
+        assert_eq!(exe.sections[1].data.len(), 256);
+        assert!(exe.image.len() > buf.len());
     }
 
     /// Fuzzing regression (cargo-fuzz `amiga_hunk_parse` target): `Reader::
