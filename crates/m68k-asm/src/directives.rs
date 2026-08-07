@@ -403,8 +403,25 @@ pub fn handle_set(
 
 /// Handle ALIGN directive in pass 1 (size estimation) and pass 2 (code generation).
 ///
-/// Syntax: `ALIGN alignment[, fill]`
-/// Aligns the location counter to `alignment` bytes. Optional `fill` value for padding.
+/// Syntax: `ALIGN <bit_count>[, ignored]`
+///
+/// The argument is a **bit count**, not a byte count: it aligns to the next
+/// address whose low `bit_count` bits are zero, so `ALIGN 2` reaches a
+/// 4-byte boundary and `ALIGN 4` a 16-byte one. This matches the Motorola
+/// syntax module of the reference assembler, whose manual defines it as
+/// "insert as many zero bytes as required to reach an address where
+/// `<bit_count>` low order bits are zero" — verified by measurement across
+/// starting offsets.
+///
+/// Two consequences that a byte-count reading gets wrong, both seen in real
+/// sources: `ALIGN 0` is a no-op rather than an error (`align 0,4` is how
+/// the Shrinkler headers spell "do nothing"), and odd counts like `ALIGN 3`
+/// are perfectly legal rather than "not a power of two".
+///
+/// A second argument is **accepted and ignored** — the reference assembler
+/// ignores it too (`align 2,$ff` still pads with zeroes), so it is not a
+/// fill value despite looking like one. Padding is always zero bytes; the
+/// `$4E71` (NOP) fill belongs to `CNOP`, not here.
 pub fn handle_align_pass1(
     args: &[String],
     symbols: &SymbolTable,
@@ -418,28 +435,23 @@ pub fn handle_align_pass1(
         ));
     }
 
-    let alignment = parse_simple_expr(&args[0], symbols, pc)
-        .map_err(|e| AsmError::with_line(format!("invalid ALIGN expression: {}", e), line_no))?
-        as u32;
+    let bit_count = parse_simple_expr(&args[0], symbols, pc)
+        .map_err(|e| AsmError::with_line(format!("invalid ALIGN expression: {}", e), line_no))?;
 
-    if alignment == 0 || !alignment.is_power_of_two() {
+    // 31 bits is already the whole address space; beyond that the shift
+    // below would overflow rather than mean anything.
+    if !(0..=31).contains(&bit_count) {
         return Err(AsmError::with_line(
-            format!("ALIGN requires a power-of-2 value, got {}", alignment),
+            format!("ALIGN bit count must be 0..31, got {}", bit_count),
             line_no,
         ));
     }
 
-    let padding = if pc.is_multiple_of(alignment) {
+    let alignment = 1u32 << bit_count;
+    let bytes = if pc.is_multiple_of(alignment) {
         0
     } else {
         alignment - (pc % alignment)
-    };
-
-    // Round up to even if needed
-    let bytes = if padding % 2 != 0 {
-        padding + 1
-    } else {
-        padding
     };
 
     Ok(DirectiveResult::with_bytes(bytes))
@@ -459,23 +471,19 @@ pub fn handle_align_pass2(
         return Ok((result, None));
     }
 
-    let fill_value = if args.len() > 1 {
-        parse_simple_expr(&args[1], symbols, pc)
-            .map_err(|e| AsmError::with_line(format!("invalid ALIGN fill value: {}", e), line_no))?
-            as u16
-    } else {
-        0x4E71 // NOP as default fill
-    };
-
-    let word_count = (result.bytes_emitted / 2) as usize;
-    let words = vec![fill_value; word_count];
+    // Padding is zero bytes, and the count may be odd — aligning from an
+    // odd PC to the next even one emits a single byte. The old code filled
+    // whole NOP words, which both wrote the wrong bytes and could not
+    // express an odd length at all; `byte_len` carries the exact count.
+    let byte_count = result.bytes_emitted as usize;
+    let words = vec![0u16; byte_count.div_ceil(2)];
 
     let instr = AssembledInstruction {
         pc,
         words,
         line_no: Some(line_no),
         source: Some(source.to_string()),
-        byte_len: None,
+        byte_len: Some(byte_count),
     };
 
     Ok((result, Some(instr)))
@@ -1771,37 +1779,52 @@ mod tests {
         assert_eq!(handle_even_pass1(0x1002).bytes_emitted, 0);
     }
 
+    /// The argument is a bit count: `ALIGN 2` reaches a 4-byte boundary,
+    /// `ALIGN 4` a 16-byte one. Each case below is the reference
+    /// assembler's measured output for that count and PC.
     #[test]
     fn test_handle_align_pass1() {
         let symbols = SymbolTable::new();
-        // Already aligned
-        assert_eq!(
-            handle_align_pass1(&["4".to_string()], &symbols, 0x1000, 1)
+        let pad = |arg: &str, pc: u32| {
+            handle_align_pass1(&[arg.to_string()], &symbols, pc, 1)
                 .unwrap()
-                .bytes_emitted,
-            0
-        );
-        // Need 2 bytes padding to align to 4
-        assert_eq!(
-            handle_align_pass1(&["4".to_string()], &symbols, 0x1002, 1)
-                .unwrap()
-                .bytes_emitted,
-            2
-        );
-        // Need 4 bytes padding to align to 8
-        assert_eq!(
-            handle_align_pass1(&["8".to_string()], &symbols, 0x1004, 1)
-                .unwrap()
-                .bytes_emitted,
-            4
-        );
+                .bytes_emitted
+        };
+
+        // ALIGN 2 -> 4-byte boundary.
+        assert_eq!(pad("2", 0x1000), 0);
+        assert_eq!(pad("2", 0x1001), 3);
+        assert_eq!(pad("2", 0x1002), 2);
+
+        // ALIGN 4 -> 16-byte boundary, the spelling most real sources use.
+        assert_eq!(pad("4", 0x1000), 0);
+        assert_eq!(pad("4", 0x1001), 15);
+        assert_eq!(pad("4", 0x1002), 14);
+
+        // An odd bit count is legal and is not a power-of-two question.
+        assert_eq!(pad("3", 0x1001), 7);
+
+        // ALIGN 0 aligns to 2^0 = 1, so it never pads. `align 0,4` in the
+        // Shrinkler headers relies on exactly this.
+        assert_eq!(pad("0", 0x1001), 0);
+    }
+
+    /// The second operand is accepted and ignored — the reference assembler
+    /// ignores it too, so it is not a fill value despite looking like one.
+    #[test]
+    fn test_handle_align_second_operand_is_ignored() {
+        let symbols = SymbolTable::new();
+        let two_arg = handle_align_pass1(&["0".to_string(), "4".to_string()], &symbols, 0x1001, 1)
+            .unwrap()
+            .bytes_emitted;
+        assert_eq!(two_arg, 0);
     }
 
     #[test]
-    fn test_handle_align_not_power_of_two() {
+    fn test_handle_align_rejects_out_of_range_bit_count() {
         let symbols = SymbolTable::new();
-        assert!(handle_align_pass1(&["3".to_string()], &symbols, 0x1000, 1).is_err());
-        assert!(handle_align_pass1(&["0".to_string()], &symbols, 0x1000, 1).is_err());
+        assert!(handle_align_pass1(&["32".to_string()], &symbols, 0x1000, 1).is_err());
+        assert!(handle_align_pass1(&["-1".to_string()], &symbols, 0x1000, 1).is_err());
     }
 
     #[test]

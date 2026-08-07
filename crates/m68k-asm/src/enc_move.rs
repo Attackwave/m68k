@@ -26,7 +26,15 @@ pub fn enc_move(
     let sz = size_code(size)?;
     let move_size = [1, 3, 2][sz as usize];
     let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, ALL, cpu)?;
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, ALL, cpu)?;
+    // The destination is data-alterable, plus An for the MOVEA form
+    // (`MOVE.W D0,A1`, which the dispatcher routes here rather than to
+    // `enc_movea`). `ALL` let two categories of invalid instruction
+    // through silently: PC-relative destinations (`MOVE.W D0,LAB(PC)`)
+    // and immediate ones. PC-relative modes are not alterable on any
+    // 68k — not just pre-68020 — because there is nothing to write back
+    // to; the reference assembler rejects them on every architecture.
+    // `CLR`/`ADD` already refused these; only MOVE was permissive.
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT | AREG, cpu)?;
 
     let op = ((move_size as u16) << 12)
         | ((dst_reg as u16) << 9)

@@ -138,6 +138,22 @@ fn every_corpus_program_is_byte_complete() {
             "mixed_data_code",
             include_str!("../../../tests/programs/mixed_data_code.s"),
         ),
+        (
+            "recursion",
+            include_str!("../../../tests/programs/recursion.s"),
+        ),
+        (
+            "word_dispatch",
+            include_str!("../../../tests/programs/word_dispatch.s"),
+        ),
+        (
+            "inline_data",
+            include_str!("../../../tests/programs/inline_data.s"),
+        ),
+        (
+            "self_modifying",
+            include_str!("../../../tests/programs/self_modifying.s"),
+        ),
     ] {
         assert_byte_complete(&run(src, false), name);
         assert_byte_complete(&run(src, true), name);
@@ -235,4 +251,132 @@ fn unreachable_printable_code_is_still_misread_as_text() {
         "if this is now code, reachability improved — update \
          tests/programs/README.md finding 2"
     );
+}
+
+/// A recursive routine does not make the walk loop or stop early.
+///
+/// The `bsr` inside `fact` targets an address the tracer has already
+/// visited *and* is currently inside. A tracer that tracks "visited" per
+/// call rather than per address either recurses forever or abandons the
+/// rest of the routine; either way the tail after the call disappears.
+#[test]
+fn recursion_is_traced_without_looping_or_truncating() {
+    let lines = run(include_str!("../../../tests/programs/recursion.s"), false);
+
+    // The recursive call resolves to the routine's own entry, not to a
+    // fresh label per visit.
+    assert_eq!(text_at(&lines, 0x101c), "bsr.w   label0");
+    assert!(
+        line_at(&lines, 0x100a).is_some_and(|l| l.label.is_some()),
+        "the recursive routine's entry has no label"
+    );
+
+    // Everything after the recursive call is still decoded: the walk did
+    // not stop at the point of recursion.
+    assert_eq!(text_at(&lines, 0x1028), "unlk    a6");
+    assert_eq!(text_at(&lines, 0x102a), "rts");
+
+    // Frame offsets stay negative displacements off a6; they are not
+    // addresses and must not become labels below the origin.
+    assert!(
+        text_at(&lines, 0x1020).contains("-$4(a6)"),
+        "frame offset was resolved as an address: {:?}",
+        text_at(&lines, 0x1020)
+    );
+
+    assert_byte_complete(&lines, "recursion");
+}
+
+/// A table of word *offsets* is data, and a table of `bra` instructions
+/// is code — neither contains an address, so neither can be found by a
+/// pointer scan.
+///
+/// These pull in opposite directions, which is why they share a file: a
+/// heuristic loose enough to call the offset table data will also call
+/// the branch table data and destroy four real instructions.
+#[test]
+fn offset_table_is_data_and_branch_table_stays_code() {
+    let lines = run(
+        include_str!("../../../tests/programs/word_dispatch.s"),
+        true,
+    );
+
+    // The five word offsets are small integers, not instructions.
+    for addr in [0x102cu32, 0x102e, 0x1030, 0x1032, 0x1034] {
+        let text = text_at(&lines, addr);
+        assert!(
+            text.starts_with("dc.w"),
+            "offset table entry at {:08x} decoded as code: {:?}",
+            addr,
+            text
+        );
+    }
+
+    // The branch table is executable and must survive as instructions.
+    for addr in [0x1042u32, 0x1046, 0x104a, 0x104e] {
+        let text = text_at(&lines, addr);
+        assert!(
+            text.starts_with("bra.w"),
+            "branch table entry at {:08x} was rendered as data: {:?}",
+            addr,
+            text
+        );
+    }
+
+    assert_byte_complete(&lines, "word_dispatch");
+}
+
+/// Self-modifying code is disassembled as *assembled*, not as patched.
+///
+/// `patch` rewrites the immediate of the `moveq` at $102a at run time. A
+/// disassembler cannot know the patched value and must not speculate: the
+/// listing shows what the bytes say, which is what reassembles.
+#[test]
+fn self_modifying_code_is_shown_as_assembled() {
+    let lines = run(
+        include_str!("../../../tests/programs/self_modifying.s"),
+        false,
+    );
+
+    assert_eq!(
+        text_at(&lines, 0x102a),
+        "moveq   #$00000001, d0",
+        "the patched-at-run-time instruction was not shown as assembled"
+    );
+
+    // The byte store into the middle of that instruction is an ordinary
+    // displacement, not a reference that turns $102b into a label.
+    assert!(
+        text_at(&lines, 0x101a).contains("$1(a0)"),
+        "store into an instruction was resolved as an address: {:?}",
+        text_at(&lines, 0x101a)
+    );
+
+    assert_byte_complete(&lines, "self_modifying");
+}
+
+/// Arguments stored inline after a `jsr` are still read as code.
+///
+/// Recorded as a known limit rather than asserted as correct. The callee
+/// reads its arguments over the return address and resumes past them, so
+/// the bytes after the call site are data — but nothing in any opword
+/// says so, and every other `jsr` in every other program *is* followed by
+/// code. Fixing this needs the tracer to model the callee's adjustment of
+/// its own return address, not a stricter data heuristic.
+///
+/// The test pins the current behaviour so the day it improves is visible.
+#[test]
+fn inline_arguments_after_a_call_are_still_read_as_code() {
+    let lines = run(include_str!("../../../tests/programs/inline_data.s"), false);
+
+    // $100a holds `dc.w 7 / dc.w 9`, decoded as one instruction.
+    assert_eq!(
+        text_at(&lines, 0x100a),
+        "ori.b   #$09, d7",
+        "if these are now data, the tracer models inline arguments — \
+         update tests/programs/README.md"
+    );
+
+    // Whatever the classification, no byte may go missing.
+    assert_byte_complete(&lines, "inline_data");
 }

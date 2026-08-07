@@ -188,8 +188,8 @@ pub fn encode_instruction(
                 Err(AsmError::new("BSR requires address operand"))
             }
         }
-        "Bcc" | "BHI" | "BLS" | "BCC" | "BCS" | "BNE" | "BEQ" | "BVC" | "BVS" | "BPL" | "BMI"
-        | "BGE" | "BLT" | "BGT" | "BLE" => {
+        "Bcc" | "BHI" | "BLS" | "BCC" | "BCS" | "BHS" | "BLO" | "BNE" | "BEQ" | "BVC" | "BVS"
+        | "BPL" | "BMI" | "BGE" | "BLT" | "BGT" | "BLE" => {
             if let Some(Operand::Address(t)) = dst {
                 let cond = match mnemonic {
                     "Bcc" => "cc",
@@ -197,6 +197,10 @@ pub fn encode_instruction(
                     "BLS" => "ls",
                     "BCC" => "cc",
                     "BCS" => "cs",
+                    // `HS`/`LO` are the unsigned spellings of `CC`/`CS`;
+                    // see COND_CODES in enc_flow.rs.
+                    "BHS" => "cc",
+                    "BLO" => "cs",
                     "BNE" => "ne",
                     "BEQ" => "eq",
                     "BVC" => "vc",
@@ -221,8 +225,9 @@ pub fn encode_instruction(
         }
 
         // DBcc instructions
-        "DBcc" | "DBT" | "DBF" | "DBHI" | "DBLS" | "DBCC" | "DBCS" | "DBNE" | "DBEQ" | "DBVC"
-        | "DBVS" | "DBPL" | "DBMI" | "DBGE" | "DBLT" | "DBGT" | "DBLE" | "DBRA" => {
+        "DBcc" | "DBT" | "DBF" | "DBHI" | "DBLS" | "DBCC" | "DBCS" | "DBHS" | "DBLO" | "DBNE"
+        | "DBEQ" | "DBVC" | "DBVS" | "DBPL" | "DBMI" | "DBGE" | "DBLT" | "DBGT" | "DBLE"
+        | "DBRA" => {
             if let (Some(Operand::DataReg(rn)), Some(Operand::Address(t))) = (src, dst) {
                 let cond = match mnemonic {
                     "DBcc" | "DBRA" => "f",
@@ -232,6 +237,8 @@ pub fn encode_instruction(
                     "DBLS" => "ls",
                     "DBCC" => "cc",
                     "DBCS" => "cs",
+                    "DBHS" => "cc",
+                    "DBLO" => "cs",
                     "DBNE" => "ne",
                     "DBEQ" => "eq",
                     "DBVC" => "vc",
@@ -337,6 +344,15 @@ pub fn encode_instruction(
                 {
                     enc_addi(*v, d, sz, pc + 4, cpu)
                 }
+                // An as destination *is* ADDA — `ADD.L #2,A1` is how real
+                // sources spell it, and every assembler picks the ADDA
+                // encoding for it. Without these two arms the address-register
+                // destination fell through to `enc_add`, which has no such
+                // form and rejected it outright.
+                (Some(Operand::Immediate(v)), Some(Operand::AddrReg(rn))) => {
+                    enc_adda_imm(*v, *rn, sz)
+                }
+                (Some(s), Some(Operand::AddrReg(rn))) => enc_adda_ea(s, *rn, sz, pc + 4, cpu),
                 (Some(s), Some(d)) => enc_add(s, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("ADD requires two operands")),
             }
@@ -352,6 +368,11 @@ pub fn encode_instruction(
                 {
                     enc_subi(*v, d, sz, pc + 4, cpu)
                 }
+                // An as destination is SUBA — see the ADD arm above.
+                (Some(Operand::Immediate(v)), Some(Operand::AddrReg(rn))) => {
+                    enc_suba_imm(*v, *rn, sz)
+                }
+                (Some(s), Some(Operand::AddrReg(rn))) => enc_suba_ea(s, *rn, sz, pc + 4, cpu),
                 (Some(s), Some(d)) => enc_sub(s, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("SUB requires two operands")),
             }
@@ -718,12 +739,30 @@ pub fn encode_instruction(
         },
         "MOVEM" => {
             let sz = size.unwrap_or("w");
+
+            // A one-register list (`MOVEM.L A1,-(SP)`) never reaches the
+            // list parser: with no `/` or `-` in it, `a1` is recognised as
+            // an ordinary register operand long before then. It is still a
+            // perfectly good register list of length one — and a common
+            // way to save a single register around a routine — so convert
+            // it to the mask it denotes here. Bits 0-7 are D0-D7, bits
+            // 8-15 A0-A7, the same numbering the list parser produces.
+            let as_mask = |op: &Operand| match op {
+                Operand::Immediate(mask) => Some(*mask as u16),
+                Operand::DataReg(n) => Some(1u16 << n),
+                Operand::AddrReg(n) => Some(1u16 << (n + 8)),
+                _ => None,
+            };
+
             match (src, dst) {
-                (Some(Operand::Immediate(mask)), Some(d)) => {
-                    enc_movem_rm(*mask as u16, d, sz, pc + 4, cpu)
+                // Register-to-memory is tried first: when both sides parse
+                // as a mask the source is the register list, matching the
+                // Immediate arms' original order.
+                (Some(s), Some(d)) if as_mask(s).is_some() => {
+                    enc_movem_rm(as_mask(s).unwrap(), d, sz, pc + 4, cpu)
                 }
-                (Some(s), Some(Operand::Immediate(mask))) => {
-                    enc_movem_mr(s, *mask as u16, sz, pc + 4, cpu)
+                (Some(s), Some(d)) if as_mask(d).is_some() => {
+                    enc_movem_mr(s, as_mask(d).unwrap(), sz, pc + 4, cpu)
                 }
                 _ => Err(AsmError::new(
                     "MOVEM requires register mask and destination/source",
@@ -749,6 +788,10 @@ pub fn encode_instruction(
                 {
                     enc_cmpi(*v, d, sz, pc + 4, cpu)
                 }
+                // An as destination is CMPA — see the ADD arm above. This
+                // covers both `CMP.W A2,A1` and `CMP.L #2,A1`, since CMPA
+                // takes its immediate through the ordinary EA path.
+                (Some(s), Some(Operand::AddrReg(rn))) => enc_cmpa(s, *rn, sz, pc + 4, cpu),
                 (Some(s), Some(d)) => enc_cmp(s, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("CMP requires two operands")),
             }
@@ -840,8 +883,8 @@ pub fn encode_instruction(
         }
 
         // Set conditionally (Scc)
-        "ST" | "SF" | "SHI" | "SLS" | "SCC" | "SCS" | "SNE" | "SEQ" | "SVC" | "SVS" | "SPL"
-        | "SMI" | "SGE" | "SLT" | "SGT" | "SLE" => {
+        "ST" | "SF" | "SHI" | "SLS" | "SCC" | "SCS" | "SHS" | "SLO" | "SNE" | "SEQ" | "SVC"
+        | "SVS" | "SPL" | "SMI" | "SGE" | "SLT" | "SGT" | "SLE" => {
             let cond = match mnemonic {
                 "ST" => "t",
                 "SF" => "f",
@@ -849,6 +892,8 @@ pub fn encode_instruction(
                 "SLS" => "ls",
                 "SCC" => "cc",
                 "SCS" => "cs",
+                "SHS" => "cc",
+                "SLO" => "cs",
                 "SNE" => "ne",
                 "SEQ" => "eq",
                 "SVC" => "vc",
@@ -907,8 +952,9 @@ pub fn encode_instruction(
         }
 
         // TRAPcc instructions (68020+)
-        "TRAPT" | "TRAPF" | "TRAPHI" | "TRAPLS" | "TRAPCC" | "TRAPCS" | "TRAPNE" | "TRAPEQ"
-        | "TRAPVC" | "TRAPVS" | "TRAPPL" | "TRAPMI" | "TRAPGE" | "TRAPLT" | "TRAPGT" | "TRAPLE" => {
+        "TRAPT" | "TRAPF" | "TRAPHI" | "TRAPLS" | "TRAPCC" | "TRAPCS" | "TRAPHS" | "TRAPLO"
+        | "TRAPNE" | "TRAPEQ" | "TRAPVC" | "TRAPVS" | "TRAPPL" | "TRAPMI" | "TRAPGE" | "TRAPLT"
+        | "TRAPGT" | "TRAPLE" => {
             let cond = match mnemonic {
                 "TRAPT" => "t",
                 "TRAPF" => "f",
@@ -916,6 +962,8 @@ pub fn encode_instruction(
                 "TRAPLS" => "ls",
                 "TRAPCC" => "cc",
                 "TRAPCS" => "cs",
+                "TRAPHS" => "cc",
+                "TRAPLO" => "cs",
                 "TRAPNE" => "ne",
                 "TRAPEQ" => "eq",
                 "TRAPVC" => "vc",

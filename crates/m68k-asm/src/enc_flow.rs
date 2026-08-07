@@ -23,6 +23,12 @@ const COND_CODES: &[(&str, u8)] = &[
     ("lt", 13),
     ("gt", 14),
     ("le", 15),
+    // `HS`/`LO` ("higher or same"/"lower") are the unsigned-comparison
+    // spellings of `CC`/`CS`, and encode identically. They are ordinary in
+    // real sources — the Shrinkler decompressor uses `BLO` throughout — so
+    // omitting them rejected whole files rather than mis-encoding them.
+    ("hs", 4),
+    ("lo", 5),
 ];
 
 fn cond_code(name: &str) -> Result<u8, AsmError> {

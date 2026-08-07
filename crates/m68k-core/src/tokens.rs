@@ -314,6 +314,32 @@ pub fn split_line(line: &str) -> (Option<String>, String, String, Vec<String>) {
         return (None, String::new(), String::new(), vec![]);
     }
 
+    // `NAME = expr` is the assignment spelling of EQU, and the one the
+    // Amiga system headers and most tutorial sources actually use
+    // (`ExecBase = 4`). Normalising it here means the whole existing EQU
+    // path applies unchanged.
+    //
+    // The `=` must be the *first* one and must not be part of a comparison
+    // operator (`<=`, `>=`, `==`, `!=`), which appear in `IF` conditions;
+    // and the left side must be a plain identifier, so `move.l #1,d0` and
+    // an indented `= 4` continuation are both left alone.
+    if let Some(eq) = line.find('=')
+        && eq > 0
+        && !matches!(line.as_bytes()[eq - 1], b'<' | b'>' | b'!' | b'=')
+        && line.as_bytes().get(eq + 1) != Some(&b'=')
+    {
+        let name = line[..eq].trim();
+        let value = line[eq + 1..].trim();
+        if !name.is_empty() && !value.is_empty() && is_valid_ident(name) {
+            return (
+                Some(name.to_string()),
+                "equ".to_string(),
+                String::new(),
+                split_operands(value),
+            );
+        }
+    }
+
     // Check for label: colon form
     let mut result: Option<(Option<String>, String, String, Vec<String>)> = None;
     if let Some(colon_pos) = line.find(':') {
@@ -334,8 +360,18 @@ pub fn split_line(line: &str) -> (Option<String>, String, String, Vec<String>) {
     }
 
     // Check for label without colon (IDENT followed by directive)
+    //
+    // The first word must not itself be an instruction: several directive
+    // names are also ordinary label names, so `BEQ END` would otherwise be
+    // read as "label BEQ, directive END" and silently *end the assembly* at
+    // a forward branch to a label called `end` — no error, just a truncated
+    // program. A mnemonic is never a label, which settles it.
     let parts: Vec<&str> = line.splitn(2, char::is_whitespace).collect();
-    if parts.len() == 2 && is_valid_ident(parts[0]) && !takes_cache_scope_operand(parts[0]) {
+    if parts.len() == 2
+        && is_valid_ident(parts[0])
+        && !takes_cache_scope_operand(parts[0])
+        && !is_mnemonic(parts[0])
+    {
         let rest = parts[1].trim();
         let rest_parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
         if let Some(first) = rest_parts.first() {
@@ -362,6 +398,32 @@ pub fn split_line(line: &str) -> (Option<String>, String, String, Vec<String>) {
     // mnemonic rather than silently becoming a label.
     if starts_in_column_1 && parts.len() == 1 && is_valid_ident(line) {
         return (Some(line.to_string()), String::new(), String::new(), vec![]);
+    }
+
+    // Label in column 1 followed by an *instruction* on the same line —
+    // `.loop  move.l $dff004,d0`, the ordinary Amiga loop idiom. The
+    // colon-less branch above only fires when a *directive* follows, so
+    // this shape fell through to `parse_rest`, which read the label as the
+    // mnemonic and reported the instruction as an unparsable operand.
+    //
+    // Column 1 is again what makes it safe: an indented `move.l ...` still
+    // parses as the instruction it is, because a mnemonic is never written
+    // flush left.
+    if starts_in_column_1
+        && parts.len() == 2
+        && is_valid_ident(parts[0])
+        && !takes_cache_scope_operand(parts[0])
+    {
+        let rest = parts[1].trim();
+        let mnem_full = rest.split(char::is_whitespace).next().unwrap_or(rest);
+        let mnem = mnem_full
+            .split('.')
+            .next()
+            .unwrap_or(mnem_full)
+            .to_lowercase();
+        if is_mnemonic(&mnem) {
+            return parse_rest_with_label(rest, Some(parts[0].to_string()));
+        }
     }
 
     parse_rest(line)
@@ -478,6 +540,46 @@ pub fn is_valid_ident(s: &str) -> bool {
 /// `Assembler`'s label handling.
 pub fn is_local_label(name: &str) -> bool {
     name.len() > 1 && name.starts_with('.')
+}
+
+/// Whether `word` names an instruction, for telling `LABEL  mnemonic ...`
+/// apart from a mnemonic that merely starts in column 1.
+///
+/// Driven by [`crate::opcodes::opcode_patterns`] so there is no second list
+/// of instruction names to keep in sync. That table spells the conditional
+/// families as placeholders (`Bcc`, `DBcc`, `Scc`, `FBcc`, …), so the
+/// concrete spellings are expanded from the condition names here — `bne`
+/// and `dbeq` appear nowhere in the table literally.
+pub fn is_mnemonic(word: &str) -> bool {
+    /// The 16 condition codes, plus the FPU's, as written in source.
+    const CONDITIONS: &[&str] = &[
+        "t", "f", "hi", "ls", "cc", "hs", "cs", "lo", "ne", "eq", "vc", "vs", "pl", "mi", "ge",
+        "lt", "gt", "le", "ra", "sr", "or", "un", "or", "ueq", "ogt", "uge", "olt", "ule", "ogl",
+        "ueq", "ngle", "ngl", "nle", "ngt", "nge", "seq", "sne",
+    ];
+
+    let w = word.to_lowercase();
+    if w.is_empty() {
+        return false;
+    }
+
+    if crate::opcodes::opcode_patterns()
+        .iter()
+        .any(|p| !p.mnemonic.contains("cc") && p.mnemonic.eq_ignore_ascii_case(&w))
+    {
+        return true;
+    }
+
+    // Conditional families: <prefix><cc>.
+    for prefix in ["b", "db", "s", "fb", "fdb", "fs", "trap", "ftrap"] {
+        if let Some(cc) = w.strip_prefix(prefix)
+            && CONDITIONS.contains(&cc)
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 /// The 68040 cache instructions take a cache-scope name as their first
