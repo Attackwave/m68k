@@ -805,13 +805,19 @@ fn parse_movem_reg_list(text: &str) -> Option<u16> {
     for part in text.split('/') {
         let part = part.trim();
         if let Some((a, b)) = part.split_once('-') {
+            // A range is over the flat 16-bit numbering D0..D7,A0..A7, so
+            // it may cross the bank boundary: `D0-A6` is the idiomatic
+            // spelling of "everything but A7" and covers bits 0..=14.
+            // Requiring both ends in the same bank rejected it outright.
             let (lo, lo_offset) = parse_dan_reg(a.trim())?;
             let (hi, hi_offset) = parse_dan_reg(b.trim())?;
-            if lo_offset != hi_offset {
+            let lo_bit = lo + lo_offset;
+            let hi_bit = hi + hi_offset;
+            if lo_bit > hi_bit {
                 return None;
             }
-            for n in lo..=hi {
-                mask |= 1 << (n + lo_offset);
+            for bit in lo_bit..=hi_bit {
+                mask |= 1 << bit;
             }
         } else {
             let (n, offset) = parse_dan_reg(part)?;
@@ -1964,18 +1970,20 @@ impl Assembler {
     /// Assemble source text into bytes.
     ///
     /// This runs both passes and branch relaxation, returning the final
-    /// binary as a flat `Vec<u8>`.
+    /// binary as a flat `Vec<u8>` — the same image the `-o` output of the
+    /// CLI writes.
+    ///
+    /// Delegates to [`crate::output::generate_binary_to`] rather than
+    /// concatenating `words`: an instruction's word count is not its byte
+    /// count. A `DC.B` with an odd length packs its last byte into the high
+    /// half of a word, and each instruction belongs at its own `pc` — so
+    /// pasting whole words end to end inserted a stray pad byte after every
+    /// odd-length item and shifted everything after it. That made this
+    /// function disagree with the CLI on any source containing byte data.
     pub fn assemble_bytes(&mut self, source: &str) -> Result<Vec<u8>, AsmError> {
         self.assemble(source)?;
-
-        let mut bytes = Vec::new();
-        for instr in &self.code {
-            for word in &instr.words {
-                bytes.push((word >> 8) as u8);
-                bytes.push((word & 0xFF) as u8);
-            }
-        }
-        Ok(bytes)
+        Ok(crate::output::generate_binary_to(&self.code, Some(self.pc))
+            .map_or_else(Vec::new, |(bytes, _)| bytes))
     }
 
     /// Pre-process macros: collect definitions and expand invocations.
@@ -4385,6 +4393,11 @@ fn is_branch_mnemonic(mnemonic: &str) -> bool {
             | "bls"
             | "bcc"
             | "bcs"
+            // `HS`/`LO` are the unsigned spellings of `CC`/`CS`. They must
+            // be listed here too, not just in `branch_condition`, or the
+            // relaxation pass would not size them as branches at all.
+            | "bhs"
+            | "blo"
             | "bne"
             | "beq"
             | "bvc"
@@ -4402,6 +4415,8 @@ fn is_branch_mnemonic(mnemonic: &str) -> bool {
             | "dbls"
             | "dbcc"
             | "dbcs"
+            | "dbhs"
+            | "dblo"
             | "dbne"
             | "dbeq"
             | "dbvc"
@@ -4428,6 +4443,10 @@ fn branch_condition(mnemonic: &str) -> Result<String, AsmError> {
         "bls" => "ls",
         "bcc" => "cc",
         "bcs" => "cs",
+        // `HS`/`LO` are the unsigned spellings of `CC`/`CS`; see COND_CODES
+        // in enc_flow.rs.
+        "bhs" => "cc",
+        "blo" => "cs",
         "bne" => "ne",
         "beq" => "eq",
         "bvc" => "vc",
@@ -4458,6 +4477,8 @@ fn dbcc_condition(mnemonic: &str) -> Result<String, AsmError> {
         "dbls" => "ls",
         "dbcc" => "cc",
         "dbcs" => "cs",
+        "dbhs" => "cc",
+        "dblo" => "cs",
         "dbne" => "ne",
         "dbeq" => "eq",
         "dbvc" => "vc",

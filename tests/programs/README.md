@@ -22,6 +22,14 @@ visible in ROM measurements: on a ROM nobody knows which answer is right.
 | `pc_relative_data.s` | `lea table(pc),a0` — reports a target address like a branch, but names *data* |
 | `nested_loops.s` | Pure code, no data at all — the control case against inventing data |
 | `mixed_data_code.s` | Byte/word/long data interleaved with code, plus an odd-length string |
+| `recursion.s` | A routine that calls itself, with a `link`/`unlk` frame — revisited addresses, and displacements that are frame offsets rather than addresses |
+| `word_dispatch.s` | A table of 16-bit *offsets* (data) and a table of `bra` instructions (code), neither containing an address |
+| `inline_data.s` | Arguments stored after the `jsr` that calls the routine, read over the return address |
+| `self_modifying.s` | Code that patches its own immediate, and a byte loaded from inside an opword |
+
+Each of the four was assembled against `vasmm68k_mot -Fbin -no-opt` and is
+byte-identical to it, so the addresses named in their header comments are
+measured rather than assumed.
 
 ## Findings
 
@@ -61,6 +69,33 @@ and that direction of error is easy to introduce while fixing the others.
 
 Kickstart 1.3 roundtrip is unchanged by both fixes (OK 80.7%, MISMATCH
 424), while `--scan-tables` now recovers 348 more lines of code there.
+
+**4. Recursion, offset tables and self-modifying code all come out
+right.** Added with the second batch of programs, and worth recording
+because each was a plausible place to fail:
+
+- `recursion.s` — the recursive `bsr` resolves to the routine's own entry
+  and the walk continues past it. A tracer that tracked "visited" per call
+  rather than per address would loop or truncate here. Frame offsets stay
+  displacements off `a6` instead of becoming labels below the origin.
+- `word_dispatch.s` — the word-offset table is data and the `bra` table is
+  code, in one image. These pull in opposite directions: a heuristic loose
+  enough to call the offset table data would also swallow four real
+  instructions in the branch table.
+- `self_modifying.s` — the patched `moveq` is listed as assembled, not as
+  patched. That is the only answer that reassembles, and the test exists so
+  no later heuristic starts speculating about run-time values.
+
+**5. Inline arguments after a `jsr` are still read as code — not fixed.**
+In `inline_data.s` the callee reads its arguments over the return address
+and resumes past them, so the words after the call site are data. Nothing
+in any opword says so, and every other `jsr` in this corpus *is* followed
+by code, so the linear walk decodes `dc.w 7 / dc.w 9` as `ori.b #$09,d7`.
+
+The honest fix is for the tracer to model a callee adjusting its own
+return address, not a stricter data heuristic — the bytes are
+indistinguishable from code without that. Recorded as a pinned test so the
+day it improves is visible.
 
 ## Adding a program
 
