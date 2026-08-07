@@ -77,7 +77,7 @@ jobs:
       # Pinned to the declared rust-version in the workspace manifest. If
       # this job fails, either the code started using a newer feature (bump
       # rust-version) or the pin drifted — do not "fix" it by widening here.
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.100.0
 
       - name: Cache cargo registry
         uses: actions/cache@v6
