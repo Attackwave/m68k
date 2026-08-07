@@ -10,7 +10,7 @@ resolver = "2"
 exclude = ["fuzz"]
 
 [workspace.package]
-version = "2.1.0"
+version = "2.2.0"
 edition = "2024"
 # Minimum supported Rust version. Determined empirically, not guessed:
 # 1.87 fails with E0658 on the let-chains in m68k-core (`let` expressions
