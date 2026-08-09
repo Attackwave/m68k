@@ -9,3 +9,9 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
+    ignore:
+      # This action's tag selects the Rust toolchain, it is not an action
+      # version. The msrv job pins it to the workspace rust-version on
+      # purpose; letting Dependabot "bump" it asks for a Rust release that
+      # does not exist and breaks the job.
+      - dependency-name: "dtolnay/rust-toolchain"
