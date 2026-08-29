@@ -29,17 +29,19 @@ impl WorkspaceIndex {
 
     /// Index or update a document in the workspace.
     pub fn update_document(&mut self, uri: &Url, text: String, version: i32) {
-        if let Ok(path) = uri.to_file_path() {
-            let doc = Document::new(uri.clone(), version, text);
-            self.documents.insert(path, doc);
-        }
+        let path = uri
+            .to_file_path()
+            .unwrap_or_else(|_| PathBuf::from(uri.path()));
+        let doc = Document::new(uri.clone(), version, text);
+        self.documents.insert(path, doc);
     }
 
     /// Remove a document from the workspace index.
     pub fn remove_document(&mut self, uri: &Url) {
-        if let Ok(path) = uri.to_file_path() {
-            self.documents.remove(&path);
-        }
+        let path = uri
+            .to_file_path()
+            .unwrap_or_else(|_| PathBuf::from(uri.path()));
+        self.documents.remove(&path);
     }
 
     /// Resolve an `INCLUDE "file.i"` path relative to the current document and search dirs.
@@ -91,28 +93,31 @@ impl WorkspaceIndex {
         }
 
         // 2. Check explicitly included files
-        if let Ok(current_path) = current_doc.uri.to_file_path() {
-            for parsed in &current_doc.parsed_lines {
-                if parsed.mnemonic.eq_ignore_ascii_case("include")
-                    && !parsed.operands.is_empty()
-                    && let Some(inc_path) = self.resolve_include(&current_path, &parsed.operands[0])
-                    && let Some(inc_doc) = self.documents.get(&inc_path)
-                    && let Some(sym) = inc_doc.symbols.get(clean_name)
-                {
-                    return Some(Location {
-                        uri: inc_doc.uri.clone(),
-                        range: Range {
-                            start: Position {
-                                line: sym.line_idx as u32,
-                                character: sym.character as u32,
-                            },
-                            end: Position {
-                                line: sym.line_idx as u32,
-                                character: (sym.character + sym.name.len()) as u32,
-                            },
+        let current_path = current_doc
+            .uri
+            .to_file_path()
+            .unwrap_or_else(|_| PathBuf::from(current_doc.uri.path()));
+
+        for parsed in &current_doc.parsed_lines {
+            if parsed.mnemonic.eq_ignore_ascii_case("include")
+                && !parsed.operands.is_empty()
+                && let Some(inc_path) = self.resolve_include(&current_path, &parsed.operands[0])
+                && let Some(inc_doc) = self.documents.get(&inc_path)
+                && let Some(sym) = inc_doc.symbols.get(clean_name)
+            {
+                return Some(Location {
+                    uri: inc_doc.uri.clone(),
+                    range: Range {
+                        start: Position {
+                            line: sym.line_idx as u32,
+                            character: sym.character as u32,
                         },
-                    });
-                }
+                        end: Position {
+                            line: sym.line_idx as u32,
+                            character: (sym.character + sym.name.len()) as u32,
+                        },
+                    },
+                });
             }
         }
 
@@ -148,8 +153,14 @@ mod tests {
     #[test]
     fn test_workspace_cross_file_definition() {
         let mut ws = WorkspaceIndex::new();
-        let uri1 = Url::parse("file:///workspace/header.i").unwrap();
-        let uri2 = Url::parse("file:///workspace/main.s").unwrap();
+        let base_dir = std::env::temp_dir().join("m68k_lsp_test");
+        let path1 = base_dir.join("header.i");
+        let path2 = base_dir.join("main.s");
+
+        let uri1 = Url::from_file_path(&path1)
+            .unwrap_or_else(|_| Url::parse("file:///workspace/header.i").unwrap());
+        let uri2 = Url::from_file_path(&path2)
+            .unwrap_or_else(|_| Url::parse("file:///workspace/main.s").unwrap());
 
         ws.update_document(&uri1, "CUSTOM_REG EQU $DFF000\n".to_string(), 1);
         ws.update_document(
