@@ -3,9 +3,14 @@
 use tower_lsp::lsp_types::{GotoDefinitionResponse, Location, Position, Range};
 
 use crate::document::Document;
+use crate::workspace::WorkspaceIndex;
 
 /// Find definition location for symbol under cursor.
-pub fn compute_definition(doc: &Document, pos: Position) -> Option<GotoDefinitionResponse> {
+pub fn compute_definition(
+    doc: &Document,
+    pos: Position,
+    workspace: Option<&WorkspaceIndex>,
+) -> Option<GotoDefinitionResponse> {
     let word_info = doc.get_word_at_position(pos)?;
     let clean_word = word_info.word.trim();
     if clean_word.is_empty() {
@@ -48,6 +53,13 @@ pub fn compute_definition(doc: &Document, pos: Position) -> Option<GotoDefinitio
         return Some(GotoDefinitionResponse::Scalar(loc));
     }
 
+    // Lookup in workspace index if available
+    if let Some(ws) = workspace
+        && let Some(loc) = ws.find_symbol_definition(doc, clean_word)
+    {
+        return Some(GotoDefinitionResponse::Scalar(loc));
+    }
+
     None
 }
 
@@ -68,6 +80,7 @@ mod tests {
                 line: 1,
                 character: 14,
             },
+            None,
         )
         .expect("should find definition");
 
