@@ -58,6 +58,21 @@ impl Library {
         &["exec", "dos", "graphics", "intuition"]
     }
 
+    /// The library file name (e.g. "exec.library").
+    pub fn file_name(self) -> &'static str {
+        match self {
+            Library::Exec => "exec.library",
+            Library::Dos => "dos.library",
+            Library::Graphics => "graphics.library",
+            Library::Intuition => "intuition.library",
+        }
+    }
+
+    /// The full LVO offset-to-name table for this library.
+    pub fn entries(self) -> &'static [(u16, &'static str)] {
+        self.table()
+    }
+
     fn table(self) -> &'static [(u16, &'static str)] {
         match self {
             Library::Exec => EXEC,

@@ -67,6 +67,7 @@ jobs:
             target/release/m68k-asm
             target/release/m68k-disasm
             target/release/m68k-floppy
+            target/release/m68k-lsp
 
   msrv:
     name: msrv (1.88)
