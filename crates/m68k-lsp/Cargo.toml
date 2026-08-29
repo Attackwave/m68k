@@ -1,0 +1,26 @@
+[package]
+name = "m68k-lsp"
+description = "Language Server Protocol (LSP) implementation for Motorola 68000 assembly"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "m68k-lsp"
+path = "src/main.rs"
+
+[dependencies]
+m68k-core = { path = "../m68k-core" }
+m68k-asm = { path = "../m68k-asm" }
+tower-lsp = "0.20.0"
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "io-std"] }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+
+[dev-dependencies]
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "io-std", "test-util"] }

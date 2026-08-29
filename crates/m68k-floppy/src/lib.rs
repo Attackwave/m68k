@@ -14,6 +14,8 @@
 //! not even be installed — the native IPF parser already serves as a
 //! fallback whenever it's absent.
 
+#![allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
+
 pub mod adf;
 pub mod adf_writer;
 pub mod amigados;
