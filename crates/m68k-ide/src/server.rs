@@ -1,34 +1,59 @@
 //! HTTP & JSON-RPC REST Server for m68k Studio IDE.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
 
-use axum::Router;
 use axum::extract::Json;
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode, Uri};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
+use axum::Router;
+use rust_embed::RustEmbed;
 use tower_http::cors::{Any, CorsLayer};
-use tower_http::services::ServeDir;
 
-use crate::commands::assembler::{AssembleRequest, assemble_code};
-use crate::commands::bitplane::{ConvertImageRequest, convert_image_to_bitplanes};
+use crate::commands::assembler::{assemble_code, AssembleRequest};
+use crate::commands::bitplane::{convert_image_to_bitplanes, ConvertImageRequest};
 use crate::commands::copper::parse_copperlist;
-use crate::commands::disassembler::{DisassembleRequest, disassemble_bytes};
+use crate::commands::disassembler::{disassemble_bytes, DisassembleRequest};
 use crate::commands::emulator::{
-    LaunchEmulatorRequest, detect_available_emulators, launch_emulator,
+    detect_available_emulators, launch_emulator, LaunchEmulatorRequest,
 };
 use crate::commands::floppy::{
-    CreateAdfRequest, WriteFileToAdfRequest, create_new_adf, inspect_adf, write_file_to_adf,
+    create_new_adf, inspect_adf, write_file_to_adf, CreateAdfRequest, WriteFileToAdfRequest,
 };
 use crate::commands::lsp_bridge::{
-    LspQueryRequest, lsp_completion, lsp_definition, lsp_diagnostics, lsp_format, lsp_hover,
-    lsp_semantic_tokens, lsp_symbols,
+    lsp_completion, lsp_definition, lsp_diagnostics, lsp_format, lsp_hover, lsp_semantic_tokens,
+    lsp_symbols, LspQueryRequest,
 };
-use crate::commands::project::{ScaffoldProjectRequest, load_project_config, scaffold_project};
+use crate::commands::project::{load_project_config, scaffold_project, ScaffoldProjectRequest};
+
+#[derive(RustEmbed)]
+#[folder = "frontend/dist/"]
+struct EmbeddedFrontend;
+
+async fn static_handler(uri: Uri) -> impl IntoResponse {
+    let raw_path = uri.path().trim_start_matches('/');
+    let path = if raw_path.is_empty() {
+        "index.html"
+    } else {
+        raw_path
+    };
+
+    match EmbeddedFrontend::get(path) {
+        Some(content) => {
+            let mime = mime_guess::from_path(path).first_or_octet_stream();
+            ([(header::CONTENT_TYPE, mime.as_ref())], content.data).into_response()
+        }
+        None => match EmbeddedFrontend::get("index.html") {
+            Some(content) => {
+                ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], content.data).into_response()
+            }
+            None => (StatusCode::NOT_FOUND, "404 Not Found").into_response(),
+        },
+    }
+}
 
 /// Build the Axum API router.
-pub fn create_router(frontend_dir: Option<PathBuf>) -> Router {
+pub fn create_router() -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -151,21 +176,13 @@ pub fn create_router(frontend_dir: Option<PathBuf>) -> Router {
             post(|Json(source): Json<String>| async move { Json(lsp_semantic_tokens(source)) }),
         );
 
-    let mut router = api_routes.layer(cors);
-
-    if let Some(dir) = frontend_dir
-        && dir.exists()
-    {
-        router = router.fallback_service(ServeDir::new(dir));
-    }
-
-    router
+    api_routes.layer(cors).fallback(static_handler)
 }
 
 /// Start the local server on the given port.
 pub async fn start_server(port: u16, open_browser: bool) -> Result<(), Box<dyn std::error::Error>> {
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
-    let app = create_router(Some(PathBuf::from("frontend/dist")));
+    let app = create_router();
 
     println!("m68k Studio Server running at http://{}", addr);
 

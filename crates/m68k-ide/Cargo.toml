@@ -26,3 +26,5 @@ thiserror = { workspace = true }
 image = { version = "0.25", default-features = false, features = ["png", "bmp", "jpeg"] }
 tower-lsp = "0.20"
 base64 = "0.22"
+rust-embed = "8.5"
+mime_guess = "2.0"
