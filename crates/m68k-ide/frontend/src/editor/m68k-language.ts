@@ -169,4 +169,69 @@ export function registerM68kLanguage() {
       ];
     },
   });
+
+  // Register VS Code Dark Studio Theme (m68k-dark)
+  monaco.editor.defineTheme('m68k-dark', {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'keyword', foreground: '3B82F6', fontStyle: 'bold' },
+      { token: 'keyword.directive', foreground: '818CF8', fontStyle: 'bold' },
+      { token: 'variable.register', foreground: 'F59E0B', fontStyle: 'bold' },
+      { token: 'type.size', foreground: '38BDF8' },
+      { token: 'number.hex', foreground: '34D399' },
+      { token: 'number.binary', foreground: '10B981' },
+      { token: 'number', foreground: '34D399' },
+      { token: 'number.immediate', foreground: 'F472B6' },
+      { token: 'string', foreground: 'F472B6' },
+      { token: 'comment', foreground: '64748B', fontStyle: 'italic' },
+      { token: 'entity.name.function.label', foreground: 'FBBF24', fontStyle: 'bold' },
+      { token: 'delimiter', foreground: '94A3B8' },
+      { token: 'identifier', foreground: 'E2E8F0' },
+    ],
+    colors: {
+      'editor.background': '#0F1117',
+      'editor.foreground': '#E2E8F0',
+      'editor.lineHighlightBackground': '#161922',
+      'editor.selectionBackground': '#1E3A8A66',
+      'editor.inactiveSelectionBackground': '#1E293B55',
+      'editorCursor.foreground': '#3B82F6',
+      'editorLineNumber.foreground': '#475569',
+      'editorLineNumber.activeForeground': '#94A3B8',
+      'editorGutter.background': '#0F1117',
+      'editorIndentGuide.background': '#1E222D',
+      'editorIndentGuide.activeBackground': '#3B82F6',
+      'editorWhitespace.foreground': '#2A2F3D',
+    },
+  });
+
+  // Register Amiga Retro Theme (amiga-theme)
+  monaco.editor.defineTheme('amiga-theme', {
+    base: 'vs-dark',
+    inherit: true,
+    rules: [
+      { token: 'keyword', foreground: 'FF8800', fontStyle: 'bold' },
+      { token: 'keyword.directive', foreground: 'FFAA33', fontStyle: 'bold' },
+      { token: 'variable.register', foreground: 'FFFFFF', fontStyle: 'bold' },
+      { token: 'type.size', foreground: '55AAFF' },
+      { token: 'number.hex', foreground: 'AAAAAA' },
+      { token: 'number.binary', foreground: '55AAFF' },
+      { token: 'number', foreground: 'AAAAAA' },
+      { token: 'string', foreground: 'FFCC00' },
+      { token: 'comment', foreground: '55AAFF', fontStyle: 'italic' },
+      { token: 'entity.name.function.label', foreground: 'FF8800', fontStyle: 'bold' },
+      { token: 'delimiter', foreground: 'FFFFFF' },
+      { token: 'identifier', foreground: 'FFFFFF' },
+    ],
+    colors: {
+      'editor.background': '#0055AA',
+      'editor.foreground': '#FFFFFF',
+      'editor.lineHighlightBackground': '#004488',
+      'editor.selectionBackground': '#002255',
+      'editorCursor.foreground': '#FF8800',
+      'editorLineNumber.foreground': '#55AAFF',
+      'editorLineNumber.activeForeground': '#FFFFFF',
+      'editorGutter.background': '#0055AA',
+    },
+  });
 }

@@ -1,10 +1,11 @@
 //! Amiga Bitplane and Palette Conversion Studio Component.
 
-import { api, BitplaneConvertResponse } from '../api';
+import { api } from '../api';
 
-export function createBitplaneStudio(): HTMLElement {
+export function createBitplaneStudio(onInsertCode?: (code: string) => void): HTMLElement {
   const container = document.createElement('div');
-  container.className = 'flex-1 flex flex-col bg-studio-bg overflow-y-auto p-4 space-y-4 text-xs font-sans select-none';
+  container.className =
+    'flex-1 flex flex-col bg-studio-bg overflow-y-auto p-4 space-y-4 text-xs font-sans select-none';
 
   container.innerHTML = `
     <div class="flex items-center justify-between border-b border-studio-border pb-3">
@@ -15,12 +16,13 @@ export function createBitplaneStudio(): HTMLElement {
       <div class="flex items-center space-x-3">
         <label class="flex items-center space-x-1.5 cursor-pointer">
           <span class="text-studio-muted">Max Bitplanes:</span>
-          <select id="select-planes" class="bg-studio-panel border border-studio-border text-white px-2 py-1 rounded outline-none">
+          <select id="select-planes" class="bg-studio-panel border border-studio-border text-white px-2 py-1 rounded outline-none cursor-pointer">
             <option value="1">1 Plane (2 Colors)</option>
             <option value="2">2 Planes (4 Colors)</option>
             <option value="3">3 Planes (8 Colors)</option>
             <option value="4">4 Planes (16 Colors)</option>
             <option value="5" selected>5 Planes (32 Colors / OCS)</option>
+            <option value="6">6 Planes (64 Colors / EHB)</option>
           </select>
         </label>
         <label class="flex items-center space-x-1.5 cursor-pointer">
@@ -31,7 +33,7 @@ export function createBitplaneStudio(): HTMLElement {
     </div>
 
     <!-- Drop Zone -->
-    <div id="drop-zone" class="border-2 border-dashed border-studio-border hover:border-studio-accent rounded-lg p-8 text-center cursor-pointer transition bg-studio-panel/40">
+    <div id="drop-zone" class="border-2 border-dashed border-studio-border hover:border-blue-500 rounded-xl p-8 text-center cursor-pointer transition bg-studio-panel/40">
       <input type="file" id="file-input" class="hidden" accept="image/png, image/bmp, image/jpeg">
       <div class="space-y-2">
         <div class="text-3xl">🖼️</div>
@@ -45,21 +47,21 @@ export function createBitplaneStudio(): HTMLElement {
       <!-- Summary Info & Palette Previews -->
       <div class="grid grid-cols-2 gap-4">
         <!-- Palette Preview Card -->
-        <div class="p-3 bg-studio-panel border border-studio-border rounded-lg space-y-2">
-          <div class="font-bold text-white flex justify-between">
+        <div class="p-3.5 bg-studio-panel border border-studio-border rounded-xl space-y-2.5">
+          <div class="font-bold text-white flex justify-between items-center">
             <span>Amiga 12-bit Palette (<span id="color-count">0</span> Colors)</span>
-            <span id="image-dims" class="text-studio-muted font-mono">320x256</span>
+            <span id="image-dims" class="text-studio-muted font-mono text-[11px]">320x256</span>
           </div>
-          <div id="palette-swatches" class="flex flex-wrap gap-1.5"></div>
+          <div id="palette-swatches" class="flex flex-wrap gap-1.5 max-h-28 overflow-y-auto"></div>
         </div>
 
         <!-- Conversion Stats -->
-        <div class="p-3 bg-studio-panel border border-studio-border rounded-lg space-y-2">
+        <div class="p-3.5 bg-studio-panel border border-studio-border rounded-xl space-y-2.5">
           <div class="font-bold text-white">Asset Details</div>
-          <div class="space-y-1 text-studio-text font-mono text-[11px]">
-            <div>Bitplanes Used: <span id="bitplanes-count" class="text-blue-400 font-bold">5</span></div>
-            <div>Total Raw Bytes: <span id="raw-byte-count" class="text-emerald-400 font-bold">0</span> Bytes</div>
-            <div>Plane Layout: <span id="layout-type" class="text-amber-400">Planar</span></div>
+          <div class="space-y-1.5 text-studio-text font-mono text-[11px]">
+            <div class="flex justify-between"><span class="text-studio-muted">Bitplanes Used:</span> <span id="bitplanes-count" class="text-blue-400 font-bold">5</span></div>
+            <div class="flex justify-between"><span class="text-studio-muted">Total Raw Bytes:</span> <span id="raw-byte-count" class="text-emerald-400 font-bold">0</span> Bytes</div>
+            <div class="flex justify-between"><span class="text-studio-muted">Plane Layout:</span> <span id="layout-type" class="text-amber-400">Planar</span></div>
           </div>
         </div>
       </div>
@@ -67,25 +69,35 @@ export function createBitplaneStudio(): HTMLElement {
       <!-- Generated Assembly Outputs -->
       <div class="grid grid-cols-2 gap-4">
         <!-- Copper Palette Code -->
-        <div class="space-y-1.5">
+        <div class="space-y-2">
           <div class="flex items-center justify-between">
-            <span class="font-bold text-white">Copper Palette Assembly (COLOR00-COLOR31):</span>
-            <button id="btn-copy-copper" class="px-2 py-0.5 text-[10px] bg-studio-hover hover:bg-studio-accent text-white rounded transition">
-              📋 Copy Copper
-            </button>
+            <span class="font-bold text-white text-[11px]">Copper Palette Assembly:</span>
+            <div class="flex items-center space-x-1.5">
+              <button id="btn-copy-copper" class="px-2 py-0.5 text-[10px] bg-studio-bg hover:bg-studio-hover border border-studio-border text-white rounded transition cursor-pointer">
+                📋 Copy
+              </button>
+              <button id="btn-insert-copper" class="px-2 py-0.5 text-[10px] bg-blue-600 hover:bg-blue-500 text-white rounded font-medium transition cursor-pointer">
+                📝 Insert
+              </button>
+            </div>
           </div>
-          <textarea id="asm-copper-output" class="w-full h-44 bg-studio-panel border border-studio-border text-white font-mono text-[11px] p-2.5 rounded outline-none resize-none" readonly></textarea>
+          <textarea id="asm-copper-output" class="w-full h-44 bg-studio-panel border border-studio-border text-white font-mono text-[11px] p-2.5 rounded-lg outline-none resize-none" readonly></textarea>
         </div>
 
         <!-- Bitplane Raw Data Assembly -->
-        <div class="space-y-1.5">
+        <div class="space-y-2">
           <div class="flex items-center justify-between">
-            <span class="font-bold text-white">Bitplane Raw Data (DC.W):</span>
-            <button id="btn-copy-bitplanes" class="px-2 py-0.5 text-[10px] bg-studio-hover hover:bg-studio-accent text-white rounded transition">
-              📋 Copy DC.W
-            </button>
+            <span class="font-bold text-white text-[11px]">Bitplane Raw Data (DC.W):</span>
+            <div class="flex items-center space-x-1.5">
+              <button id="btn-copy-bitplanes" class="px-2 py-0.5 text-[10px] bg-studio-bg hover:bg-studio-hover border border-studio-border text-white rounded transition cursor-pointer">
+                📋 Copy
+              </button>
+              <button id="btn-insert-bitplanes" class="px-2 py-0.5 text-[10px] bg-blue-600 hover:bg-blue-500 text-white rounded font-medium transition cursor-pointer">
+                📝 Insert
+              </button>
+            </div>
           </div>
-          <textarea id="asm-bitplane-output" class="w-full h-44 bg-studio-panel border border-studio-border text-white font-mono text-[11px] p-2.5 rounded outline-none resize-none" readonly></textarea>
+          <textarea id="asm-bitplane-output" class="w-full h-44 bg-studio-panel border border-studio-border text-white font-mono text-[11px] p-2.5 rounded-lg outline-none resize-none" readonly></textarea>
         </div>
       </div>
     </div>
@@ -136,7 +148,8 @@ export function createBitplaneStudio(): HTMLElement {
     const maxPlanes = parseInt(selectPlanes.value, 10);
     const interleaved = checkInterleaved.checked;
 
-    const res: BitplaneConvertResponse = await api.convertBitplanes(currentImageBytes, maxPlanes, interleaved);
+    const res = await api.convertBitplanes(currentImageBytes, maxPlanes, interleaved);
+    if (!res) return;
 
     resultSection.classList.remove('hidden');
 
@@ -168,11 +181,27 @@ export function createBitplaneStudio(): HTMLElement {
   container.querySelector('#btn-copy-copper')?.addEventListener('click', () => {
     const val = (container.querySelector('#asm-copper-output') as HTMLTextAreaElement).value;
     navigator.clipboard.writeText(val);
+    const btn = container.querySelector('#btn-copy-copper') as HTMLElement;
+    btn.textContent = '✅ Copied!';
+    setTimeout(() => (btn.textContent = '📋 Copy'), 1500);
   });
 
   container.querySelector('#btn-copy-bitplanes')?.addEventListener('click', () => {
     const val = (container.querySelector('#asm-bitplane-output') as HTMLTextAreaElement).value;
     navigator.clipboard.writeText(val);
+    const btn = container.querySelector('#btn-copy-bitplanes') as HTMLElement;
+    btn.textContent = '✅ Copied!';
+    setTimeout(() => (btn.textContent = '📋 Copy'), 1500);
+  });
+
+  container.querySelector('#btn-insert-copper')?.addEventListener('click', () => {
+    const val = (container.querySelector('#asm-copper-output') as HTMLTextAreaElement).value;
+    if (onInsertCode && val) onInsertCode(val);
+  });
+
+  container.querySelector('#btn-insert-bitplanes')?.addEventListener('click', () => {
+    const val = (container.querySelector('#asm-bitplane-output') as HTMLTextAreaElement).value;
+    if (onInsertCode && val) onInsertCode(val);
   });
 
   return container;

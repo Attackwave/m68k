@@ -1,3 +1,4 @@
+pub mod analysis;
 pub mod assembler;
 pub mod bitplane;
 pub mod copper;
@@ -6,3 +7,4 @@ pub mod emulator;
 pub mod floppy;
 pub mod lsp_bridge;
 pub mod project;
+pub mod workspace;

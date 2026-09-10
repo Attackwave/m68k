@@ -2,10 +2,36 @@
 @tailwind components;
 @tailwind utilities;
 
-/* Custom scrollbars */
+/* Root Browser Surface Polish */
+html, body {
+  background-color: #0F1117 !important;
+  color: #E2E8F0;
+}
+
+::selection {
+  background: rgba(59, 130, 246, 0.45);
+  color: #ffffff;
+}
+
+input, textarea, select {
+  caret-color: #3B82F6;
+}
+
+/* Tabular numbers for precision metrics & hex dumps */
+.font-mono, [class*="font-mono"], code, kbd {
+  font-variant-numeric: tabular-nums lining-nums;
+}
+
+/* Accessible focus rings */
+button:focus-visible, input:focus-visible, select:focus-visible {
+  outline: 2px solid #3B82F6;
+  outline-offset: 1px;
+}
+
+/* Custom Studio Scrollbars */
 ::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
+  width: 7px;
+  height: 7px;
 }
 
 ::-webkit-scrollbar-track {
@@ -21,9 +47,74 @@
   background: #3B82F6;
 }
 
-/* Monaco Editor tweaks */
+/* Monaco Editor Base Overrides & Dark Canvas */
+#monaco-editor-container,
+.monaco-editor,
+.monaco-editor-background,
+.monaco-editor .inputarea.ime-input {
+  background-color: #0F1117 !important;
+}
+
 .monaco-editor {
-  padding-top: 4px;
+  padding-top: 2px;
+}
+
+.monaco-editor .margin {
+  background-color: #0F1117 !important;
+}
+
+.monaco-editor .lines-content {
+  background-color: #0F1117 !important;
+}
+
+.monaco-editor .view-lines {
+  cursor: text !important;
+}
+
+/* Keyframe Micro-Animations */
+@keyframes fadeIn {
+  from {
+    opacity: 0;
+    transform: scale(0.985);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+.animate-fade-in {
+  animation: fadeIn 0.12s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+/* Motion Sensitivity (prefers-reduced-motion) */
+@media (prefers-reduced-motion: reduce) {
+  *, ::before, ::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  .animate-fade-in {
+    animation: none !important;
+    opacity: 1 !important;
+    transform: none !important;
+  }
+}
+
+/* Touch Device Optimization (pointer: coarse) */
+@media (pointer: coarse) {
+  button, select, input {
+    min-height: 36px;
+  }
+  .act-item {
+    width: 44px;
+    height: 44px;
+  }
+  .editor-tab {
+    padding-left: 12px;
+    padding-right: 12px;
+  }
 }
 
 /* Amiga retro theme mode */

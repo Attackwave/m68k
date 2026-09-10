@@ -16,6 +16,7 @@ fn test_assemble_code_success() {
         source: "    ORG $1000\nSTART:\n    moveq #10,d0\n    rts\n".to_string(),
         cpu: Some("68000".to_string()),
         base_address: Some(0x1000),
+        platform: None,
     };
 
     let res = assemble_code(req);
@@ -26,11 +27,27 @@ fn test_assemble_code_success() {
 }
 
 #[test]
+fn test_assemble_python_code_success() {
+    let req = AssembleRequest {
+        source: "def main():\n    custom.color00 = 0x0F80\n    return 0\n".to_string(),
+        cpu: Some("68000".to_string()),
+        base_address: None,
+        platform: Some("amiga".to_string()),
+    };
+
+    let res = assemble_code(req);
+    assert!(res.success);
+    assert!(res.byte_count >= 4);
+    assert!(res.generated_asm.is_some());
+}
+
+#[test]
 fn test_assemble_code_with_errors() {
     let req = AssembleRequest {
         source: "START:\n    UNKNOWN_OPCODE #1,d0\n".to_string(),
         cpu: Some("68000".to_string()),
         base_address: None,
+        platform: None,
     };
 
     let res = assemble_code(req);
@@ -149,4 +166,35 @@ fn test_bitplane_conversion() {
     assert!(res.total_bytes > 0);
     assert!(!res.palette_hex.is_empty());
     assert!(res.copper_palette_asm.contains("COLOR00"));
+}
+
+#[test]
+fn test_cycle_analysis() {
+    use m68k_ide::commands::analysis::{CycleAnalysisRequest, analyze_source_cycles};
+
+    let source = "
+    nop
+    rts
+    "
+    .to_string();
+
+    let res = analyze_source_cycles(CycleAnalysisRequest {
+        source,
+        cpu: Some("68000".to_string()),
+    });
+
+    assert_eq!(res.lines.len(), 2);
+    assert_eq!(res.total_min_cycles, 20); // 4 (nop) + 16 (rts)
+    assert!(res.pal_scanlines > 0.0);
+}
+
+#[test]
+fn test_hardware_register_database() {
+    use m68k_ide::commands::analysis::get_hardware_register_database;
+
+    let db = get_hardware_register_database();
+    assert!(!db.is_empty());
+    let dmacon = db.iter().find(|r| r.name.contains("DMACON"));
+    assert!(dmacon.is_some());
+    assert_eq!(dmacon.unwrap().address_hex, "$DFF096");
 }
