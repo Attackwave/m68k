@@ -488,6 +488,15 @@ fn parse_operand_text(
 
     // Addressing with displacement: (d16,An) or (d32,An)
     if let Some((disp, reg)) = parse_parens_disp_register(paren_text, symbols, current_pc) {
+        // A displacement that evaluates to 0 means the same thing as plain
+        // `(An)`, which needs no extension word — 2 bytes less. Source
+        // like `MOVE.L #x,OFF(A0)` with `OFF EQU 0` hits this whenever a
+        // struct field sits at offset 0. Only under `--optimize`: it
+        // changes the layout, and predictable addresses are exactly why
+        // optimization is off by default.
+        if disp == 0 && symbols.optimize_absolute() {
+            return Ok(Operand::AddrRegIndirect(reg));
+        }
         let is_long = !(-0x8000..=0x7FFF).contains(&disp);
         return Ok(Operand::AddrRegIndirectDisp(reg, disp, is_long));
     }
@@ -907,8 +916,18 @@ fn parse_minus_parens_register(text: &str) -> Option<u8> {
 /// prefix and are left untouched).
 fn split_disp_before_paren(text: &str) -> Option<String> {
     let trimmed = text.trim();
-    let paren_pos = trimmed.find('(')?;
-    if paren_pos == 0 || !trimmed.ends_with(')') {
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+    // Split at the paren that opens the *address* part — the last
+    // top-level `(` whose group runs to the end of the string — not at
+    // the first `(` anywhere. A displacement may be a parenthesized
+    // expression of its own (`(A*8)(A0)`, `A*(B-8)(A0)`), and taking the
+    // first paren read those as an empty displacement and rejected the
+    // operand, even though the same expression parses fine outside an
+    // addressing mode.
+    let paren_pos = address_paren_pos(trimmed)?;
+    if paren_pos == 0 {
         return None;
     }
     let disp = trimmed[..paren_pos].trim();
@@ -917,6 +936,29 @@ fn split_disp_before_paren(text: &str) -> Option<String> {
     }
     let inner = &trimmed[paren_pos + 1..trimmed.len() - 1];
     Some(format!("({},{})", disp, inner))
+}
+
+/// Byte offset of the `(` that opens the trailing parenthesized group of
+/// `text`, i.e. the address part of a `disp(An)` operand. Returns `None`
+/// if the parens are unbalanced.
+fn address_paren_pos(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    // Walk backwards from the closing paren: the matching `(` is where
+    // the depth returns to zero.
+    for (i, &b) in bytes.iter().enumerate().rev() {
+        match b {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_parens_disp_register(text: &str, symbols: &SymbolTable, pc: u32) -> Option<(i32, u8)> {
@@ -3782,6 +3824,29 @@ impl Assembler {
             .unwrap_or(BranchSize::Any);
 
         let disp = target as i32 - pc as i32 - 2;
+
+        // An explicit `.S`/`.B` is a promise about the encoding, not a
+        // request. Silently widening it to the word form desynced the
+        // layout: pass 1 budgeted 2 bytes from `branch_size_bytes`, the
+        // encoder emitted 4, and every symbol after the branch landed
+        // 2 bytes low — correct code with a wrong symbol table, which is
+        // far worse than a rejected build. vasm and Devpac reject this
+        // too. Unsuffixed branches are unaffected: they arrive as `Any`
+        // and are relaxed to a fitting size.
+        if size_hint == BranchSize::Short
+            && !is_dbcc_mnemonic(mnemonic)
+            && (!(-128..=127).contains(&disp) || disp == 0 || disp == -1)
+        {
+            return Err(AsmError::with_line(
+                format!(
+                    "{}.s target is out of range for a short branch \
+                     (displacement {disp}, limit -128..127 excluding 0 and -1); \
+                     drop the .s suffix or use .w",
+                    mnemonic
+                ),
+                line.line_no,
+            ));
+        }
 
         let words = match mnemonic {
             "bra" => self.encode_bra(disp, size_hint)?,
