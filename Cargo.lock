@@ -429,7 +429,7 @@ dependencies = [
 
 [[package]]
 name = "m68k-asm"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "m68k-core",
  "m68k-disasm",
@@ -439,7 +439,7 @@ dependencies = [
 
 [[package]]
 name = "m68k-cli"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "clap",
  "m68k-asm",
@@ -450,7 +450,7 @@ dependencies = [
 
 [[package]]
 name = "m68k-core"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "bitflags 2.13.2",
  "serde_json",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "m68k-disasm"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "hex",
  "m68k-core",
@@ -469,7 +469,7 @@ dependencies = [
 
 [[package]]
 name = "m68k-floppy"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "m68k-core",
  "thiserror",
@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "m68k-lsp"
-version = "2.2.0"
+version = "2.2.1"
 dependencies = [
  "clap",
  "m68k-asm",
