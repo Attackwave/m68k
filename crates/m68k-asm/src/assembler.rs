@@ -488,6 +488,15 @@ fn parse_operand_text(
 
     // Addressing with displacement: (d16,An) or (d32,An)
     if let Some((disp, reg)) = parse_parens_disp_register(paren_text, symbols, current_pc) {
+        // A displacement that evaluates to 0 means the same thing as plain
+        // `(An)`, which needs no extension word — 2 bytes less. Source
+        // like `MOVE.L #x,OFF(A0)` with `OFF EQU 0` hits this whenever a
+        // struct field sits at offset 0. Only under `--optimize`: it
+        // changes the layout, and predictable addresses are exactly why
+        // optimization is off by default.
+        if disp == 0 && symbols.optimize_absolute() {
+            return Ok(Operand::AddrRegIndirect(reg));
+        }
         let is_long = !(-0x8000..=0x7FFF).contains(&disp);
         return Ok(Operand::AddrRegIndirectDisp(reg, disp, is_long));
     }
@@ -907,8 +916,18 @@ fn parse_minus_parens_register(text: &str) -> Option<u8> {
 /// prefix and are left untouched).
 fn split_disp_before_paren(text: &str) -> Option<String> {
     let trimmed = text.trim();
-    let paren_pos = trimmed.find('(')?;
-    if paren_pos == 0 || !trimmed.ends_with(')') {
+    if !trimmed.ends_with(')') {
+        return None;
+    }
+    // Split at the paren that opens the *address* part — the last
+    // top-level `(` whose group runs to the end of the string — not at
+    // the first `(` anywhere. A displacement may be a parenthesized
+    // expression of its own (`(A*8)(A0)`, `A*(B-8)(A0)`), and taking the
+    // first paren read those as an empty displacement and rejected the
+    // operand, even though the same expression parses fine outside an
+    // addressing mode.
+    let paren_pos = address_paren_pos(trimmed)?;
+    if paren_pos == 0 {
         return None;
     }
     let disp = trimmed[..paren_pos].trim();
@@ -917,6 +936,29 @@ fn split_disp_before_paren(text: &str) -> Option<String> {
     }
     let inner = &trimmed[paren_pos + 1..trimmed.len() - 1];
     Some(format!("({},{})", disp, inner))
+}
+
+/// Byte offset of the `(` that opens the trailing parenthesized group of
+/// `text`, i.e. the address part of a `disp(An)` operand. Returns `None`
+/// if the parens are unbalanced.
+fn address_paren_pos(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut depth = 0i32;
+    // Walk backwards from the closing paren: the matching `(` is where
+    // the depth returns to zero.
+    for (i, &b) in bytes.iter().enumerate().rev() {
+        match b {
+            b')' => depth += 1,
+            b'(' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn parse_parens_disp_register(text: &str, symbols: &SymbolTable, pc: u32) -> Option<(i32, u8)> {
@@ -1919,6 +1961,15 @@ impl Assembler {
         self.cpu = cpu.to_string();
     }
 
+    /// The address the program starts at, as given to [`Self::new`] or
+    /// set by `ORG`.
+    ///
+    /// Needed to place output that contains only reservations, where
+    /// there is no first instruction to take a base address from.
+    pub fn origin(&self) -> u32 {
+        self.origin
+    }
+
     /// Location counter after the last assembled line.
     ///
     /// Needed to size binary output, since a trailing `DS`/`DCB` only
@@ -2445,6 +2496,11 @@ impl Assembler {
     /// Pass 1: Collect labels, build symbol table, estimate sizes.
     fn pass1(&mut self, lines: &[ParsedLine]) -> Result<(), AsmError> {
         self.pc = self.origin;
+        // Per-pass state, like `pc`: RS walks a struct from its base
+        // every time the source is walked. Leaving it where the previous
+        // pass stopped made pass 2 continue counting, so every field
+        // came out one whole struct further along.
+        self.rs_counter = 0;
         self.line_pcs.clear();
         self.conditional_stack.clear();
         self.current_global_label = None;
@@ -2542,14 +2598,18 @@ impl Assembler {
             }
 
             // Handle label (skip for directives that own their label:
-            // EQU/SET define a value, EQUR/REG define a register alias.
-            // Defining those as ordinary labels too would put them in the
-            // symbol table pointing at the current PC, which is both wrong
-            // and confusing in `--sym` output.)
+            // EQU/SET define a value, EQUR/REG define a register alias,
+            // RS assigns the struct offset it is tracking. Defining those
+            // as ordinary labels too would put them in the symbol table
+            // pointing at the current PC, which is both wrong and
+            // confusing in `--sym` output — and since the directive's own
+            // `define` then found the name already taken and silently
+            // gave up, every RS field came out as the current PC.
             if let Some(ref label) = line.label {
                 let is_equ_or_set = matches!(&line.line_type,
                     LineType::Directive { name, .. }
                     if name == "equ" || name == "set" || name == "equr" || name == "reg"
+                        || name == "rs"
                 );
                 if !is_equ_or_set {
                     let name = self.qualify_label(label);
@@ -2649,6 +2709,34 @@ impl Assembler {
     /// depends on a `SET` symbol whose value changed between passes, pass 1
     /// may have validated a different value, and `target % alignment` would
     /// divide by zero on an alignment of 0.
+    /// Element size and count of an `RS.<size> <count>` directive.
+    ///
+    /// `args[0]` is the size suffix and `args[1]` the count, the same
+    /// layout `build_directive_args` produces for `DS`. Both passes use
+    /// this so the struct offsets they compute cannot disagree.
+    /// An omitted suffix means word, matching `DS`; an omitted count
+    /// means one element, so `RS.B 0` (the idiom for "size of the struct
+    /// so far") still reserves nothing.
+    fn parse_rs_operands(&self, args: &[String], line_no: usize) -> Result<(u32, u32), AsmError> {
+        let element_size: u32 = match args.first().map(|s| s.as_str()).unwrap_or("w") {
+            "b" => 1,
+            "w" => 2,
+            "l" => 4,
+            other => {
+                return Err(AsmError::with_line(
+                    format!("RS has no size `{other}` (expected .b, .w or .l)"),
+                    line_no,
+                ));
+            }
+        };
+        let count = if args.len() > 1 {
+            evaluate_expr_str(&args[1], &self.symbols, self.pc)? as u32
+        } else {
+            1
+        };
+        Ok((element_size, count))
+    }
+
     fn cnop_padding(&self, args: &[String], line_no: usize) -> Result<u32, AsmError> {
         if args.len() < 2 {
             return Err(AsmError::with_line(
@@ -2867,15 +2955,21 @@ impl Assembler {
                 Ok(0)
             }
             "rs" => {
+                // `args[0]` is the size suffix, as for DS — evaluating it
+                // as the count made `RS.L 1` fail with "undefined symbol:
+                // l", and counting elements rather than bytes would have
+                // laid every field of a struct on top of its neighbour.
+                let (element_size, count) = self.parse_rs_operands(args, line_no)?;
                 if let Some(lbl) = label {
-                    self.symbols
-                        .define(lbl, self.rs_counter, Some(line_no))
-                        .ok();
+                    // Overwrite rather than define: the relaxation loop
+                    // runs this repeatedly, and `define` silently no-ops
+                    // on an existing name, freezing the offset.
+                    self.symbols.force_set(lbl, self.rs_counter, Some(line_no));
                 }
-                if !args.is_empty() {
-                    let count = evaluate_expr_str(&args[0], &self.symbols, self.pc)? as u32;
-                    self.rs_counter = self.rs_counter.wrapping_add(count);
-                }
+                let total = element_size
+                    .checked_mul(count)
+                    .ok_or_else(|| AsmError::with_line("RS size too large", line_no))?;
+                self.rs_counter = self.rs_counter.wrapping_add(total);
                 Ok(0)
             }
             "rsreset" => {
@@ -3110,6 +3204,7 @@ impl Assembler {
     fn recalculate_pcs(&mut self, lines: &[ParsedLine]) {
         self.line_pcs.clear();
         self.pc = self.origin;
+        self.rs_counter = 0;
         let mut cond_stack: Vec<bool> = Vec::new();
         // Rebuild the local-label scope from the top, as both passes do.
         self.current_global_label = None;
@@ -3168,9 +3263,13 @@ impl Assembler {
                 // got zeroes wherever it used one.
                 // EQUR/REG own their labels too — they name a register, not
                 // an address, and must not be entered as ordinary symbols.
+                // So does RS, whose label is a struct offset: this loop
+                // overwrites with `force_set`, so without the exemption it
+                // reset every RS field to the current PC on each pass.
                 let is_equ_or_set = matches!(&line.line_type,
                     LineType::Directive { name, .. }
                     if name == "equ" || name == "set" || name == "equr" || name == "reg"
+                        || name == "rs"
                 );
                 if let Some(ref label) = line.label
                     && !is_equ_or_set
@@ -3303,6 +3402,7 @@ impl Assembler {
     /// Pass 2: Encode all instructions with resolved symbols.
     fn pass2(&mut self, lines: &[ParsedLine]) -> Result<(), AsmError> {
         self.pc = self.origin;
+        self.rs_counter = 0;
         self.code.clear();
         self.conditional_stack.clear();
         // Local labels resolve against the enclosing global label, so the
@@ -3783,6 +3883,29 @@ impl Assembler {
 
         let disp = target as i32 - pc as i32 - 2;
 
+        // An explicit `.S`/`.B` is a promise about the encoding, not a
+        // request. Silently widening it to the word form desynced the
+        // layout: pass 1 budgeted 2 bytes from `branch_size_bytes`, the
+        // encoder emitted 4, and every symbol after the branch landed
+        // 2 bytes low — correct code with a wrong symbol table, which is
+        // far worse than a rejected build. vasm and Devpac reject this
+        // too. Unsuffixed branches are unaffected: they arrive as `Any`
+        // and are relaxed to a fitting size.
+        if size_hint == BranchSize::Short
+            && !is_dbcc_mnemonic(mnemonic)
+            && (!(-128..=127).contains(&disp) || disp == 0 || disp == -1)
+        {
+            return Err(AsmError::with_line(
+                format!(
+                    "{}.s target is out of range for a short branch \
+                     (displacement {disp}, limit -128..127 excluding 0 and -1); \
+                     drop the .s suffix or use .w",
+                    mnemonic
+                ),
+                line.line_no,
+            ));
+        }
+
         let words = match mnemonic {
             "bra" => self.encode_bra(disp, size_hint)?,
             "bsr" => self.encode_bsr(disp, size_hint)?,
@@ -4016,15 +4139,16 @@ impl Assembler {
                 Ok(())
             }
             "rs" => {
+                // Same operand layout as pass 1 — see `parse_rs_operands`.
+                let (element_size, count) = self.parse_rs_operands(args, line.line_no)?;
                 if let Some(lbl) = &line.label {
                     self.symbols
-                        .define(lbl, self.rs_counter, Some(line.line_no))
-                        .ok();
+                        .force_set(lbl, self.rs_counter, Some(line.line_no));
                 }
-                if !args.is_empty() {
-                    let count = evaluate_expr_str(&args[0], &self.symbols, self.pc)? as u32;
-                    self.rs_counter = self.rs_counter.wrapping_add(count);
-                }
+                let total = element_size
+                    .checked_mul(count)
+                    .ok_or_else(|| AsmError::with_line("RS size too large", line.line_no))?;
+                self.rs_counter = self.rs_counter.wrapping_add(total);
                 Ok(())
             }
             "rsreset" => {
