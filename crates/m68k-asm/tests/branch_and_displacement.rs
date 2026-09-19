@@ -218,3 +218,103 @@ OFF EQU 4
     assert_eq!(bytes.len(), 8, "displacement 4 still needs its word");
     assert_eq!(&bytes[6..8], &[0x00, 0x04]);
 }
+
+// --- Reservation-only source and RS struct offsets --------------------
+
+/// A source file holding nothing but `DS` reservations is a valid BSS
+/// file: it asks for a zero-filled image of the reserved size, but was
+/// rejected because no instruction existed to take a base address from.
+#[test]
+fn reservation_only_source_produces_a_zero_filled_image() {
+    let mut asm = Assembler::new(ORIGIN);
+    asm.set_cpu("68000");
+    asm.assemble("    ORG $8000\nv:  DS.L 1\nw:  DS.B 6\n")
+        .expect("a pure BSS source must assemble");
+
+    let (bytes, base) =
+        m68k_asm::output::generate_binary_from(&asm.code, Some(asm.end_pc()), Some(asm.origin()))
+            .expect("reservations must produce an image");
+
+    assert_eq!(base, ORIGIN);
+    assert_eq!(bytes.len(), 10, "DS.L 1 + DS.B 6 = 10 bytes");
+    assert!(bytes.iter().all(|&b| b == 0), "reserved space is zeroed");
+}
+
+/// A file that reserves nothing really is empty, and must stay an error
+/// — that guard catches accidentally empty sources.
+#[test]
+fn truly_empty_source_still_produces_nothing() {
+    let mut asm = Assembler::new(ORIGIN);
+    asm.set_cpu("68000");
+    asm.assemble("    ORG $8000\n").expect("must assemble");
+
+    assert!(
+        m68k_asm::output::generate_binary_from(&asm.code, Some(asm.end_pc()), Some(asm.origin()))
+            .is_none(),
+        "a source with neither code nor reservations has no image"
+    );
+}
+
+/// `RS` counts bytes from a struct base. `RS.L 1` failed outright with
+/// "undefined symbol: l" (the size suffix was evaluated as the count),
+/// and the labels resolved to the current PC instead of their offset.
+#[test]
+fn rs_directives_number_struct_fields_by_byte_offset() {
+    let source = "\
+        RSRESET
+TK_PC   RS.L 1
+TK_SR   RS.W 1
+TK_NAME RS.B 16
+TK_SIZE RS.B 0
+        ORG $8000
+        MOVE.W #TK_PC,D0
+";
+    let (_, symbols) = assemble_with_symbols(source, false).expect("RS must assemble");
+
+    assert_eq!(symbol(&symbols, "TK_PC"), Some(0));
+    assert_eq!(symbol(&symbols, "TK_SR"), Some(4), "after RS.L 1");
+    assert_eq!(symbol(&symbols, "TK_NAME"), Some(6), "after RS.W 1");
+    // RS.B 0 reserves nothing: the running total is the struct size.
+    assert_eq!(symbol(&symbols, "TK_SIZE"), Some(22), "after RS.B 16");
+}
+
+/// The offsets have to survive into an addressing mode, which is what
+/// they exist for.
+#[test]
+fn rs_offsets_work_as_displacements() {
+    let source = "\
+        RSRESET
+F_A     RS.L 1
+F_B     RS.W 1
+        ORG $8000
+        MOVE.L F_A(A0),D0
+        MOVE.W F_B(A0),D1
+";
+    let bytes = assemble(source).expect("RS offsets must address");
+    // move.l 0(a0),d0 then move.w 4(a0),d1
+    assert_eq!(&bytes[0..4], &[0x20, 0x28, 0x00, 0x00]);
+    assert_eq!(&bytes[4..8], &[0x32, 0x28, 0x00, 0x04]);
+}
+
+/// `RSSET` starts the counter somewhere other than zero.
+#[test]
+fn rsset_starts_the_counter_at_a_given_value() {
+    let source = "\
+        RSSET $10
+F1      RS.W 1
+F2      RS.L 1
+        ORG $8000
+        MOVE.W #F1,D0
+";
+    let (_, symbols) = assemble_with_symbols(source, false).expect("RSSET must assemble");
+    assert_eq!(symbol(&symbols, "F1"), Some(0x10));
+    assert_eq!(symbol(&symbols, "F2"), Some(0x12));
+}
+
+/// An unknown size on RS is a typo, not a word-sized default.
+#[test]
+fn rs_rejects_an_unknown_size_suffix() {
+    let err =
+        assemble("        RSRESET\nF   RS.Q 1\n").expect_err("RS.Q is not a size the 68k has");
+    assert!(err.to_lowercase().contains("size"), "got: {err}");
+}

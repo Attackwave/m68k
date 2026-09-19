@@ -8,7 +8,7 @@ use m68k_asm::amiga_hunk_writer::generate_hunk_exe;
 use m68k_asm::assembler::Assembler;
 use m68k_asm::ieee695::generate_ieee695_sections;
 use m68k_asm::output::{
-    OutputFormat, generate_binary_to, generate_elf_sections, generate_intel_hex, generate_srecord,
+    OutputFormat, generate_binary_from, generate_elf_sections, generate_intel_hex, generate_srecord,
 };
 
 #[derive(Parser, Debug)]
@@ -243,7 +243,7 @@ fn run(args: Args) -> Result<(), String> {
             const MAX_BINARY_SIZE: usize = 16 * 1024 * 1024; // 68k address space
             // Pass the final PC so a trailing DS/DCB reservation (which
             // emits no instruction) still sizes the image.
-            match generate_binary_to(&asm.code, Some(asm.end_pc())) {
+            match generate_binary_from(&asm.code, Some(asm.end_pc()), Some(asm.origin())) {
                 Some((bytes, _base_addr)) => {
                     if bytes.len() > MAX_BINARY_SIZE {
                         return Err(format!(

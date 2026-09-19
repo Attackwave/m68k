@@ -30,8 +30,31 @@ pub fn generate_binary_to(
     instructions: &[AssembledInstruction],
     end_pc: Option<u32>,
 ) -> Option<(Vec<u8>, u32)> {
+    generate_binary_from(instructions, end_pc, None)
+}
+
+/// Like [`generate_binary_to`], but `origin` supplies the base address
+/// when there are no instructions at all.
+///
+/// A source file holding nothing but `DS`/`DCB` reservations emits no
+/// instruction — it only advances the location counter — so there is no
+/// first instruction to take a base address from, and such a file was
+/// rejected as "no code generated" even though a zero-filled image of
+/// the reserved size is exactly what it asks for. A pure BSS file is
+/// valid input. A file that reserves nothing still returns `None`: there
+/// the emptiness is real, and the caller's error message is right.
+pub fn generate_binary_from(
+    instructions: &[AssembledInstruction],
+    end_pc: Option<u32>,
+    origin: Option<u32>,
+) -> Option<(Vec<u8>, u32)> {
     if instructions.is_empty() {
-        return None;
+        // Only reservations: size the image from origin..end_pc.
+        let (base, end) = (origin?, end_pc?);
+        return match end.checked_sub(base) {
+            Some(size) if size > 0 => Some((vec![0u8; size as usize], base)),
+            _ => None,
+        };
     }
 
     let base_addr = instructions[0].pc;
