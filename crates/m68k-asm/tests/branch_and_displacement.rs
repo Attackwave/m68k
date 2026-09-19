@@ -318,3 +318,139 @@ fn rs_rejects_an_unknown_size_suffix() {
         assemble("        RSRESET\nF   RS.Q 1\n").expect_err("RS.Q is not a size the 68k has");
     assert!(err.to_lowercase().contains("size"), "got: {err}");
 }
+
+// --- Absolute-short shortening range ---------------------------------
+
+/// Absolute short is sign-extended, so it reaches `$0000..$7FFF` and the
+/// top of the address space — not the unsigned `$0000..$FFFF`. Testing
+/// the unsigned range let `$8000..$FFFF` through as short, and the
+/// encoder then rejected the operand it had been handed: `--optimize`
+/// failed outright on any program based at `$8000`, rather than leaving
+/// the long form in place. Shortening is opportunistic.
+#[test]
+fn optimize_keeps_the_long_form_for_unreachable_addresses() {
+    let source = "\
+    ORG $8000
+    CLR.L v
+    LEA v,A0
+    MOVE.L v,D0
+v:  DC.L 0
+";
+    let (bytes, _) = assemble_with_symbols(source, true)
+        .expect("an address outside short range must keep the long form, not fail");
+
+    // clr.l, lea and move.l each in their long-absolute encoding.
+    assert_eq!(&bytes[0..2], &[0x42, 0xB9], "clr.l must stay long");
+    assert_eq!(&bytes[6..8], &[0x41, 0xF9], "lea must stay long");
+    assert_eq!(&bytes[12..14], &[0x20, 0x39], "move.l must stay long");
+}
+
+/// The whole range, in one place: what shortens and what does not.
+#[test]
+fn optimize_shortens_exactly_the_reachable_addresses() {
+    // The mode reaches the bottom and the top of memory. The top half
+    // has three spellings for the same location -- 24-bit ($FFFFF0, how
+    // Amiga sources write it), 32-bit ($FFFFFFF0) and negative -- and
+    // all of them must shorten.
+    const SHORT: [u32; 7] = [
+        0x0000_1000,
+        0x0000_7FFF,
+        0x00FF_8000,
+        0x00FF_FFF0,
+        0x00FF_FFFF,
+        0xFFFF_8000,
+        0xFFFF_FFF0,
+    ];
+    // $FF7FFF is one below the top half and genuinely unreachable --
+    // the off-by-one guard on that boundary. $DFF180 is the Amiga
+    // custom-chip base, which really does need the long form.
+    const LONG: [u32; 5] = [
+        0x0000_8000,
+        0x0000_FFFF,
+        0x0001_0000,
+        0x00FF_7FFF,
+        0x00DF_F180,
+    ];
+
+    for addr in SHORT {
+        let source = format!("    ORG $1000\n    CLR.L ${addr:08X}\n");
+        let (bytes, _) = assemble_with_symbols(&source, true)
+            .unwrap_or_else(|e| panic!("${addr:08X} must assemble: {e}"));
+        assert_eq!(
+            &bytes[0..2],
+            &[0x42, 0xB8],
+            "${addr:08X} is reachable and should shorten"
+        );
+    }
+
+    for addr in LONG {
+        let source = format!("    ORG $1000\n    CLR.L ${addr:08X}\n");
+        let (bytes, _) = assemble_with_symbols(&source, true)
+            .unwrap_or_else(|e| panic!("${addr:08X} must assemble: {e}"));
+        assert_eq!(
+            &bytes[0..2],
+            &[0x42, 0xB9],
+            "${addr:08X} is not reachable and must stay long"
+        );
+    }
+}
+
+/// The high half must survive the round trip: `$FFFF8000` and `-32768`
+/// name the same location and encode to the same extension word.
+#[test]
+fn high_addresses_shorten_to_a_sign_extended_word() {
+    let (bytes, _) =
+        assemble_with_symbols("    ORG $1000\n    CLR.L $FFFF8000\n", true).expect("must assemble");
+    assert_eq!(&bytes[0..4], &[0x42, 0xB8, 0x80, 0x00]);
+
+    let (top, _) =
+        assemble_with_symbols("    ORG $1000\n    CLR.L $FFFFFFFF\n", true).expect("must assemble");
+    assert_eq!(&top[0..4], &[0x42, 0xB8, 0xFF, 0xFF]);
+}
+
+/// Without `--optimize` nothing shortens, whatever the address.
+#[test]
+fn addresses_stay_long_without_optimize() {
+    let (bytes, _) =
+        assemble_with_symbols("    ORG $1000\n    CLR.L $1000\n", false).expect("must assemble");
+    assert_eq!(
+        &bytes[0..2],
+        &[0x42, 0xB9],
+        "no shortening without the flag"
+    );
+}
+
+/// The top of memory can be written 24-bit, 32-bit or negative, and all
+/// three name one location — so all three must produce the same short
+/// encoding. Only the 32-bit spelling shortened before, which made
+/// `$FFFFF0` silently cost two bytes more than `$FFFFFFF0`.
+#[test]
+fn every_spelling_of_a_high_address_encodes_the_same() {
+    let mut seen = Vec::new();
+    for spelling in ["$FFFFF0", "$FFFFFFF0", "-16"] {
+        let source = format!("    ORG $1000\n    CLR.L {spelling}\n");
+        let (bytes, _) = assemble_with_symbols(&source, true)
+            .unwrap_or_else(|e| panic!("{spelling} must assemble: {e}"));
+        seen.push(bytes[0..4].to_vec());
+    }
+    assert_eq!(seen[0], vec![0x42, 0xB8, 0xFF, 0xF0], "24-bit spelling");
+    assert_eq!(seen[0], seen[1], "24-bit and 32-bit must agree");
+    assert_eq!(seen[0], seen[2], "24-bit and negative must agree");
+}
+
+/// A shortened high address has to survive the round trip through the
+/// disassembler, or the saving costs correctness.
+#[test]
+fn a_shortened_high_address_round_trips() {
+    let (bytes, _) =
+        assemble_with_symbols("    ORG $1000\n    CLR.L $FFFFF0\n", true).expect("must assemble");
+
+    let mut dis = m68k_disasm::disassembler::Disassembler::new(bytes, 0x1000);
+    dis.set_cpu("68000");
+    let lines = dis.disassemble();
+    let text = lines[0].text.to_lowercase();
+
+    // Printed sign-extended to 32 bits, with the .w suffix that makes it
+    // reassemble to the same four bytes.
+    assert!(text.contains("$fffffff0.w"), "got: {text}");
+}
