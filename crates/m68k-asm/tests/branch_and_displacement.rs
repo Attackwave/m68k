@@ -348,9 +348,29 @@ v:  DC.L 0
 /// The whole range, in one place: what shortens and what does not.
 #[test]
 fn optimize_shortens_exactly_the_reachable_addresses() {
-    // (address, expected opword for `CLR.L <addr>`)
-    const SHORT: [u32; 3] = [0x0000_1000, 0x0000_7FFF, 0xFFFF_8000];
-    const LONG: [u32; 4] = [0x0000_8000, 0x0000_FFFF, 0x0001_0000, 0x00DF_F180];
+    // The mode reaches the bottom and the top of memory. The top half
+    // has three spellings for the same location -- 24-bit ($FFFFF0, how
+    // Amiga sources write it), 32-bit ($FFFFFFF0) and negative -- and
+    // all of them must shorten.
+    const SHORT: [u32; 7] = [
+        0x0000_1000,
+        0x0000_7FFF,
+        0x00FF_8000,
+        0x00FF_FFF0,
+        0x00FF_FFFF,
+        0xFFFF_8000,
+        0xFFFF_FFF0,
+    ];
+    // $FF7FFF is one below the top half and genuinely unreachable --
+    // the off-by-one guard on that boundary. $DFF180 is the Amiga
+    // custom-chip base, which really does need the long form.
+    const LONG: [u32; 5] = [
+        0x0000_8000,
+        0x0000_FFFF,
+        0x0001_0000,
+        0x00FF_7FFF,
+        0x00DF_F180,
+    ];
 
     for addr in SHORT {
         let source = format!("    ORG $1000\n    CLR.L ${addr:08X}\n");
@@ -398,4 +418,39 @@ fn addresses_stay_long_without_optimize() {
         &[0x42, 0xB9],
         "no shortening without the flag"
     );
+}
+
+/// The top of memory can be written 24-bit, 32-bit or negative, and all
+/// three name one location — so all three must produce the same short
+/// encoding. Only the 32-bit spelling shortened before, which made
+/// `$FFFFF0` silently cost two bytes more than `$FFFFFFF0`.
+#[test]
+fn every_spelling_of_a_high_address_encodes_the_same() {
+    let mut seen = Vec::new();
+    for spelling in ["$FFFFF0", "$FFFFFFF0", "-16"] {
+        let source = format!("    ORG $1000\n    CLR.L {spelling}\n");
+        let (bytes, _) = assemble_with_symbols(&source, true)
+            .unwrap_or_else(|e| panic!("{spelling} must assemble: {e}"));
+        seen.push(bytes[0..4].to_vec());
+    }
+    assert_eq!(seen[0], vec![0x42, 0xB8, 0xFF, 0xF0], "24-bit spelling");
+    assert_eq!(seen[0], seen[1], "24-bit and 32-bit must agree");
+    assert_eq!(seen[0], seen[2], "24-bit and negative must agree");
+}
+
+/// A shortened high address has to survive the round trip through the
+/// disassembler, or the saving costs correctness.
+#[test]
+fn a_shortened_high_address_round_trips() {
+    let (bytes, _) =
+        assemble_with_symbols("    ORG $1000\n    CLR.L $FFFFF0\n", true).expect("must assemble");
+
+    let mut dis = m68k_disasm::disassembler::Disassembler::new(bytes, 0x1000);
+    dis.set_cpu("68000");
+    let lines = dis.disassemble();
+    let text = lines[0].text.to_lowercase();
+
+    // Printed sign-extended to 32 bits, with the .w suffix that makes it
+    // reassemble to the same four bytes.
+    assert!(text.contains("$fffffff0.w"), "got: {text}");
 }
