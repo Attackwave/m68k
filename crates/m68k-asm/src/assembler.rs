@@ -582,8 +582,8 @@ fn parse_operand_text(
         && let Ok(value) = evaluate_expr_str(inner, symbols, current_pc)
     {
         return Ok(
-            if symbols.optimize_absolute() && (0..=0xFFFF).contains(&value) {
-                Operand::AbsoluteShort(value as i32)
+            if symbols.optimize_absolute() && fits_absolute_short(value) {
+                Operand::AbsoluteShort(absolute_short_value(value))
             } else {
                 Operand::AbsoluteLong(value as i32)
             },
@@ -602,8 +602,8 @@ fn parse_operand_text(
     if let Ok(value) = evaluate_expr_str(text, symbols, current_pc) {
         // Check if it looks like an absolute address (no register, no #)
         if !text.contains('(') && !text.contains(')') {
-            if symbols.optimize_absolute() && (0..=0xFFFF).contains(&value) {
-                return Ok(Operand::AbsoluteShort(value as i32));
+            if symbols.optimize_absolute() && fits_absolute_short(value) {
+                return Ok(Operand::AbsoluteShort(absolute_short_value(value)));
             } else {
                 return Ok(Operand::AbsoluteLong(value as i32));
             }
@@ -1449,6 +1449,51 @@ fn is_identifier(text: &str) -> bool {
         return false;
     }
     chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Whether `value` can be reached by the absolute-short addressing mode.
+///
+/// The extension word is **sign-extended** to 32 bits, so the mode
+/// reaches `$000000..$007FFF` and `$FF8000..$FFFFFF` — not the unsigned
+/// `$0000..$FFFF`. Testing the unsigned range let `$8000..$FFFF` through
+/// as short, and `encode_ea` then rejected the operand it had been
+/// handed: `--optimize` failed outright on a program based at `$8000`
+/// instead of leaving the long form in place. Shortening is
+/// opportunistic — what does not fit simply stays long, which is what
+/// vasm and Devpac do.
+fn fits_absolute_short(value: i64) -> bool {
+    // The test that covers every spelling: take the low word and sign-
+    // extend it back. If that reproduces the address, the short form
+    // addresses the same location.
+    //
+    // The high half reaches the top of memory and can be written three
+    // ways — `$FFFFFFF0` (32-bit), `$FFFFF0` (24-bit, the 68000's real
+    // bus width, and how Amiga sources spell it) and `-16`. Enumerating
+    // ranges instead caught only some of them: `$FFFFF0` stayed long
+    // while `$FFFFFFF0` shortened, though they name one location.
+    let fits = |bits: u32| -> bool {
+        let mask = if bits == 32 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        let masked = (value as u64) & mask;
+        let word = (masked & 0xFFFF) as u16;
+        // Sign-extend the word into the same width and compare.
+        ((word as i16 as i64) as u64) & mask == masked
+    };
+    // Negative values are already the sign-extended form.
+    (-32768..=32767).contains(&value) || fits(24) || fits(32)
+}
+
+/// The value to store in an `AbsoluteShort` operand for `value`.
+///
+/// Callers have already checked [`fits_absolute_short`]. The stored form
+/// is the sign-extended one (`$FFFFF0` and `$FFFFFFF0` both become
+/// `-16`), which is what `encode_ea` writes to the extension word and
+/// what the disassembler prints back.
+fn absolute_short_value(value: i64) -> i32 {
+    (value as u64 & 0xFFFF) as u16 as i16 as i32
 }
 
 /// Evaluate an expression string using the symbol table.
