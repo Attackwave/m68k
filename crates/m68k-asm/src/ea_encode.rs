@@ -71,6 +71,12 @@ pub fn encode_ea(
         }
         Operand::AbsoluteShort(addr) => {
             let (mode, reg) = (7, 0);
+            // The extension word is sign-extended to 32 bits, so this mode
+            // reaches the top of the address space as well as the bottom.
+            // `$FFFF8000` and `-32768` name the same location and must
+            // encode identically — which they already do here, since an
+            // address that high has wrapped to a negative `i32` by the
+            // time it arrives. The check only has to be signed.
             let a = *addr;
             if !(-32768..=32767).contains(&a) {
                 return Err(AsmError::new("absolute short address out of range"));

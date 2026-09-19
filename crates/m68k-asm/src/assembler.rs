@@ -582,7 +582,7 @@ fn parse_operand_text(
         && let Ok(value) = evaluate_expr_str(inner, symbols, current_pc)
     {
         return Ok(
-            if symbols.optimize_absolute() && (0..=0xFFFF).contains(&value) {
+            if symbols.optimize_absolute() && fits_absolute_short(value) {
                 Operand::AbsoluteShort(value as i32)
             } else {
                 Operand::AbsoluteLong(value as i32)
@@ -602,7 +602,7 @@ fn parse_operand_text(
     if let Ok(value) = evaluate_expr_str(text, symbols, current_pc) {
         // Check if it looks like an absolute address (no register, no #)
         if !text.contains('(') && !text.contains(')') {
-            if symbols.optimize_absolute() && (0..=0xFFFF).contains(&value) {
+            if symbols.optimize_absolute() && fits_absolute_short(value) {
                 return Ok(Operand::AbsoluteShort(value as i32));
             } else {
                 return Ok(Operand::AbsoluteLong(value as i32));
@@ -1449,6 +1449,26 @@ fn is_identifier(text: &str) -> bool {
         return false;
     }
     chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// Whether `value` can be reached by the absolute-short addressing mode.
+///
+/// The extension word is **sign-extended** to 32 bits, so the mode
+/// reaches `$000000..$007FFF` and `$FF8000..$FFFFFF` — not the unsigned
+/// `$0000..$FFFF`. Testing the unsigned range let `$8000..$FFFF` through
+/// as short, and `encode_ea` then rejected the operand it had been
+/// handed: `--optimize` failed outright on a program based at `$8000`
+/// instead of leaving the long form in place. Shortening is
+/// opportunistic — what does not fit simply stays long, which is what
+/// vasm and Devpac do.
+fn fits_absolute_short(value: i64) -> bool {
+    // Low half of the range, and the high half in both of its spellings:
+    // written out as `$FFFF8000..$FFFFFFFF`, or already negative. The
+    // disassembler prints this mode sign-extended to 32 bits, so
+    // `$FFFF8000` is the canonical spelling of the top of the range.
+    (0..=0x7FFF).contains(&value)
+        || (0xFFFF_8000..=0xFFFF_FFFF).contains(&value)
+        || (-32768..0).contains(&value)
 }
 
 /// Evaluate an expression string using the symbol table.

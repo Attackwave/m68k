@@ -318,3 +318,84 @@ fn rs_rejects_an_unknown_size_suffix() {
         assemble("        RSRESET\nF   RS.Q 1\n").expect_err("RS.Q is not a size the 68k has");
     assert!(err.to_lowercase().contains("size"), "got: {err}");
 }
+
+// --- Absolute-short shortening range ---------------------------------
+
+/// Absolute short is sign-extended, so it reaches `$0000..$7FFF` and the
+/// top of the address space — not the unsigned `$0000..$FFFF`. Testing
+/// the unsigned range let `$8000..$FFFF` through as short, and the
+/// encoder then rejected the operand it had been handed: `--optimize`
+/// failed outright on any program based at `$8000`, rather than leaving
+/// the long form in place. Shortening is opportunistic.
+#[test]
+fn optimize_keeps_the_long_form_for_unreachable_addresses() {
+    let source = "\
+    ORG $8000
+    CLR.L v
+    LEA v,A0
+    MOVE.L v,D0
+v:  DC.L 0
+";
+    let (bytes, _) = assemble_with_symbols(source, true)
+        .expect("an address outside short range must keep the long form, not fail");
+
+    // clr.l, lea and move.l each in their long-absolute encoding.
+    assert_eq!(&bytes[0..2], &[0x42, 0xB9], "clr.l must stay long");
+    assert_eq!(&bytes[6..8], &[0x41, 0xF9], "lea must stay long");
+    assert_eq!(&bytes[12..14], &[0x20, 0x39], "move.l must stay long");
+}
+
+/// The whole range, in one place: what shortens and what does not.
+#[test]
+fn optimize_shortens_exactly_the_reachable_addresses() {
+    // (address, expected opword for `CLR.L <addr>`)
+    const SHORT: [u32; 3] = [0x0000_1000, 0x0000_7FFF, 0xFFFF_8000];
+    const LONG: [u32; 4] = [0x0000_8000, 0x0000_FFFF, 0x0001_0000, 0x00DF_F180];
+
+    for addr in SHORT {
+        let source = format!("    ORG $1000\n    CLR.L ${addr:08X}\n");
+        let (bytes, _) = assemble_with_symbols(&source, true)
+            .unwrap_or_else(|e| panic!("${addr:08X} must assemble: {e}"));
+        assert_eq!(
+            &bytes[0..2],
+            &[0x42, 0xB8],
+            "${addr:08X} is reachable and should shorten"
+        );
+    }
+
+    for addr in LONG {
+        let source = format!("    ORG $1000\n    CLR.L ${addr:08X}\n");
+        let (bytes, _) = assemble_with_symbols(&source, true)
+            .unwrap_or_else(|e| panic!("${addr:08X} must assemble: {e}"));
+        assert_eq!(
+            &bytes[0..2],
+            &[0x42, 0xB9],
+            "${addr:08X} is not reachable and must stay long"
+        );
+    }
+}
+
+/// The high half must survive the round trip: `$FFFF8000` and `-32768`
+/// name the same location and encode to the same extension word.
+#[test]
+fn high_addresses_shorten_to_a_sign_extended_word() {
+    let (bytes, _) =
+        assemble_with_symbols("    ORG $1000\n    CLR.L $FFFF8000\n", true).expect("must assemble");
+    assert_eq!(&bytes[0..4], &[0x42, 0xB8, 0x80, 0x00]);
+
+    let (top, _) =
+        assemble_with_symbols("    ORG $1000\n    CLR.L $FFFFFFFF\n", true).expect("must assemble");
+    assert_eq!(&top[0..4], &[0x42, 0xB8, 0xFF, 0xFF]);
+}
+
+/// Without `--optimize` nothing shortens, whatever the address.
+#[test]
+fn addresses_stay_long_without_optimize() {
+    let (bytes, _) =
+        assemble_with_symbols("    ORG $1000\n    CLR.L $1000\n", false).expect("must assemble");
+    assert_eq!(
+        &bytes[0..2],
+        &[0x42, 0xB9],
+        "no shortening without the flag"
+    );
+}
