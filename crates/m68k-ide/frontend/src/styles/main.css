@@ -1,0 +1,35 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+
+::-webkit-scrollbar-track {
+  background: #161922;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2A2F3D;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3B82F6;
+}
+
+/* Monaco Editor tweaks */
+.monaco-editor {
+  padding-top: 4px;
+}
+
+/* Amiga retro theme mode */
+.theme-amiga {
+  --bg-primary: #0055AA;
+  --bg-secondary: #002255;
+  --text-main: #FFFFFF;
+  --accent: #FF8800;
+}

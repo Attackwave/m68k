@@ -12,3 +12,5 @@ spot/
 PLAN.md
 target/
 tmp/
+node_modules/
+dist/

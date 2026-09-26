@@ -6,6 +6,7 @@ members = [
     "crates/m68k-floppy",
     "crates/m68k-cli",
     "crates/m68k-lsp",
+    "crates/m68k-ide",
 ]
 resolver = "2"
 exclude = ["fuzz"]
