@@ -1520,17 +1520,14 @@ fn undefined_symbol_name(text: &str, symbols: &SymbolTable) -> Option<String> {
     }
 }
 
-/// Prefix a diagnostic with the file it happened in, when that is not
-/// the top-level source.
+/// An error at a known place in a known file, needing no translation.
 ///
-/// Used for errors raised during INCLUDE expansion, which carry a line
-/// number counted within the included file while the caller only knows
-/// the name of the file it was invoked with.
-fn in_file(message: impl Into<String>, file: Option<&str>) -> String {
-    let message = message.into();
+/// `file` is `None` for the top-level source, whose line numbers the
+/// caller resolves against the input name it already has.
+fn here(message: impl Into<String>, file: &Option<String>, line_no: usize) -> AsmError {
     match file {
-        Some(f) => format!("in {f}: {message}"),
-        None => message,
+        Some(f) => AsmError::at(message, f.clone(), line_no),
+        None => AsmError::with_line(message, line_no),
     }
 }
 
@@ -2754,19 +2751,12 @@ impl Assembler {
             let filename = args
                 .first()
                 .map(|a| strip_quotes(a).to_string())
-                .ok_or_else(|| {
-                    AsmError::with_line(
-                        in_file("INCLUDE requires a filename", current_file.as_deref()),
-                        idx + 1,
-                    )
-                })?;
-            // The line number here counts within the file being expanded,
-            // and the source map does not exist yet, so the file has to be
-            // named in the message or the reader is sent to the wrong one.
+                .ok_or_else(|| here("INCLUDE requires a filename", &current_file, idx + 1))?;
+            // These are raised while the file is still being expanded, so
+            // the line already counts within it and there is no source map
+            // to translate through yet. `here` marks the location final.
             let path = resolve_include_path_in(&filename, &self.source_root, &self.include_paths)
-                .map_err(|e| {
-                AsmError::with_line(in_file(e.message, current_file.as_deref()), idx + 1)
-            })?;
+                .map_err(|e| here(e.message, &current_file, idx + 1))?;
 
             // Already pulled in? Drop the directive and move on.
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
@@ -2775,8 +2765,9 @@ impl Assembler {
             }
 
             let content = std::fs::read_to_string(&path).map_err(|e| {
-                AsmError::with_line(
+                here(
                     format!("cannot read include '{}': {}", path.display(), e),
+                    &current_file,
                     idx + 1,
                 )
             })?;

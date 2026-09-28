@@ -564,3 +564,45 @@ fn a_macro_with_a_free_name_still_expands() {
         .expect("an ordinary macro must expand");
     assert_eq!(bytes, vec![0x4E, 0x71], "the body should be one NOP");
 }
+
+/// A missing include must name the file that asked for it and the line
+/// within *that* file. The error is raised while expansion is still
+/// running, so there is no source map yet — translating it as if there
+/// were one reported the outer file's line instead.
+#[test]
+fn a_missing_include_names_its_own_file_and_line() {
+    let dir = std::env::temp_dir().join("m68k_missing_include_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("a.s"), "; 1\n; 2\n    INCLUDE \"absent.i\"\n").unwrap();
+
+    let mut asm = Assembler::new(ORIGIN);
+    asm.set_cpu("68000");
+    asm.set_source_root(dir.clone());
+    let err = asm
+        .assemble("    ORG $1000\n    NOP\n    INCLUDE \"a.s\"\n    NOP\n")
+        .expect_err("the include is missing");
+
+    assert_eq!(
+        err.file.as_deref(),
+        Some("a.s"),
+        "the file that asked for it, not the top-level source"
+    );
+    assert_eq!(err.line_no, Some(3), "line 3 of a.s is the INCLUDE");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// At the top level there is no enclosing file, so the location stays
+/// relative to the source being assembled.
+#[test]
+fn a_missing_include_at_the_top_level_has_no_file_of_its_own() {
+    let mut asm = Assembler::new(ORIGIN);
+    asm.set_cpu("68000");
+    let err = asm
+        .assemble("    ORG $1000\n    NOP\n    NOP\n    INCLUDE \"absent.i\"\n")
+        .expect_err("the include is missing");
+
+    assert_eq!(err.file, None, "top level: the caller knows the name");
+    assert_eq!(err.line_no, Some(4));
+}

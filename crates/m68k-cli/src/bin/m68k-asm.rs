@@ -174,7 +174,16 @@ fn run(args: Args) -> Result<(), String> {
     // assembler carries refers to the expanded text, not to any file a
     // reader can open.
     if let Err(e) = asm.assemble_bytes(&source) {
-        let where_ = source_location(&asm, e.line_no, &input_name);
+        // An error that already names its file was raised before the
+        // source map existed; its line counts within that file and must
+        // not be translated again.
+        let where_ = match &e.file {
+            Some(file) => match e.line_no {
+                Some(line) => format!("{file}:{line}"),
+                None => file.clone(),
+            },
+            None => source_location(&asm, e.line_no, &input_name),
+        };
         return Err(format!("{}: {}", where_, e.message));
     }
 
