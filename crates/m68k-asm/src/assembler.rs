@@ -306,6 +306,29 @@ pub enum BranchSize {
     Long,
 }
 
+/// Where a line of the expanded source originally came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SourceOrigin {
+    /// The file the line was written in, as it was named in the
+    /// `INCLUDE` (or `None` for the top-level source).
+    pub file: Option<String>,
+    /// 1-based line number within that file.
+    pub line: usize,
+    /// Name of the macro this line was expanded from, when it did not
+    /// come straight from the file.
+    pub macro_name: Option<String>,
+}
+
+impl SourceOrigin {
+    fn top_level(line: usize) -> Self {
+        Self {
+            file: None,
+            line,
+            macro_name: None,
+        }
+    }
+}
+
 /// Information about a branch that may need relaxation.
 #[derive(Debug, Clone)]
 pub struct BranchInfo {
@@ -508,6 +531,16 @@ fn parse_operand_text(
         return Ok(Operand::AddrRegIndirectIndex(
             an, xn, disp, scale, xn_is_long,
         ));
+    }
+    // It parses as the indexed form but the displacement does not fit the
+    // brief format's 8-bit field. Say so, rather than falling through to
+    // "cannot parse operand", which sends the reader looking at the
+    // syntax instead of the value. The PC-relative variant has always
+    // reported this correctly; this is the register-based counterpart.
+    if let Some(disp) = indexed_displacement_out_of_range(paren_text, symbols, current_pc) {
+        return Err(AsmError::new(format!(
+            "indexed displacement {disp} out of range (brief format is 8-bit, -128..127)"
+        )));
     }
 
     // Indexed with the base register suppressed: `(bd,Xn.size*scale)`, and
@@ -1123,13 +1156,43 @@ fn parse_parens_disp_reg_index(
             if let Some(reg) = parse_register(&xn_name)
                 && let Some(xn) = index_reg_num(&reg)
             {
+                // Masking to 8 bits here would turn an out-of-range
+                // displacement into a different, valid instruction:
+                // `316(A0,D2.L)` became `$3C(A0,D2.L)`, reading 316 bytes
+                // away from where the source said. The narrowing is kept
+                // (the brief format's field really is 8-bit) but only for
+                // values that fit; the caller rejects the rest.
                 let disp = evaluate_displacement(disp_str, symbols, pc);
-                let disp_i8 = (disp & 0xFF) as i8;
-                return Some((an, xn, disp_i8, scale, is_long));
+                if !(-128..=127).contains(&disp) {
+                    return None;
+                }
+                return Some((an, xn, disp as i8, scale, is_long));
             }
         }
     }
     None
+}
+
+/// The displacement of an `(d,An,Xn)` operand whose value does not fit
+/// the brief format's 8-bit field, or `None` if `text` is not that form
+/// or the displacement fits.
+///
+/// Mirrors [`parse_parens_disp_reg_index`]'s shape check so the two
+/// cannot disagree about what counts as the indexed form.
+fn indexed_displacement_out_of_range(text: &str, symbols: &SymbolTable, pc: u32) -> Option<i32> {
+    let trimmed = text.trim();
+    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').collect();
+    if parts.len() < 3 {
+        return None;
+    }
+    if !matches!(parse_register(parts[1].trim()), Some(Operand::AddrReg(_))) {
+        return None;
+    }
+    let (xn_name, _, _) = parse_index_reg_and_scale(parts[2].trim());
+    index_reg_num(&parse_register(&xn_name)?)?;
+    let disp = evaluate_displacement(parts[0].trim(), symbols, pc);
+    (!(-128..=127).contains(&disp)).then_some(disp)
 }
 
 /// Parse 68020+ memory indirect / full format EA syntax:
@@ -1438,6 +1501,39 @@ fn evaluate_displacement(text: &str, symbols: &SymbolTable, pc: u32) -> i32 {
         .unwrap_or(0)
 }
 
+/// The symbol name `text` refers to, if it is a bare identifier that has
+/// no defined value — otherwise `None`.
+///
+/// Used in pass 2 to tell a genuine undefined symbol from the cases that
+/// legitimately look like one: a register alias, a defined label, and
+/// anything that is not a plain identifier at all.
+fn undefined_symbol_name(text: &str, symbols: &SymbolTable) -> Option<String> {
+    let text = text.trim();
+    if !is_identifier(text) {
+        return None;
+    }
+    // Local labels are stored under their qualified name.
+    let name = symbols.resolve_name(text);
+    match symbols.get(&name) {
+        Some(entry) if entry.defined => None,
+        _ => Some(text.to_string()),
+    }
+}
+
+/// Prefix a diagnostic with the file it happened in, when that is not
+/// the top-level source.
+///
+/// Used for errors raised during INCLUDE expansion, which carry a line
+/// number counted within the included file while the caller only knows
+/// the name of the file it was invoked with.
+fn in_file(message: impl Into<String>, file: Option<&str>) -> String {
+    let message = message.into();
+    match file {
+        Some(f) => format!("in {f}: {message}"),
+        None => message,
+    }
+}
+
 /// Check if text is a valid identifier.
 fn is_identifier(text: &str) -> bool {
     if text.is_empty() {
@@ -1702,6 +1798,16 @@ pub struct Assembler {
     /// Extra directories searched for `INCLUDE` files (the `-I` paths),
     /// tried after the including file's own directory.
     pub include_paths: Vec<PathBuf>,
+    /// Where each line of the expanded source came from.
+    ///
+    /// `INCLUDE` splices whole files in and macros expand to several
+    /// lines each, so a line number in the text the parser sees is not
+    /// the line number anyone can look up. Without this map an error in
+    /// an include was reported against the top-level file, and every
+    /// error after a macro call was off by the body's length — enough to
+    /// make a "jump to the error" tool point at the wrong line.
+    /// Indexed by expanded line number minus one.
+    source_map: Vec<SourceOrigin>,
     /// Results of `IFD`/`IFND` as decided in pass 1, keyed by source line.
     ///
     /// These test whether a symbol is *defined yet*, which is inherently
@@ -1843,6 +1949,7 @@ impl Assembler {
             line_pcs: Vec::new(),
             source_root: PathBuf::from("."),
             include_paths: Vec::new(),
+            source_map: Vec::new(),
             conditional_results: HashMap::new(),
             register_aliases: HashMap::new(),
             included_files: std::collections::HashSet::new(),
@@ -2006,6 +2113,73 @@ impl Assembler {
         self.cpu = cpu.to_string();
     }
 
+    /// Warn about immediates that encode cleanly but almost certainly do
+    /// not mean what the source says.
+    ///
+    /// Neither case is an error — both are valid bit patterns the CPU
+    /// will execute — so the build continues. They are flagged because
+    /// the value that arrives is not the value that was written, and
+    /// nothing else in the output shows that.
+    fn warn_suspicious_immediate(
+        &mut self,
+        mnemonic: &str,
+        src: Option<&Operand>,
+        dst: Option<&Operand>,
+        line_no: usize,
+    ) {
+        match mnemonic {
+            // MOVEQ sign-extends its byte: `#200` loads -56, not 200.
+            // Writing it as `#-56` (or using MOVE.L) says what happens.
+            "MOVEQ" => {
+                if let Some(Operand::Immediate(v)) = src
+                    && (128..=255).contains(v)
+                {
+                    self.errors.warning(
+                        format!(
+                            "MOVEQ #{v} loads {} — the operand is sign-extended from 8 bits; \
+                             write #{} or use MOVE.L to load {v}",
+                            *v as u8 as i8, *v as u8 as i8
+                        ),
+                        Some(line_no),
+                    );
+                }
+            }
+            // The bit number is taken modulo the operand width: 32 for a
+            // data register, 8 for memory. A larger number silently wraps
+            // to a different bit.
+            "BTST" | "BSET" | "BCLR" | "BCHG" => {
+                if let Some(Operand::Immediate(bit)) = src {
+                    let (width, what) = match dst {
+                        Some(Operand::DataReg(_)) => (32, "a data register"),
+                        Some(_) => (8, "a memory operand"),
+                        None => return,
+                    };
+                    if *bit >= width {
+                        self.errors.warning(
+                            format!(
+                                "{mnemonic} #{bit} on {what} tests bit {} — the bit number is \
+                                 taken modulo {width}",
+                                bit % width
+                            ),
+                            Some(line_no),
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Where a line of the expanded source was originally written.
+    ///
+    /// `line_no` is the 1-based number the parser and every diagnostic
+    /// use; the result names the file and line a reader can open. Returns
+    /// `None` when there is no map (nothing was expanded), in which case
+    /// the number already refers to the top-level file.
+    pub fn source_origin(&self, line_no: usize) -> Option<&SourceOrigin> {
+        self.source_map.get(line_no.checked_sub(1)?)
+    }
+
     /// The address the program starts at, as given to [`Self::new`] or
     /// set by `ORG`.
     ///
@@ -2134,6 +2308,11 @@ impl Assembler {
         let mut output = Vec::new();
         let lines: Vec<&str> = source.lines().collect();
         let mut i = 0;
+        // For every line pushed to `output`, which input line it came
+        // from, plus the macro it was expanded out of. Composed with the
+        // running source map at the end of the pass so the origin
+        // survives however many expansion rounds it takes.
+        let mut trace: Vec<(usize, Option<String>)> = Vec::new();
 
         while i < lines.len() {
             let raw = lines[i];
@@ -2152,6 +2331,21 @@ impl Assembler {
                 if i < lines.len() {
                     i += 1; // skip ENDM
                 }
+                // A macro named like a directive can never be invoked:
+                // the expansion check below skips anything that parses as
+                // a directive, so `DATA MACRO ... ENDM` was stored and
+                // then silently ignored at every call site, assembling to
+                // nothing at all. Say so where the name is chosen.
+                if is_directive_name(&mname.to_lowercase()) {
+                    self.errors.error(
+                        format!(
+                            "macro name '{mname}' clashes with the directive of the same name \
+                             and could never be invoked — choose another name"
+                        ),
+                        Some(i),
+                    );
+                    continue;
+                }
                 self.macro_definitions
                     .entry(mname.to_lowercase())
                     .and_modify(|def| {
@@ -2169,6 +2363,7 @@ impl Assembler {
             // Check for ENDM (standalone)
             if mnemonic1 == "endm" {
                 output.push(raw.to_string());
+                trace.push((i, None));
                 i += 1;
                 continue;
             }
@@ -2176,6 +2371,7 @@ impl Assembler {
             // Check for ENDR (standalone outside REPT/IRP/IRPC)
             if mnemonic1 == "endr" {
                 output.push(raw.to_string());
+                trace.push((i, None));
                 i += 1;
                 continue;
             }
@@ -2204,6 +2400,7 @@ impl Assembler {
                                     Some(i + 1),
                                 );
                                 output.push(raw.to_string());
+                                trace.push((i, None));
                                 i += 1;
                                 continue;
                             }
@@ -2234,6 +2431,7 @@ impl Assembler {
 
                 if let Some(ref lbl) = lbl1 {
                     output.push(format!("{} EQU $", lbl));
+                    trace.push((i, None));
                 }
 
                 for _ in 0..count {
@@ -2272,12 +2470,14 @@ impl Assembler {
 
                 if let Some(ref lbl) = lbl1 {
                     output.push(format!("{} EQU $", lbl));
+                    trace.push((i, None));
                 }
 
                 let key = format!("\\{}", param_name);
                 for value in &values {
                     for line in &body {
                         output.push(line.replace(&key, value));
+                        trace.push((i, None));
                     }
                 }
                 continue;
@@ -2313,12 +2513,14 @@ impl Assembler {
 
                 if let Some(ref lbl) = lbl1 {
                     output.push(format!("{} EQU $", lbl));
+                    trace.push((i, None));
                 }
 
                 let key = format!("\\{}", param_name);
                 for ch in &chars {
                     for line in &body {
                         output.push(line.replace(&key, &ch.to_string()));
+                        trace.push((i, None));
                     }
                 }
                 continue;
@@ -2332,6 +2534,7 @@ impl Assembler {
                 && let Some(def) = self.macro_definitions.get(&mnemonic1.to_lowercase())
             {
                 // Expand macro
+                let mname_key = mnemonic1.to_lowercase();
                 any_macro_invoked = true;
                 self.macro_unique_counter += 1;
                 let unique_id = self.macro_unique_counter;
@@ -2372,6 +2575,7 @@ impl Assembler {
                 // Label on invocation line becomes an EQU
                 if let Some(ref lbl) = lbl1 {
                     output.push(format!("{} EQU $", lbl));
+                    trace.push((i, None));
                 }
 
                 // Expand each body line (MEXIT/EXITM stops expansion)
@@ -2385,6 +2589,9 @@ impl Assembler {
                         break;
                     }
                     output.push(expanded);
+                    // Every expanded line points back at the invocation,
+                    // which is the line a reader can actually navigate to.
+                    trace.push((i, Some(mname_key.clone())));
                 }
 
                 i += 1;
@@ -2397,7 +2604,29 @@ impl Assembler {
             }
 
             output.push(raw.to_string());
+            trace.push((i, None));
             i += 1;
+        }
+
+        // Compose this pass's trace with the map built so far, so an
+        // origin survives however many expansion rounds a source needs.
+        if !self.source_map.is_empty() {
+            let previous = std::mem::take(&mut self.source_map);
+            self.source_map = trace
+                .iter()
+                .map(|(input_line, macro_name)| {
+                    let mut origin = previous
+                        .get(*input_line)
+                        .cloned()
+                        .unwrap_or_else(|| SourceOrigin::top_level(*input_line + 1));
+                    // The innermost macro wins: it is the one whose body
+                    // the line is actually in.
+                    if origin.macro_name.is_none() {
+                        origin.macro_name = macro_name.clone();
+                    }
+                    origin
+                })
+                .collect();
         }
 
         (output.join("\n"), any_macro_invoked)
@@ -2409,7 +2638,8 @@ impl Assembler {
         // macros, constants and structures the rest of the source uses,
         // so it has to be in place before macro expansion and parsing.
         self.included_files.clear();
-        let included = self.expand_includes(source, 0)?;
+        self.source_map.clear();
+        let included = self.expand_includes(source, 0, None)?;
         let expanded = self.macro_preprocess(&included);
         let parsed = parse_source(&expanded);
 
@@ -2428,7 +2658,8 @@ impl Assembler {
     /// Test/diagnostic hook: run include + macro expansion only.
     pub fn debug_expand(&mut self, source: &str) -> Result<String, AsmError> {
         self.included_files.clear();
-        let included = self.expand_includes(source, 0)?;
+        self.source_map.clear();
+        let included = self.expand_includes(source, 0, None)?;
         Ok(self.macro_preprocess(&included))
     }
 
@@ -2446,7 +2677,12 @@ impl Assembler {
     /// text would be spliced in repeatedly and the second copy's `EQU`s
     /// would collide ("symbol 'LN' already defined"). Including once has
     /// the same net effect the guards are written to achieve.
-    fn expand_includes(&mut self, source: &str, depth: usize) -> Result<String, AsmError> {
+    fn expand_includes(
+        &mut self,
+        source: &str,
+        depth: usize,
+        current_file: Option<String>,
+    ) -> Result<String, AsmError> {
         const MAX_INCLUDE_DEPTH: usize = 64;
 
         // INCDIR has to be handled here rather than in pass 1: includes are
@@ -2457,6 +2693,16 @@ impl Assembler {
             .lines()
             .any(|l| matches!(split_line(l).1.as_str(), "include" | "incdir"))
         {
+            // Nothing to splice, but the lines still have to reach the
+            // source map — this is the path every included file takes
+            // once its own nested includes are done, and skipping it left
+            // the included lines with no recorded origin at all.
+            self.source_map
+                .extend((1..=source.lines().count()).map(|line| SourceOrigin {
+                    file: current_file.clone(),
+                    line,
+                    macro_name: None,
+                }));
             return Ok(source.to_string());
         }
         if depth >= MAX_INCLUDE_DEPTH {
@@ -2468,6 +2714,13 @@ impl Assembler {
 
         let mut out = String::with_capacity(source.len());
         for (idx, raw) in source.lines().enumerate() {
+            // Record where this line came from before any branch below
+            // may splice other content in its place.
+            let origin = SourceOrigin {
+                file: current_file.clone(),
+                line: idx + 1,
+                macro_name: None,
+            };
             let (_, mnemonic, size, operands) = split_line(raw);
             if mnemonic == "incdir" {
                 // Register the search path and keep the line: pass 1 sees it
@@ -2487,11 +2740,13 @@ impl Assembler {
                 }
                 out.push_str(raw);
                 out.push('\n');
+                self.source_map.push(origin);
                 continue;
             }
             if mnemonic != "include" {
                 out.push_str(raw);
                 out.push('\n');
+                self.source_map.push(origin);
                 continue;
             }
 
@@ -2499,9 +2754,19 @@ impl Assembler {
             let filename = args
                 .first()
                 .map(|a| strip_quotes(a).to_string())
-                .ok_or_else(|| AsmError::with_line("INCLUDE requires a filename", idx + 1))?;
+                .ok_or_else(|| {
+                    AsmError::with_line(
+                        in_file("INCLUDE requires a filename", current_file.as_deref()),
+                        idx + 1,
+                    )
+                })?;
+            // The line number here counts within the file being expanded,
+            // and the source map does not exist yet, so the file has to be
+            // named in the message or the reader is sent to the wrong one.
             let path = resolve_include_path_in(&filename, &self.source_root, &self.include_paths)
-                .map_err(|e| AsmError::with_line(e.message, idx + 1))?;
+                .map_err(|e| {
+                AsmError::with_line(in_file(e.message, current_file.as_deref()), idx + 1)
+            })?;
 
             // Already pulled in? Drop the directive and move on.
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
@@ -2523,7 +2788,7 @@ impl Assembler {
             if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
                 self.source_root = parent.to_path_buf();
             }
-            let nested = self.expand_includes(&content, depth + 1);
+            let nested = self.expand_includes(&content, depth + 1, Some(filename.clone()));
             self.source_root = saved_root;
 
             out.push_str(&nested?);
@@ -3614,7 +3879,20 @@ impl Assembler {
         // encoding actually fails, since the branch paths below legitimately
         // work with an unparsed operand.
         let mut operand_error: Option<AsmError> = None;
-        let mut parse_operand = |text: &str| match parse_operand_text(text, &self.symbols, pc) {
+        let symbols = &self.symbols;
+        let mut parse_operand = |text: &str| match parse_operand_text(text, symbols, pc) {
+            // `parse_operand_text` answers a bare identifier with the
+            // placeholder `Address(0)` so pass 1 can size a forward
+            // reference before the symbol is known. By pass 2 every
+            // symbol is known, so a placeholder that is still here names
+            // something that was never defined — a typo. Letting it
+            // through assembled `JSR tippfehler` to `jsr $0.w` with exit
+            // status 0: working output for a program that cannot run.
+            Ok(Operand::Address(0)) if undefined_symbol_name(text, symbols).is_some() => {
+                let name = undefined_symbol_name(text, symbols).unwrap();
+                operand_error.get_or_insert(AsmError::new(format!("undefined symbol: {name}")));
+                None
+            }
             Ok(op) => Some(op),
             Err(e) => {
                 operand_error.get_or_insert(e);
@@ -3864,21 +4142,29 @@ impl Assembler {
                 crate::enc_fpu::enc_fmove(&s, &d, size, Some(kfactor), pc + 2, &self.cpu)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?
             }
-            _ => encode_instruction(
-                &mnemonic_upper,
-                size,
-                src.as_ref(),
-                dst.as_ref(),
-                pc,
-                &self.cpu,
-            )
-            .map_err(|e| {
-                // If an operand failed to parse, that is the real cause;
-                // the encoder only sees a missing operand and reports the
-                // instruction's shape, which points at the wrong thing.
-                let cause = operand_error.take().unwrap_or(e);
-                AsmError::with_line(cause.message, line.line_no)
-            })?,
+            _ => {
+                self.warn_suspicious_immediate(
+                    &mnemonic_upper,
+                    src.as_ref(),
+                    dst.as_ref(),
+                    line.line_no,
+                );
+                encode_instruction(
+                    &mnemonic_upper,
+                    size,
+                    src.as_ref(),
+                    dst.as_ref(),
+                    pc,
+                    &self.cpu,
+                )
+                .map_err(|e| {
+                    // If an operand failed to parse, that is the real cause;
+                    // the encoder only sees a missing operand and reports the
+                    // instruction's shape, which points at the wrong thing.
+                    let cause = operand_error.take().unwrap_or(e);
+                    AsmError::with_line(cause.message, line.line_no)
+                })?
+            }
         };
         let word_count = words.len();
 

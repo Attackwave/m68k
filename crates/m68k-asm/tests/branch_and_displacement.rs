@@ -454,3 +454,113 @@ fn a_shortened_high_address_round_trips() {
     // reassemble to the same four bytes.
     assert!(text.contains("$fffffff0.w"), "got: {text}");
 }
+
+// --- Silent truncation and misleading locations ----------------------
+
+/// A bare identifier that never gets defined is a typo. It used to
+/// assemble to address 0 with exit status 0 — `JSR tippfehler` became
+/// `jsr $0.w`, working output for a program that cannot run.
+#[test]
+fn undefined_symbols_are_rejected_rather_than_assembled_as_zero() {
+    for source in [
+        "    ORG $1000\n    JSR nothere\n",
+        "    ORG $1000\n    MOVE.L nothere,D0\n",
+    ] {
+        let err = assemble(source).expect_err("an undefined symbol must fail the build");
+        assert!(
+            err.contains("undefined symbol") && err.contains("nothere"),
+            "error should name the missing symbol, got: {err}"
+        );
+    }
+}
+
+/// A forward reference is not an undefined symbol — the check must not
+/// catch the ordinary case of using a label before defining it.
+#[test]
+fn forward_references_still_assemble() {
+    assemble("    ORG $1000\n    BRA later\n    NOP\nlater:\n    RTS\n")
+        .expect("a forward reference is legitimate");
+}
+
+/// The brief-format index displacement is 8 bits. Masking an oversized
+/// value into it silently addressed a different location: `316(A0,D2.L)`
+/// read 316 bytes away from where the source said.
+#[test]
+fn oversized_index_displacement_is_rejected() {
+    for disp in ["316", "-200", "128", "-129"] {
+        let source = format!("    ORG $1000\n    MOVE.L {disp}(A0,D2.L),D0\n");
+        assert!(
+            assemble(&source).is_err(),
+            "{disp} does not fit 8 bits and must be rejected"
+        );
+    }
+}
+
+/// The values that do fit must keep working, including the boundaries.
+#[test]
+fn index_displacement_boundaries_still_assemble() {
+    for disp in ["127", "-128", "0"] {
+        let source = format!("    ORG $1000\n    MOVE.L {disp}(A0,D2.L),D0\n");
+        assemble(&source).unwrap_or_else(|e| panic!("{disp} fits 8 bits: {e}"));
+    }
+}
+
+/// ANDI/ORI/EORI/CMPI/ADDI/SUBI each masked their immediate into place
+/// without a range check, so `ANDI.B #300,D0` assembled to `#$2C` and
+/// reported success. `MOVE.B #300` already rejected the same value.
+#[test]
+fn oversized_immediates_are_rejected_in_the_immediate_family() {
+    for mnemonic in ["ANDI", "ORI", "EORI", "CMPI", "ADDI", "SUBI"] {
+        let source = format!("    ORG $1000\n    {mnemonic}.B #300,D0\n");
+        let err = assemble(&source).expect_err(&format!("{mnemonic}.B #300 does not fit a byte"));
+        assert!(
+            err.contains("out of range"),
+            "{mnemonic}: error should name the range, got: {err}"
+        );
+    }
+    assemble("    ORG $1000\n    ANDI.W #$10000,D0\n")
+        .expect_err("a word immediate above $FFFF must be rejected");
+}
+
+/// Both spellings of a byte's bit pattern stay valid — `#$FF` and `#-1`
+/// mean one thing here, and rejecting either would break real sources.
+#[test]
+fn immediate_family_accepts_both_signs_of_the_same_pattern() {
+    for source in [
+        "    ORG $1000\n    ANDI.B #$FF,D0\n",
+        "    ORG $1000\n    ANDI.B #-1,D0\n",
+        "    ORG $1000\n    CMPI.W #$FFFF,D0\n",
+        "    ORG $1000\n    CMPI.W #-32768,D0\n",
+    ] {
+        assemble(source).unwrap_or_else(|e| panic!("{source:?} is a valid immediate: {e}"));
+    }
+}
+
+/// A macro named like a directive can never be invoked: the expansion
+/// check skips anything that parses as a directive, so the definition
+/// was stored and then silently ignored at every call site.
+#[test]
+fn a_macro_named_like_a_directive_is_rejected() {
+    let mut asm = Assembler::new(ORIGIN);
+    asm.set_cpu("68000");
+    let _ = asm.assemble("DATA MACRO\n    DC.W $1234\n    ENDM\n    ORG $1000\n    DATA\n");
+    let reported: String = asm
+        .errors
+        .errors
+        .iter()
+        .map(|d| d.message.to_lowercase())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        reported.contains("clash") || reported.contains("directive"),
+        "the name conflict must be reported, got: {reported:?}"
+    );
+}
+
+/// A macro with a name of its own still works.
+#[test]
+fn a_macro_with_a_free_name_still_expands() {
+    let bytes = assemble("MYMAC MACRO\n    NOP\n    ENDM\n    ORG $1000\n    MYMAC\n")
+        .expect("an ordinary macro must expand");
+    assert_eq!(bytes, vec![0x4E, 0x71], "the body should be one NOP");
+}

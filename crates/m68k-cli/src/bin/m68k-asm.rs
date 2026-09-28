@@ -169,15 +169,21 @@ fn run(args: Args) -> Result<(), String> {
     }
     asm.errors.filename = input_name.clone();
 
-    asm.assemble_bytes(&source)
-        .map_err(|e| format!("{}: {}", input_name, e))?;
+    // Translate through the source map before reporting: INCLUDE and
+    // macro expansion both change line numbers, so the number the
+    // assembler carries refers to the expanded text, not to any file a
+    // reader can open.
+    if let Err(e) = asm.assemble_bytes(&source) {
+        let where_ = source_location(&asm, e.line_no, &input_name);
+        return Err(format!("{}: {}", where_, e.message));
+    }
 
     // Print warnings and errors with filename
     for diag in &asm.errors.warnings {
-        eprintln!("{}", format_diagnostic(diag, &input_name));
+        eprintln!("{}", format_diagnostic(diag, &asm, &input_name));
     }
     for diag in &asm.errors.errors {
-        eprintln!("{}", format_diagnostic(diag, &input_name));
+        eprintln!("{}", format_diagnostic(diag, &asm, &input_name));
     }
 
     // The ERROR directive (and other non-fatal diagnostics collected into
@@ -329,14 +335,42 @@ fn run(args: Args) -> Result<(), String> {
     write_auxiliary_outputs(&asm, &args, &input_name)
 }
 
-fn format_diagnostic(diag: &m68k_core::errors::Diagnostic, filename: &str) -> String {
+fn format_diagnostic(
+    diag: &m68k_core::errors::Diagnostic,
+    asm: &Assembler,
+    filename: &str,
+) -> String {
     let prefix = match diag.severity {
         m68k_core::errors::Severity::Error => "error",
         m68k_core::errors::Severity::Warning => "warning",
     };
-    match diag.line_no {
-        Some(line) => format!("{}:{}: {}: {}", filename, line, prefix, diag.message),
-        None => format!("{}: {}: {}", filename, prefix, diag.message),
+    format!(
+        "{}: {}: {}",
+        source_location(asm, diag.line_no, filename),
+        prefix,
+        diag.message
+    )
+}
+
+/// Render `file:line` for a diagnostic, resolving the expanded line
+/// number back to the file and line it was written in.
+///
+/// A line that came out of a macro body names the macro too: the
+/// invocation is the line a reader can navigate to, but saying so is
+/// what makes the number make sense.
+fn source_location(asm: &Assembler, line_no: Option<usize>, filename: &str) -> String {
+    let Some(line) = line_no else {
+        return filename.to_string();
+    };
+    match asm.source_origin(line) {
+        Some(origin) => {
+            let file = origin.file.as_deref().unwrap_or(filename);
+            match &origin.macro_name {
+                Some(m) => format!("{}:{} (in macro {})", file, origin.line, m),
+                None => format!("{}:{}", file, origin.line),
+            }
+        }
+        None => format!("{}:{}", filename, line),
     }
 }
 
