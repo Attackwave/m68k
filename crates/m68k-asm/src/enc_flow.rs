@@ -624,6 +624,42 @@ pub fn enc_suba_ea(
     Ok(words)
 }
 
+/// Extension words for the immediate of ANDI/ORI/EORI/CMPI/ADDI/SUBI.
+///
+/// Each of those six used to mask the value into place itself
+/// (`value & 0xFF`) with no range check, so `ANDI.B #300,D0` assembled
+/// to `#$2C` and reported success — a different, valid instruction.
+/// `MOVE.B #300` rejected the same value, which is the behaviour these
+/// now share.
+///
+/// Byte accepts `-128..=255` and word `-32768..=65535`: both the signed
+/// and the unsigned spelling of the same bit pattern are in normal use
+/// (`#-1` and `#$FF` mean one thing here).
+fn immediate_words(value: i64, size: &str) -> Result<Vec<u16>, AsmError> {
+    match size {
+        "b" => {
+            if !(-128..=255).contains(&value) {
+                return Err(AsmError::new(format!(
+                    "byte immediate {value} out of range (-128..255)"
+                )));
+            }
+            Ok(vec![(value & 0xFF) as u16])
+        }
+        "w" => {
+            if !(-32768..=65535).contains(&value) {
+                return Err(AsmError::new(format!(
+                    "word immediate {value} out of range (-32768..65535)"
+                )));
+            }
+            Ok(vec![(value & 0xFFFF) as u16])
+        }
+        _ => Ok(vec![
+            ((value >> 16) & 0xFFFF) as u16,
+            (value & 0xFFFF) as u16,
+        ]),
+    }
+}
+
 /// Encode ADDI instruction.
 pub fn enc_addi(
     value: i64,
@@ -645,14 +681,7 @@ pub fn enc_addi(
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0600 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
-    if size == "b" {
-        words.push((value & 0xFF) as u16);
-    } else if size == "w" {
-        words.push((value & 0xFFFF) as u16);
-    } else {
-        words.push(((value >> 16) & 0xFFFF) as u16);
-        words.push((value & 0xFFFF) as u16);
-    }
+    words.extend(immediate_words(value, size)?);
     words.extend(dst_ext);
     Ok(words)
 }
@@ -676,14 +705,7 @@ pub fn enc_subi(
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0400 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
-    if size == "b" {
-        words.push((value & 0xFF) as u16);
-    } else if size == "w" {
-        words.push((value & 0xFFFF) as u16);
-    } else {
-        words.push(((value >> 16) & 0xFFFF) as u16);
-        words.push((value & 0xFFFF) as u16);
-    }
+    words.extend(immediate_words(value, size)?);
     words.extend(dst_ext);
     Ok(words)
 }
@@ -717,14 +739,7 @@ pub fn enc_andi(
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0200 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
-    if size == "b" {
-        words.push((value & 0xFF) as u16);
-    } else if size == "w" {
-        words.push((value & 0xFFFF) as u16);
-    } else {
-        words.push(((value >> 16) & 0xFFFF) as u16);
-        words.push((value & 0xFFFF) as u16);
-    }
+    words.extend(immediate_words(value, size)?);
     words.extend(dst_ext);
     Ok(words)
 }
@@ -756,14 +771,7 @@ pub fn enc_ori(
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
-    if size == "b" {
-        words.push((value & 0xFF) as u16);
-    } else if size == "w" {
-        words.push((value & 0xFFFF) as u16);
-    } else {
-        words.push(((value >> 16) & 0xFFFF) as u16);
-        words.push((value & 0xFFFF) as u16);
-    }
+    words.extend(immediate_words(value, size)?);
     words.extend(dst_ext);
     Ok(words)
 }
@@ -792,14 +800,7 @@ pub fn enc_eori(
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0A00 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
-    if size == "b" {
-        words.push((value & 0xFF) as u16);
-    } else if size == "w" {
-        words.push((value & 0xFFFF) as u16);
-    } else {
-        words.push(((value >> 16) & 0xFFFF) as u16);
-        words.push((value & 0xFFFF) as u16);
-    }
+    words.extend(immediate_words(value, size)?);
     words.extend(dst_ext);
     Ok(words)
 }
@@ -887,14 +888,7 @@ pub fn enc_cmpi(
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
     let op = 0x0C00 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
-    if size == "b" {
-        words.push((value & 0xFF) as u16);
-    } else if size == "w" {
-        words.push((value & 0xFFFF) as u16);
-    } else {
-        words.push(((value >> 16) & 0xFFFF) as u16);
-        words.push((value & 0xFFFF) as u16);
-    }
+    words.extend(immediate_words(value, size)?);
     words.extend(dst_ext);
     Ok(words)
 }

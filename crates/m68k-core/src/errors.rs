@@ -7,6 +7,15 @@ use std::fmt;
 pub struct AsmError {
     pub message: String,
     pub line_no: Option<usize>,
+    /// File the line number belongs to, when it is already known.
+    ///
+    /// Most errors are found after INCLUDE and macro expansion, so their
+    /// line number refers to the expanded text and the caller translates
+    /// it through the source map. An error raised *during* expansion has
+    /// no map yet but does know its file, and its line already counts
+    /// within that file — setting this marks the location as final so it
+    /// is not translated a second time.
+    pub file: Option<String>,
 }
 
 impl AsmError {
@@ -14,6 +23,7 @@ impl AsmError {
         Self {
             message: message.into(),
             line_no: None,
+            file: None,
         }
     }
 
@@ -21,6 +31,17 @@ impl AsmError {
         Self {
             message: message.into(),
             line_no: Some(line_no),
+            file: None,
+        }
+    }
+
+    /// An error whose location is already resolved: `file` and `line_no`
+    /// name a real place in a real file and need no translation.
+    pub fn at(message: impl Into<String>, file: impl Into<String>, line_no: usize) -> Self {
+        Self {
+            message: message.into(),
+            line_no: Some(line_no),
+            file: Some(file.into()),
         }
     }
 }

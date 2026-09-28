@@ -1534,8 +1534,14 @@ pub fn resolve_include_path_in(
         return Ok(cwd_path);
     }
 
-    let mut searched = vec![source_root.display().to_string()];
-    searched.extend(include_paths.iter().map(|p| p.display().to_string()));
+    // An empty `source_root` is the current directory; printing it as the
+    // empty string produced "searched in " with nothing after it.
+    let show = |p: &std::path::Path| {
+        let s = p.display().to_string();
+        if s.is_empty() { ".".to_string() } else { s }
+    };
+    let mut searched = vec![show(source_root)];
+    searched.extend(include_paths.iter().map(|p| show(p)));
     Err(AsmError::new(format!(
         "file not found: '{}' (searched in {})",
         filename,
