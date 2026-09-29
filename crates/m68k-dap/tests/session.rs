@@ -46,6 +46,7 @@ fn fake_stub(listener: TcpListener, code: Vec<u8>) {
             "g" => {
                 let mut regs = [0u32; 18];
                 regs[0] = (pc - LOAD) / 2; // d0 counts executed instructions
+                regs[15] = 0x3_0000; // stack: zeroes, no return addresses
                 regs[17] = pc;
                 reply(
                     &mut sock,
@@ -54,10 +55,13 @@ fn fake_stub(listener: TcpListener, code: Vec<u8>) {
             }
             p if p.starts_with('m') => {
                 let (addr, len) = p[1..].split_once(',').unwrap();
-                let addr = u32::from_str_radix(addr, 16).unwrap() - LOAD;
+                let addr = u32::from_str_radix(addr, 16).unwrap();
                 let len = u32::from_str_radix(len, 16).unwrap();
                 let bytes: String = (addr..addr + len)
-                    .map(|a| format!("{:02x}", code.get(a as usize).copied().unwrap_or(0)))
+                    .map(|a| {
+                        let byte = a.checked_sub(LOAD).and_then(|o| code.get(o as usize));
+                        format!("{:02x}", byte.copied().unwrap_or(0))
+                    })
                     .collect();
                 reply(&mut sock, &bytes);
             }
@@ -197,6 +201,39 @@ fn breakpoint_continue_step_and_registers() {
         vars["variables"][0],
         json!({ "name": "d0", "value": "$00000002", "variablesReference": 0 })
     );
+
+    // One frame: the zeroed stack holds no return addresses.
+    let trace = c.request("stackTrace", json!({ "threadId": 1 }));
+    assert_eq!(trace["totalFrames"], 1);
+
+    // Backwards from the current instruction, resynced on the line table.
+    let dis = c.request(
+        "disassemble",
+        json!({ "memoryReference": format!("0x{:x}", LOAD + 4), "instructionOffset": -2, "instructionCount": 4 }),
+    );
+    let insns = dis["instructions"].as_array().unwrap();
+    let addrs: Vec<&str> = insns
+        .iter()
+        .map(|i| i["address"].as_str().unwrap())
+        .collect();
+    assert_eq!(addrs, ["0x20000", "0x20002", "0x20004", "0x20006"]);
+    assert_eq!(insns[0]["symbol"], "start");
+    assert_eq!(insns[1]["line"], 4);
+    assert!(
+        insns[3]["instruction"].as_str().unwrap().starts_with("rts"),
+        "{}",
+        insns[3]
+    );
+
+    // A breakpoint set from the disassembly view stops `continue` there.
+    let bps = c.request(
+        "setInstructionBreakpoints",
+        json!({ "breakpoints": [{ "instructionReference": format!("0x{:x}", LOAD + 6) }] }),
+    );
+    assert_eq!(bps["breakpoints"][0]["verified"], true);
+    c.request("continue", json!({ "threadId": 1 }));
+    assert_eq!(c.expect_event("stopped")["reason"], "breakpoint");
+    assert_eq!(c.current_line(), 6);
 
     let hover = c.request("evaluate", json!({ "expression": "start" }));
     assert_eq!(hover["result"], format!("${LOAD:08x} ({LOAD})"));

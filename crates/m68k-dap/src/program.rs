@@ -56,6 +56,13 @@ impl Program {
         Ok(program)
     }
 
+    /// Whether `addr` lies inside one of the program's hunks.
+    pub fn contains(&self, addr: u32) -> bool {
+        self.hunks
+            .iter()
+            .any(|&(start, end)| (start..end).contains(&addr))
+    }
+
     /// Source line containing `pc`: the last row at or below it in the same hunk.
     pub fn line_at(&self, pc: u32) -> Option<&Line> {
         let &(start, end) = self.hunks.iter().find(|(s, e)| (*s..*e).contains(&pc))?;

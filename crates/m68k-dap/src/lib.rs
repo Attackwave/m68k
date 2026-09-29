@@ -5,6 +5,7 @@
 //! packets from the emulator arrive on the same channel, so a stop reply
 //! that shows up while a request is in flight is queued, never lost.
 
+pub mod disasm;
 pub mod program;
 pub mod rsp;
 
@@ -16,8 +17,6 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::time::{Duration, Instant};
 
-use m68k_core::addressing::InstructionStream;
-use m68k_disasm::decoder::{DecodeResult, decode_next};
 use serde_json::{Value, json};
 
 use program::Program;
@@ -32,6 +31,12 @@ const MAX_STEPS: usize = 100_000;
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const CALL_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+/// Bytes of stack searched for return addresses.
+const STACK_SCAN: u32 = 512;
+const MAX_FRAMES: usize = 32;
+/// Longest 68000 instruction; 68020+ addressing modes can exceed it, which
+/// only costs the backwards disassembly an extra resync.
+const MAX_INSN_LEN: i64 = 10;
 
 pub enum Msg {
     Dap(Value),
@@ -88,6 +93,10 @@ pub struct Session<W: Write> {
     program: Program,
     /// Breakpoint addresses per source path, as last set by the editor.
     breakpoints: HashMap<String, Vec<u32>>,
+    /// Breakpoints set from the disassembly view.
+    instruction_breakpoints: Vec<u32>,
+    /// Symbol addresses, for branch targets in the disassembly.
+    labels: HashMap<u32, String>,
     stop_on_entry: bool,
     pausing: bool,
     /// Work that must follow the response: DAP wants the reply to `next`
@@ -112,6 +121,8 @@ impl<W: Write> Session<W> {
             emulator: None,
             program: Program::default(),
             breakpoints: HashMap::new(),
+            instruction_breakpoints: Vec::new(),
+            labels: HashMap::new(),
             stop_on_entry: false,
             pausing: false,
             after_response: None,
@@ -168,6 +179,8 @@ impl<W: Write> Session<W> {
                 "supportsReadMemoryRequest": true,
                 "supportsSteppingGranularity": true,
                 "supportsEvaluateForHovers": true,
+                "supportsDisassembleRequest": true,
+                "supportsInstructionBreakpoints": true,
             })),
             "launch" => {
                 self.launch(args)?;
@@ -175,6 +188,8 @@ impl<W: Write> Session<W> {
                 Ok(Value::Null)
             }
             "setBreakpoints" => self.set_breakpoints(args),
+            "setInstructionBreakpoints" => self.set_instruction_breakpoints(args),
+            "disassemble" => self.disassemble(args),
             "configurationDone" => {
                 if self.stop_on_entry {
                     self.after_response = Some(After::Stopped("entry"));
@@ -252,6 +267,12 @@ impl<W: Write> Session<W> {
             .filter_map(|p| u32::from_str_radix(p.rsplit('=').next()?, 16).ok())
             .collect();
         self.program = Program::load(&exe, &segments)?;
+        self.labels = self
+            .program
+            .symbols
+            .iter()
+            .map(|(n, a)| (*a, n.clone()))
+            .collect();
         if self.program.lines.is_empty() {
             self.output("No line debug info in the program; assemble with --linedebug for source stepping.\n");
         }
@@ -467,6 +488,20 @@ impl<W: Write> Session<W> {
             .collect())
     }
 
+    /// Read up to `len` bytes, in packet-sized chunks; stops early at
+    /// unreadable memory.
+    fn read_range(&mut self, addr: u32, len: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        while (data.len() as u32) < len {
+            let chunk = (len - data.len() as u32).min(512);
+            match self.read_bytes(addr.wrapping_add(data.len() as u32), chunk) {
+                Ok(b) if !b.is_empty() => data.extend(b),
+                _ => break,
+            }
+        }
+        data
+    }
+
     // ----- execution control ----------------------------------------------
 
     fn resume(&mut self) -> Result<(), String> {
@@ -509,13 +544,8 @@ impl<W: Write> Session<W> {
     /// Decode the instruction at `pc`: its mnemonic and length.
     fn instruction_at(&mut self, pc: u32) -> Result<(String, u32), String> {
         let bytes = self.read_bytes(pc, 22)?;
-        let mut stream = InstructionStream::new(&bytes, pc);
-        Ok(match decode_next(&mut stream, "68060") {
-            Ok((_, DecodeResult::Instruction(i))) => {
-                (i.mnemonic.to_lowercase(), i.raw_bytes.len() as u32)
-            }
-            _ => (String::new(), 2),
-        })
+        let insn = disasm::decode_one(&bytes, pc, &HashMap::new());
+        Ok((insn.mnemonic, insn.bytes.len() as u32))
     }
 
     /// Execute one instruction, running over subroutine calls when `over`.
@@ -524,7 +554,7 @@ impl<W: Write> Session<W> {
     fn step_instruction(&mut self, over: bool) -> Result<(String, bool), String> {
         let pc = self.pc()?;
         let (mnemonic, len) = self.instruction_at(pc)?;
-        if over && (mnemonic.starts_with("jsr") || mnemonic.starts_with("bsr")) {
+        if over && disasm::is_call(&mnemonic) {
             let ret = pc + len;
             self.request(&format!("Z0,{ret:x}"))?;
             self.resume()?;
@@ -606,20 +636,20 @@ impl<W: Write> Session<W> {
         Ok(json!({ "breakpoints": result }))
     }
 
-    fn stack_trace(&mut self) -> Result<Value, String> {
-        let pc = self.pc()?;
+    /// A stack frame for code at `addr`, with its source line when known.
+    fn frame(&self, id: usize, addr: u32) -> Value {
         let name = self
             .program
-            .symbolize(pc)
-            .unwrap_or_else(|| format!("${pc:08x}"));
+            .symbolize(addr)
+            .unwrap_or_else(|| format!("${addr:08x}"));
         let mut frame = json!({
-            "id": 0,
+            "id": id,
             "name": name,
             "line": 0,
             "column": 0,
-            "instructionPointerReference": format!("0x{pc:x}"),
+            "instructionPointerReference": format!("0x{addr:x}"),
         });
-        if let Some(line) = self.program.line_at(pc) {
+        if let Some(line) = self.program.line_at(addr) {
             let file = Path::new(&line.file);
             frame["source"] = json!({
                 "name": file.file_name().map(|n| n.to_string_lossy()),
@@ -628,7 +658,143 @@ impl<W: Write> Session<W> {
             frame["line"] = json!(line.line);
             frame["column"] = json!(1);
         }
-        Ok(json!({ "stackFrames": [frame], "totalFrames": 1 }))
+        frame
+    }
+
+    /// The current frame plus the callers found on the stack.
+    ///
+    /// Hand-written assembly keeps no frame pointers, so this scans the top
+    /// of the stack for longwords that point into the program right behind
+    /// a `jsr`/`bsr`. Saved registers that happen to hold such an address
+    /// show up as an extra frame, and a caller whose return address sits
+    /// deeper than [`STACK_SCAN`] is missed.
+    fn stack_trace(&mut self) -> Result<Value, String> {
+        let regs = self.registers()?;
+        let (Some(&sp), Some(&pc)) = (regs.get(15), regs.get(17)) else {
+            return Err("short register reply".into());
+        };
+        let mut frames = vec![self.frame(0, pc)];
+        let stack = self.read_range(sp, STACK_SCAN);
+        for k in (0..stack.len().saturating_sub(3)).step_by(2) {
+            if frames.len() >= MAX_FRAMES {
+                break;
+            }
+            let ret = u32::from_be_bytes(stack[k..k + 4].try_into().unwrap());
+            if ret < 6 || !self.program.contains(ret) {
+                continue;
+            }
+            let Ok(before) = self.read_bytes(ret - 6, 6) else {
+                continue;
+            };
+            let Ok(before) = <[u8; 6]>::try_from(before.as_slice()) else {
+                continue;
+            };
+            if let Some(len) = disasm::call_before(&before, ret) {
+                frames.push(self.frame(frames.len(), ret - len));
+            }
+        }
+        let total = frames.len();
+        Ok(json!({ "stackFrames": frames, "totalFrames": total }))
+    }
+
+    fn set_instruction_breakpoints(&mut self, args: &Value) -> Result<Value, String> {
+        for addr in std::mem::take(&mut self.instruction_breakpoints) {
+            self.request(&format!("z0,{addr:x}")).ok();
+        }
+        let mut result = Vec::new();
+        for bp in args["breakpoints"].as_array().into_iter().flatten() {
+            let addr = parse_address(bp["instructionReference"].as_str().unwrap_or_default())
+                .map(|a| a.wrapping_add(bp["offset"].as_i64().unwrap_or(0) as u32));
+            match addr {
+                Some(addr) if self.request(&format!("Z0,{addr:x}")).is_ok() => {
+                    self.instruction_breakpoints.push(addr);
+                    result.push(
+                        json!({ "verified": true, "instructionReference": format!("0x{addr:x}") }),
+                    );
+                }
+                _ => result.push(json!({ "verified": false })),
+            }
+        }
+        Ok(json!({ "breakpoints": result }))
+    }
+
+    /// `instructionCount` instructions starting `instructionOffset`
+    /// instructions away from the reference. Going backwards on a
+    /// variable-length ISA needs a known instruction boundary: a line-table
+    /// address if one is near, otherwise the decode start is nudged a word
+    /// at a time until it lands on the reference.
+    fn disassemble(&mut self, args: &Value) -> Result<Value, String> {
+        let base = parse_address(args["memoryReference"].as_str().unwrap_or_default())
+            .ok_or("invalid memory reference")?
+            .wrapping_add(args["offset"].as_i64().unwrap_or(0) as u32);
+        let first = args["instructionOffset"].as_i64().unwrap_or(0);
+        let count = args["instructionCount"]
+            .as_i64()
+            .unwrap_or(0)
+            .clamp(0, 4096);
+        let back = ((-first).max(0) * MAX_INSN_LEN) as u32;
+        let ahead = ((first + count).max(0) * MAX_INSN_LEN + MAX_INSN_LEN) as u32;
+
+        let lo = base.saturating_sub(back) & !1;
+        let start = self
+            .program
+            .lines
+            .iter()
+            .map(|l| l.address)
+            .filter(|&a| a >= lo && a <= base)
+            .min()
+            .unwrap_or(lo);
+        let bytes = self.read_range(start, base - start + ahead);
+        let mut insns = Vec::new();
+        for shift in (0..(base - start).min(MAX_INSN_LEN as u32 * 2))
+            .step_by(2)
+            .chain([base - start])
+        {
+            let Some(slice) = bytes.get(shift as usize..) else {
+                break;
+            };
+            insns = disasm::decode_range(slice, start + shift, &self.labels);
+            if insns.iter().any(|i| i.address == base) {
+                break;
+            }
+        }
+        let anchor = insns.iter().position(|i| i.address == base);
+
+        let entries: Vec<Value> = (first..first + count)
+            .map(|k| {
+                let insn = anchor
+                    .and_then(|a| usize::try_from(a as i64 + k).ok())
+                    .and_then(|i| insns.get(i));
+                match insn {
+                    Some(i) => self.instruction_entry(i),
+                    // Outside what could be read or decoded: word-sized
+                    // placeholders keep the view's addresses monotonic.
+                    None => json!({
+                        "address": format!("0x{:x}", base.wrapping_add((k * 2) as u32)),
+                        "instruction": "??",
+                        "presentationHint": "invalid",
+                    }),
+                }
+            })
+            .collect();
+        Ok(json!({ "instructions": entries }))
+    }
+
+    fn instruction_entry(&self, insn: &disasm::Insn) -> Value {
+        let bytes: Vec<String> = insn.bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let mut entry = json!({
+            "address": format!("0x{:x}", insn.address),
+            "instructionBytes": bytes.join(" "),
+            "instruction": insn.text,
+        });
+        if let Some(name) = self.labels.get(&insn.address) {
+            entry["symbol"] = json!(name);
+        }
+        if let Some(line) = self.program.line_at(insn.address) {
+            entry["location"] = json!({ "path": line.file });
+            entry["line"] = json!(line.line);
+        }
+        entry
     }
 
     fn variables(&mut self) -> Result<Value, String> {
@@ -654,14 +820,7 @@ impl<W: Write> Session<W> {
             .ok_or("invalid memory reference")?;
         let addr = base.wrapping_add(args["offset"].as_i64().unwrap_or(0) as u32);
         let count = args["count"].as_u64().unwrap_or(0).min(64 * 1024) as u32;
-        let mut data = Vec::new();
-        while (data.len() as u32) < count {
-            let chunk = (count - data.len() as u32).min(512);
-            match self.read_bytes(addr + data.len() as u32, chunk) {
-                Ok(b) if !b.is_empty() => data.extend(b),
-                _ => break,
-            }
-        }
+        let data = self.read_range(addr, count);
         Ok(json!({
             "address": format!("0x{addr:x}"),
             "data": base64(&data),
