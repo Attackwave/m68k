@@ -61,6 +61,9 @@ pub struct Section {
     /// hunk writer mapped every `Named` section to `HUNK_CODE`, turning a
     /// declared data section into executable code in the output file.
     pub declared_kind: Option<SectionKind>,
+    /// Memory the loader must allocate the section in, from a `_C`/`_F`
+    /// type suffix or a `CHIP`/`FAST` argument.
+    pub memory: Memory,
     /// Position of this section's first `SECTION` directive in the source.
     ///
     /// Sections live in a `HashMap`, whose iteration order is arbitrary, so
@@ -85,6 +88,7 @@ impl Section {
         Self {
             kind,
             declared_kind: None,
+            memory: Memory::Any,
             order,
             origin,
             pc: origin,
@@ -551,6 +555,29 @@ pub fn handle_even_pass2(
 /// attribute suffixes (`_C` chip, `_F` fast, `_P` public) are accepted and
 /// ignored, since this assembler resolves everything to absolute addresses
 /// and never emits the hunk memory flags they control.
+/// Memory requirement of a section, carried into the hunk header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Memory {
+    #[default]
+    Any,
+    Chip,
+    Fast,
+}
+
+impl Memory {
+    /// From a type suffix (`DATA_C`) or a separate memory argument (`CHIP`).
+    fn parse(word: &str) -> Option<Memory> {
+        let upper = word.trim().to_ascii_uppercase();
+        let tag = upper.rsplit_once('_').map_or(upper.as_str(), |(_, t)| t);
+        match tag {
+            "C" | "CHIP" => Some(Memory::Chip),
+            "F" | "FAST" => Some(Memory::Fast),
+            "P" | "PUBLIC" => Some(Memory::Any),
+            _ => None,
+        }
+    }
+}
+
 fn section_type_keyword(arg: &str) -> Option<SectionKind> {
     let upper = arg.trim().to_ascii_uppercase();
     let base = upper
@@ -629,6 +656,24 @@ pub fn handle_section(
         && let Some(section) = sections.sections.get_mut(&kind)
     {
         section.declared_kind = Some(declared);
+        // `DATA_C`, or `DATA,CHIP` as a third argument. Dropping this put
+        // bitplanes and samples in fast RAM, where the custom chips cannot
+        // reach them.
+        let memory = args[1]
+            .contains('_')
+            .then(|| Memory::parse(&args[1]))
+            .flatten();
+        let memory = match (memory, args.get(2)) {
+            (Some(m), _) => m,
+            (None, Some(arg)) => Memory::parse(arg).ok_or_else(|| {
+                AsmError::with_line(
+                    format!("unknown SECTION memory type: {}", arg.trim()),
+                    line_no,
+                )
+            })?,
+            (None, None) => Memory::Any,
+        };
+        section.memory = memory;
     }
 
     Ok(DirectiveResult::with_pc(sections.current_pc()))

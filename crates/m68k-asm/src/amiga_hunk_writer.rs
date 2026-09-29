@@ -22,7 +22,7 @@
 //! alone writes no relocations and suits position-independent code only.
 
 use crate::assembler::{Assembler, SymbolTable};
-use crate::directives::{Section, SectionKind, SectionManager};
+use crate::directives::{Memory, Section, SectionKind, SectionManager};
 use m68k_core::errors::AsmError;
 
 const HUNK_HEADER: u32 = 0x03F3;
@@ -261,7 +261,16 @@ fn write_hunk_exe(
     for (_, section) in &ordered {
         // `reserved_size`, not `to_bytes().len()`: a BSS section's `DS`
         // space emits no bytes but still occupies the hunk.
-        push_u32(&mut out, (section.reserved_size().div_ceil(4)) as u32);
+        // Bits 30/31 tell LoadSeg() to allocate chip or fast memory.
+        let memory = match section.memory {
+            Memory::Any => 0,
+            Memory::Chip => 1 << 30,
+            Memory::Fast => 1 << 31,
+        };
+        push_u32(
+            &mut out,
+            (section.reserved_size().div_ceil(4)) as u32 | memory,
+        );
     }
 
     for (hunk, (kind, section)) in ordered.iter().enumerate() {
@@ -459,6 +468,31 @@ len     equ 16
         // A pointer in the data hunk back into code.
         assert_eq!(long_at(&data.data, 2), code.address);
         assert_eq!(code.relocs.len(), 2);
+    }
+
+    #[test]
+    fn memory_type_goes_into_the_hunk_header() {
+        let src = "
+    SECTION code,CODE
+    rts
+    SECTION gfx,DATA_C
+    dc.w 1
+    SECTION buf,BSS,FAST
+    ds.l 2
+    SECTION any,DATA
+    dc.w 2
+";
+        let exe = relocatable(src).unwrap();
+        let sizes: Vec<u32> = (0..4).map(|i| long_at(&exe, 20 + 4 * i)).collect();
+        assert_eq!(sizes, vec![1, 0x4000_0001, 0x8000_0002, 1]);
+        // The reader masks the flags off, so sizes stay sane.
+        let loaded = read_hunk_executable(&exe, 0x1000).unwrap();
+        assert_eq!(loaded.sections[1].data.len(), 4);
+
+        let bad = Assembler::new(0)
+            .assemble(" SECTION x,DATA,SLOW\n dc.w 1\n")
+            .map(|_| ());
+        assert!(bad.unwrap_err().message.contains("memory type"));
     }
 
     #[test]
