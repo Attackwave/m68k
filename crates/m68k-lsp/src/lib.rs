@@ -26,6 +26,7 @@ pub mod rename;
 pub mod semantic_tokens;
 pub mod signature;
 pub mod symbols;
+pub mod timing_hints;
 pub mod workspace;
 
 pub use backend::Backend;

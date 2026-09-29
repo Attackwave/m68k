@@ -28,14 +28,17 @@ for (const [src, wantLine] of [
 const d = new RegExp(diag.regexp).exec('src/x.s:7 (in macro m): warning: odd address');
 assert.deepStrictEqual([d[diag.file], d[diag.line], d[diag.severity]], ['src/x.s', '7', 'warning']);
 
-// LSP: initialize, open a broken document, expect a diagnostic on line 1 (0-based).
+// LSP: initialize, open a document with an error, expect a diagnostic on
+// line 1 (0-based), cycle hints and a cycle sum for the valid lines.
 const lsp = spawn(bin('m68k-lsp'), ['--cpu', '68000']);
 const send = (msg) => {
   const body = JSON.stringify({ jsonrpc: '2.0', ...msg });
   lsp.stdin.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
 };
+const TEXT = 'start:\n  bogus d0\n  moveq #0,d0\n  rts\n';
+const pending = new Set(['diagnostics', 'hints', 'sum']);
 let buf = '';
-const timer = setTimeout(() => { lsp.kill(); assert.fail('no diagnostics from m68k-lsp'); }, 5000);
+const timer = setTimeout(() => { lsp.kill(); assert.fail(`m68k-lsp did not answer: ${[...pending]}`); }, 5000);
 lsp.stdout.on('data', (chunk) => {
   buf += chunk;
   for (;;) {
@@ -47,14 +50,30 @@ lsp.stdout.on('data', (chunk) => {
       send({ method: 'initialized', params: {} });
       send({
         method: 'textDocument/didOpen',
-        params: { textDocument: { uri: 'file:///tmp/t.s', languageId: 'm68k', version: 1, text: 'start:\n  bogus d0\n' } },
+        params: { textDocument: { uri: 'file:///tmp/t.s', languageId: 'm68k', version: 1, text: TEXT } },
       });
+      const doc = { uri: 'file:///tmp/t.s' };
+      const range = { start: { line: 0, character: 0 }, end: { line: 3, character: 0 } };
+      send({ id: 2, method: 'textDocument/inlayHint', params: { textDocument: doc, range } });
+      send({ id: 3, method: 'm68k/cycleSum', params: { textDocument: doc, startLine: 2, endLine: 3 } });
+    }
+    if (msg.id === 2) {
+      assert.deepStrictEqual(msg.result.map((h) => [h.position.line, h.label]), [[2, '4'], [3, '16']]);
+      pending.delete('hints');
+    }
+    if (msg.id === 3) {
+      assert.deepStrictEqual(msg.result, { min: 20, max: 20, instructions: 2, unknown: 0 });
+      pending.delete('sum');
     }
     if (msg.method === 'textDocument/publishDiagnostics' && msg.params.diagnostics.length) {
       assert.strictEqual(msg.params.diagnostics[0].range.start.line, 1);
+      pending.delete('diagnostics');
+    }
+    if (pending.size === 0) {
       clearTimeout(timer);
       lsp.kill();
       console.log('ok');
+      return;
     }
   }
 });

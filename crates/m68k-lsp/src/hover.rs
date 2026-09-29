@@ -4,7 +4,7 @@ use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Posi
 
 use m68k_core::amiga_lvo::Library;
 
-use crate::analysis::cycles::estimate_cycles;
+use crate::analysis::cycles::instruction_timing;
 use crate::analysis::directives_docs::lookup_directive;
 use crate::analysis::op_docs::{FlagEffect, OpcodeDoc, lookup_opcode};
 use crate::document::{Document, WordKind};
@@ -82,9 +82,9 @@ fn format_opcode_hover(mnemonic: &str, size: Option<&str>, operands: &[String]) 
         doc.min_cpu.name()
     ));
 
-    // Estimate cycles
-    if let Some(cycle_est) = estimate_cycles(mnemonic, size, operands) {
-        md.push_str(&format!("* **Timing (68000):** {}\n", cycle_est.display));
+    // Exact timing for these operands, else the table's generic value.
+    if let Some(timing) = instruction_timing(mnemonic, size.unwrap_or(""), operands) {
+        md.push_str(&format!("* **Timing (68000):** {}\n", timing.detail));
     } else {
         md.push_str(&format!("* **Timing (68000):** {}\n", doc.base_cycles));
     }

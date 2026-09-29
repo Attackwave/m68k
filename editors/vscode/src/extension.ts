@@ -102,8 +102,59 @@ function debugConfigurations(context: vscode.ExtensionContext): vscode.DebugConf
   };
 }
 
+interface CycleSum {
+  min: number;
+  max: number | null;
+  instructions: number;
+  unknown: number;
+}
+
+/// Status bar readout of the 68000 cycles in the selection.
+function cycleReadout(): vscode.Disposable {
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  item.tooltip =
+    '68000 cycles of the selected instructions (zero wait states). ' +
+    'Chip RAM accesses can take longer while custom chip DMA is busy.';
+  let pending: NodeJS.Timeout | undefined;
+
+  const update = async (editor: vscode.TextEditor | undefined) => {
+    const sel = editor?.selection;
+    if (!client || !editor || !sel || sel.isEmpty || editor.document.languageId !== 'm68k') {
+      item.hide();
+      return;
+    }
+    // A selection ending at column 0 does not include that line.
+    const endLine = sel.end.character === 0 && sel.end.line > sel.start.line ? sel.end.line - 1 : sel.end.line;
+    const sum = await client.sendRequest<CycleSum | null>('m68k/cycleSum', {
+      textDocument: { uri: editor.document.uri.toString() },
+      startLine: sel.start.line,
+      endLine,
+    });
+    if (!sum || sum.instructions === 0) {
+      item.hide();
+      return;
+    }
+    const cycles = sum.max === null ? `≥${sum.min}` : sum.min === sum.max ? `${sum.min}` : `${sum.min}–${sum.max}`;
+    const unknown = sum.unknown ? ` (+${sum.unknown} unknown)` : '';
+    item.text = `$(clock) ${cycles} cycles · ${sum.instructions} instr${unknown}`;
+    item.show();
+  };
+
+  const schedule = (editor: vscode.TextEditor | undefined) => {
+    clearTimeout(pending);
+    pending = setTimeout(() => update(editor).catch(() => item.hide()), 100);
+  };
+  return vscode.Disposable.from(
+    item,
+    vscode.window.onDidChangeTextEditorSelection((e) => schedule(e.textEditor)),
+    vscode.window.onDidChangeActiveTextEditor(schedule),
+    { dispose: () => clearTimeout(pending) }
+  );
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(
+    cycleReadout(),
     vscode.debug.registerDebugAdapterDescriptorFactory('m68k', {
       createDebugAdapterDescriptor: () => new vscode.DebugAdapterExecutable(tool(context, 'm68k-dap')),
     }),

@@ -19,6 +19,7 @@ use crate::rename::{compute_rename, prepare_rename};
 use crate::semantic_tokens::{compute_semantic_tokens, get_semantic_tokens_legend};
 use crate::signature::compute_signature_help;
 use crate::symbols::compute_document_symbols;
+use crate::timing_hints::{CycleSum, CycleSumParams, compute_inlay_hints, cycle_sum};
 use crate::workspace::WorkspaceIndex;
 
 /// The m68k Language Server backend state.
@@ -38,6 +39,23 @@ impl Backend {
             workspace: Arc::new(RwLock::new(WorkspaceIndex::new())),
             config: Arc::new(RwLock::new(LinterConfig::default())),
         }
+    }
+
+    /// Cycle counts come from the 68000 tables; later CPUs time differently.
+    async fn timing_applies(&self) -> bool {
+        self.config.read().await.cpu == m68k_core::cpu_gate::MinCpu::Mc68000
+    }
+
+    /// `m68k/cycleSum`: total cycles of the instructions on a line range,
+    /// for a selection readout in the editor.
+    pub async fn cycle_sum(&self, params: CycleSumParams) -> Result<Option<CycleSum>> {
+        if !self.timing_applies().await {
+            return Ok(None);
+        }
+        let docs = self.documents.read().await;
+        Ok(docs
+            .get(&params.text_document.uri)
+            .map(|doc| cycle_sum(doc, params.start_line, params.end_line)))
     }
 
     async fn validate_document(&self, uri: &Url) {
@@ -95,6 +113,7 @@ impl LanguageServer for Backend {
                     work_done_progress_options: WorkDoneProgressOptions::default(),
                 })),
                 document_formatting_provider: Some(OneOf::Left(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 signature_help_provider: Some(SignatureHelpOptions {
                     trigger_characters: Some(vec![",".to_string(), " ".to_string()]),
                     retrigger_characters: None,
@@ -315,5 +334,15 @@ impl LanguageServer for Backend {
         } else {
             Ok(None)
         }
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        if !self.timing_applies().await {
+            return Ok(None);
+        }
+        let docs = self.documents.read().await;
+        Ok(docs
+            .get(&params.text_document.uri)
+            .map(|doc| compute_inlay_hints(doc, params.range)))
     }
 }
