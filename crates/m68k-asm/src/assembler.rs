@@ -2053,6 +2053,25 @@ impl Assembler {
         self.sections.set_current_pc(self.pc + size);
     }
 
+    /// Warn about word or long data starting at an odd address.
+    ///
+    /// Instructions are padded to an even address, data is not: moving it
+    /// would shift every label after it. A word or long access to an odd
+    /// address raises an address error on the 68000, so the layout is kept
+    /// and the line flagged.
+    fn warn_if_odd(&mut self, directive: &str, element_size: u32, line: &ParsedLine) {
+        if element_size >= 2 && !self.pc.is_multiple_of(2) {
+            self.errors.warning(
+                format!(
+                    "{directive} at odd address ${:X}: word and long accesses to it raise an \
+                     address error on the 68000 (EVEN before it aligns it)",
+                    self.pc
+                ),
+                Some(line.line_no),
+            );
+        }
+    }
+
     /// Emit a single zero pad byte to restore word alignment.
     ///
     /// Recorded as a one-byte instruction (`byte_len = 1`) so the output
@@ -4695,6 +4714,11 @@ impl Assembler {
                 ));
             }
         };
+        self.warn_if_odd(
+            &format!("DC.{}", size_suffix.to_ascii_uppercase()),
+            element_size,
+            line,
+        );
 
         let mut words = Vec::new();
         let mut total_bytes: usize = 0;
@@ -4844,6 +4868,11 @@ impl Assembler {
                 ));
             }
         };
+        self.warn_if_odd(
+            &format!("DS.{}", size_suffix.to_ascii_uppercase()),
+            element_size,
+            line,
+        );
 
         // DS reserves space but doesn't emit code
         // Just advance the PC
@@ -4888,6 +4917,11 @@ impl Assembler {
                 ));
             }
         };
+        self.warn_if_odd(
+            &format!("DCB.{}", size_suffix.to_ascii_uppercase()),
+            element_size,
+            line,
+        );
         // Reject before allocating: element_size * count can overflow u32
         // (panicking on a crafted DCB.L $80000000,0) and, even unchecked,
         // a huge count would otherwise drive an unbounded Vec allocation
@@ -7804,6 +7838,24 @@ later: DC.W 0
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
         ];
         assert_eq!(Assembler::new(0).assemble_bytes(ok).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_word_data_at_odd_address_warns_without_moving() {
+        let mut asm = Assembler::new(0);
+        let bytes = asm
+            .assemble_bytes(" DC.B 1\nw: DC.W 2\n DS.L 1\n EVEN\n DC.L 4\n DC.B 5\n DC.B 6\n")
+            .unwrap();
+        // Layout unchanged: DC.W still starts at 1.
+        assert_eq!(&bytes[..3], &[1, 0, 2]);
+        assert_eq!(asm.symbols.get("w").unwrap().value, 1);
+        let lines: Vec<Option<usize>> = asm.errors.warnings.iter().map(|w| w.line_no).collect();
+        assert_eq!(lines, vec![Some(2), Some(3)]);
+        assert!(
+            asm.errors.warnings[0]
+                .message
+                .contains("DC.W at odd address $1")
+        );
     }
 
     #[test]
