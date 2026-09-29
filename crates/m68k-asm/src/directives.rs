@@ -934,10 +934,19 @@ fn tokenize_expr(text: &str, pc: u32) -> Result<Vec<ExprToken>, String> {
             if i < chars.len() {
                 i += 1; // skip closing quote
             }
-            // Return first character as number for DC.B "string" handling
-            if !s.is_empty() {
-                tokens.push(ExprToken::Num(s.as_bytes()[0] as i64));
+            // A character constant: up to four bytes packed big-endian and
+            // right-justified, so 'ab' is $6162 and 'Hell' is $48656C6C.
+            // Taking only the first byte made `CMPI.L #'Hell',D0` compare
+            // against 'H' without any message.
+            let bytes = s.as_bytes();
+            if bytes.is_empty() || bytes.len() > 4 {
+                return Err(format!(
+                    "character constant {quote}{s}{quote} must have 1 to 4 characters"
+                ));
             }
+            tokens.push(ExprToken::Num(
+                bytes.iter().fold(0i64, |v, &b| (v << 8) | b as i64),
+            ));
             continue;
         }
 
@@ -1644,8 +1653,33 @@ pub fn parse_string_literal(s: &str) -> Result<String, String> {
 }
 
 /// Parse DC string argument into bytes.
+/// Whether `s` is exactly one quoted literal, e.g. `'abc'` or `"a\"b"`,
+/// as opposed to an expression that merely starts with one (`'x'+1`).
+pub fn is_string_literal(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let Some(&quote) = bytes.first().filter(|&&q| q == b'"' || q == b'\'') else {
+        return false;
+    };
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            // A doubled quote is an embedded quote character.
+            q if q == quote && bytes.get(i + 1) == Some(&quote) => i += 2,
+            q if q == quote => return i == bytes.len() - 1,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 pub fn parse_dc_string(s: &str) -> Result<Vec<u8>, String> {
     let parsed = parse_string_literal(s)?;
+    // A doubled delimiter is one embedded quote: 'it''s' is `it's`.
+    let parsed = match s.chars().next() {
+        Some(q @ ('\'' | '"')) => parsed.replace(&format!("{q}{q}"), &q.to_string()),
+        _ => parsed,
+    };
     Ok(parsed.as_bytes().to_vec())
 }
 

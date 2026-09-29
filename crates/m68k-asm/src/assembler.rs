@@ -3223,7 +3223,7 @@ impl Assembler {
                     let trimmed = value_str.trim();
                     if matches!(size_suffix, "s" | "d" | "x" | "p") {
                         total = total.saturating_add(element_size);
-                    } else if trimmed.starts_with('"') || trimmed.starts_with('\'') {
+                    } else if crate::directives::is_string_literal(trimmed) && element_size == 1 {
                         let bytes = crate::directives::parse_dc_string(trimmed).map_err(|e| {
                             AsmError::with_line(format!("invalid DC string: {}", e), line_no)
                         })?;
@@ -4711,14 +4711,10 @@ impl Assembler {
                 continue;
             }
 
-            // Check if it's a string literal
-            if trimmed.starts_with('"') || trimmed.starts_with('\'') {
-                if element_size != 1 {
-                    return Err(AsmError::with_line(
-                        "string literals only supported with DC.B",
-                        line.line_no,
-                    ));
-                }
+            // A string literal is a byte sequence in DC.B. In DC.W/DC.L it is
+            // a character constant and goes through the expression
+            // evaluator below like any other value ('ab' = $6162).
+            if crate::directives::is_string_literal(trimmed) && element_size == 1 {
                 let bytes = parse_dc_string(trimmed).map_err(|e| {
                     AsmError::with_line(format!("invalid DC string: {}", e), line.line_no)
                 })?;
@@ -4734,6 +4730,38 @@ impl Assembler {
             } else {
                 let value = evaluate_expr_str(value_str, &self.symbols, self.pc)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
+
+                // Signed or unsigned, but it has to fit: masking made
+                // `DC.B 300` emit $2C and `DC.W $12345` emit $2345.
+                // Symbols are stored as 32-bit values, so `X EQU -1` comes
+                // back as $FFFFFFFF; read the upper half of the 32-bit
+                // range as negative, as the CPU would.
+                let signed32 = |v: i64| {
+                    if (0x8000_0000..=0xFFFF_FFFF).contains(&v) {
+                        v - (1i64 << 32)
+                    } else {
+                        v
+                    }
+                };
+                let bits = element_size as u32 * 8;
+                let value = if bits < 32 { signed32(value) } else { value };
+                if value < -(1i64 << (bits - 1)) || value > (1i64 << bits) - 1 {
+                    let name = match element_size {
+                        1 => "DC.B",
+                        2 => "DC.W",
+                        _ => "DC.L",
+                    };
+                    return Err(AsmError::with_line(
+                        format!(
+                            "value {value} ({}${:X}) does not fit {name} ({}..{})",
+                            if value < 0 { "-" } else { "" },
+                            value.unsigned_abs(),
+                            -(1i64 << (bits - 1)),
+                            (1i64 << bits) - 1
+                        ),
+                        line.line_no,
+                    ));
+                }
 
                 match element_size {
                     1 => {
@@ -7727,6 +7755,55 @@ later: DC.W 0
         let mut asm = Assembler::new(0);
         asm.set_cpu("68040");
         asm.assemble(ok).unwrap();
+    }
+
+    #[test]
+    fn test_character_constants_pack_up_to_four_bytes() {
+        let bytes = |src: &str| Assembler::new(0).assemble_bytes(src).unwrap();
+        // Immediates took only the first character: #'Hell' was #'H'.
+        assert_eq!(
+            bytes(" CMPI.L #'Hell',D0"),
+            [0x0C, 0x80, 0x48, 0x65, 0x6C, 0x6C]
+        );
+        assert_eq!(bytes(" MOVE.W #'ab',D1"), [0x32, 0x3C, 0x61, 0x62]);
+        // In DC.W/DC.L a quoted literal is a right-justified constant.
+        assert_eq!(bytes(" DC.L 'Hell'"), [0x48, 0x65, 0x6C, 0x6C]);
+        assert_eq!(bytes(" DC.L 'ab'"), [0, 0, 0x61, 0x62]);
+        assert_eq!(bytes(" DC.W 'ab'"), [0x61, 0x62]);
+        // DC.B: an expression starting with a quote is evaluated, not
+        // copied as text; a doubled quote is one embedded quote.
+        assert_eq!(bytes(" DC.B 'x'+1"), [0x79]);
+        assert_eq!(bytes(" DC.B 'it''s'"), b"it's");
+        let err = Assembler::new(0)
+            .assemble(" MOVE.L #'Hello',D0")
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("1 to 4 characters"), "{}", err.message);
+    }
+
+    #[test]
+    fn test_dc_values_must_fit_their_size() {
+        let fails = |src: &str| {
+            Assembler::new(0)
+                .assemble(src)
+                .map(|_| ())
+                .unwrap_err()
+                .message
+        };
+        assert!(fails(" DC.B 300").contains("does not fit DC.B"));
+        assert!(fails(" DC.B -129").contains("-$81"));
+        assert!(fails(" DC.W $12345").contains("does not fit DC.W"));
+        assert!(fails(" DC.W 'abc'").contains("does not fit DC.W"));
+        // Both signed and unsigned readings are accepted, and a negative
+        // EQU (stored as 32 bits) still fits a byte.
+        let ok = "M1 EQU -1\n DC.B -128,255,M1\n EVEN\n DC.W -32768,$FFFF\n DC.L -1,$FFFFFFFF\n";
+        #[rustfmt::skip]
+        let expected = [
+            0x80, 0xFF, 0xFF, 0x00, // bytes, padded by EVEN
+            0x80, 0x00, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        assert_eq!(Assembler::new(0).assemble_bytes(ok).unwrap(), expected);
     }
 
     #[test]
