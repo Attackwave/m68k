@@ -458,7 +458,10 @@ fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Re
         let mut sym_out = String::new();
         sym_out.push_str(&format!("; Symbol table for {}\n\n", input_name));
         let mut syms: Vec<_> = asm.symbols.iter().collect();
-        syms.sort_by_key(|(name, _)| name.to_lowercase());
+        // Case-insensitive order, ties broken by the exact name: `err_exist`
+        // and `ERR_EXIST` otherwise came out in hash-map order, so the file
+        // differed from run to run.
+        syms.sort_by_cached_key(|(name, _)| (name.to_lowercase(), name.to_string()));
         for (name, entry) in &syms {
             sym_out.push_str(&format!("{:<20} = ${:06X}\n", name, entry.value));
         }
@@ -493,7 +496,10 @@ fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Re
     if asm.symbols.iter().count() > 0 {
         eprintln!("\nSymbols:");
         let mut syms: Vec<_> = asm.symbols.iter().collect();
-        syms.sort_by_key(|(name, _)| name.to_lowercase());
+        // Case-insensitive order, ties broken by the exact name: `err_exist`
+        // and `ERR_EXIST` otherwise came out in hash-map order, so the file
+        // differed from run to run.
+        syms.sort_by_cached_key(|(name, _)| (name.to_lowercase(), name.to_string()));
         for (name, entry) in syms {
             eprintln!("  {:<20} ${:08X}", name, entry.value);
         }
