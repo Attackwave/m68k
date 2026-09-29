@@ -81,6 +81,58 @@ jobs:
             target/release/m68k-disasm
             target/release/m68k-floppy
             target/release/m68k-lsp
+            target/release/m68k-dap
+
+  vscode:
+    name: vscode (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: linux-x64
+          - os: windows-latest
+            target: win32-x64
+          - os: macos-latest
+            target: darwin-arm64
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Build tools
+        run: cargo build --release -p m68k-cli -p m68k-lsp -p m68k-dap
+
+      # The extension ships its own copies of the tools, one package per
+      # platform, so it works without anything on PATH.
+      - name: Bundle tools
+        shell: bash
+        run: |
+          ext=""; [ "$RUNNER_OS" = "Windows" ] && ext=".exe"
+          mkdir -p editors/vscode/bin
+          for tool in m68k-asm m68k-lsp m68k-dap; do
+            cp "target/release/$tool$ext" editors/vscode/bin/
+          done
+
+      - name: Build and test extension
+        working-directory: editors/vscode
+        run: |
+          npm ci
+          npm run compile
+          node test/smoke.js
+
+      - name: Package
+        working-directory: editors/vscode
+        run: npx vsce package --target ${{ matrix.target }} -o m68k-${{ matrix.target }}.vsix
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: vscode-${{ matrix.target }}
+          path: editors/vscode/m68k-${{ matrix.target }}.vsix
 
   msrv:
     name: msrv (1.88)
