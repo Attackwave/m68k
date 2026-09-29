@@ -1833,7 +1833,7 @@ pub struct Assembler {
     pub register_aliases: HashMap<String, String>,
     /// Files already spliced in, so each is included only once.
     included_files: std::collections::HashSet<PathBuf>,
-    /// Resolved path of every included file, keyed by the name
+    /// Absolute path of every included file, keyed by the name
     /// [`SourceOrigin::file`] carries (the name as written in `INCLUDE`).
     /// Debug info needs a path a debugger can open; diagnostics keep the
     /// short name.
@@ -2766,11 +2766,14 @@ impl Assembler {
 
             // Already pulled in? Drop the directive and move on.
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if !self.included_files.insert(canonical.clone()) {
+            if !self.included_files.insert(canonical) {
                 continue;
             }
+            // Not the canonical path: on Windows that carries a `\\?\`
+            // prefix no editor uses, so a debugger could not match it.
+            let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
             self.include_paths_resolved
-                .insert(filename.clone(), canonical);
+                .insert(filename.clone(), absolute);
 
             let content = std::fs::read_to_string(&path).map_err(|e| {
                 here(

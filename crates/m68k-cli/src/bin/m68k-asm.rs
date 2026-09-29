@@ -331,7 +331,9 @@ fn run(args: Args) -> Result<(), String> {
         OutputFormatArg::HunkExe => {
             // Debuggers open these paths, so they are absolute; diagnostics
             // keep the short names.
-            let main_file = fs::canonicalize(&args.input).unwrap_or_else(|_| args.input.clone());
+            // `absolute`, not `canonicalize`: no `\\?\` prefix on Windows,
+            // and symlinks stay as the editor sees them.
+            let main_file = std::path::absolute(&args.input).unwrap_or_else(|_| args.input.clone());
             let line_of = |line_no: usize| {
                 let origin = asm.source_origin(line_no)?;
                 let path = match &origin.file {
