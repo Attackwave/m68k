@@ -122,6 +122,9 @@ pub fn compute_completion(doc: &Document, _pos: Position) -> CompletionResponse 
         }
     }
 
+    // 6. Amiga custom chip registers
+    items.extend(crate::custom_regs::completion_items());
+
     CompletionResponse::Array(items)
 }
 

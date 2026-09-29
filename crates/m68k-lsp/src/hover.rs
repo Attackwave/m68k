@@ -17,6 +17,22 @@ pub fn compute_hover(doc: &Document, pos: Position) -> Option<Hover> {
         return None;
     }
 
+    // Custom chip registers, by name or $DFFxxx address. A user EQU of the
+    // same name is shown below the register documentation.
+    if let Some(mut md) = crate::custom_regs::hover(doc, clean_word, word_info.line_idx) {
+        if let Some(symbol) = format_symbol_hover(doc, clean_word) {
+            md.push_str("\n---\n\n");
+            md.push_str(&symbol);
+        }
+        return Some(Hover {
+            contents: HoverContents::Markup(MarkupContent {
+                kind: MarkupKind::Markdown,
+                value: md,
+            }),
+            range: Some(word_info.range),
+        });
+    }
+
     let markdown = match word_info.kind {
         WordKind::Mnemonic => format_opcode_hover(
             clean_word.split('.').next().unwrap_or(clean_word),

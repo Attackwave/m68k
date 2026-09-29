@@ -23,6 +23,7 @@
 //! automatically get, and vice versa).
 
 pub mod addressing;
+pub mod amiga_custom;
 pub mod amiga_hunk;
 pub mod amiga_lvo;
 pub mod cpu_gate;

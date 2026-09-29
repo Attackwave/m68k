@@ -35,17 +35,20 @@ const send = (msg) => {
   const body = JSON.stringify({ jsonrpc: '2.0', ...msg });
   lsp.stdin.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
 };
-const TEXT = 'start:\n  bogus d0\n  moveq #0,d0\n  rts\n';
-const pending = new Set(['diagnostics', 'hints', 'sum']);
-let buf = '';
+const TEXT = 'start:\n  bogus d0\n  moveq #0,d0\n  rts\n  move.w #$8380,DMACON(a6)\n';
+const pending = new Set(['diagnostics', 'hints', 'sum', 'hover']);
+// Content-Length counts bytes, so frames are cut from a Buffer, not a string.
+let buf = Buffer.alloc(0);
 const timer = setTimeout(() => { lsp.kill(); assert.fail(`m68k-lsp did not answer: ${[...pending]}`); }, 5000);
 lsp.stdout.on('data', (chunk) => {
-  buf += chunk;
+  buf = Buffer.concat([buf, chunk]);
   for (;;) {
-    const hdr = /Content-Length: (\d+)\r\n\r\n/.exec(buf);
-    if (!hdr || buf.length < hdr.index + hdr[0].length + +hdr[1]) return;
-    const msg = JSON.parse(buf.substr(hdr.index + hdr[0].length, +hdr[1]));
-    buf = buf.slice(hdr.index + hdr[0].length + +hdr[1]);
+    const sep = buf.indexOf('\r\n\r\n');
+    if (sep < 0) return;
+    const len = +/Content-Length: (\d+)/.exec(buf.subarray(0, sep).toString())[1];
+    if (buf.length < sep + 4 + len) return;
+    const msg = JSON.parse(buf.subarray(sep + 4, sep + 4 + len).toString('utf8'));
+    buf = buf.subarray(sep + 4 + len);
     if (msg.id === 1) {
       send({ method: 'initialized', params: {} });
       send({
@@ -56,6 +59,7 @@ lsp.stdout.on('data', (chunk) => {
       const range = { start: { line: 0, character: 0 }, end: { line: 3, character: 0 } };
       send({ id: 2, method: 'textDocument/inlayHint', params: { textDocument: doc, range } });
       send({ id: 3, method: 'm68k/cycleSum', params: { textDocument: doc, startLine: 2, endLine: 3 } });
+      send({ id: 4, method: 'textDocument/hover', params: { textDocument: doc, position: { line: 4, character: 18 } } });
     }
     if (msg.id === 2) {
       assert.deepStrictEqual(msg.result.map((h) => [h.position.line, h.label]), [[2, '4'], [3, '16']]);
@@ -64,6 +68,10 @@ lsp.stdout.on('data', (chunk) => {
     if (msg.id === 3) {
       assert.deepStrictEqual(msg.result, { min: 20, max: 20, instructions: 2, unknown: 0 });
       pending.delete('sum');
+    }
+    if (msg.id === 4) {
+      assert.match(msg.result.contents.value, /SET DMAEN\|BPLEN\|COPEN/);
+      pending.delete('hover');
     }
     if (msg.method === 'textDocument/publishDiagnostics' && msg.params.diagnostics.length) {
       assert.strictEqual(msg.params.diagnostics[0].range.start.line, 1);

@@ -85,6 +85,8 @@ pub fn compute_diagnostics(doc: &Document, config: &LinterConfig) -> Vec<Diagnos
         }
     }
 
+    diagnostics.extend(crate::custom_regs::diagnostics(doc));
+
     // 2. Run assembler in-memory pass to catch structural, branch, and expression errors
     let mut asm = Assembler::new(0);
     asm.set_cpu(config.cpu.name());

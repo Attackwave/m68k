@@ -11,6 +11,19 @@ debug adapter ship with the extension; nothing else needs to be on `PATH`.
   formatting, signature help and semantic highlighting. `INCLUDE` files are
   resolved from the workspace root and its `include/` and `includes/`
   directories.
+- **Cycle counts**: exact 68000 timing at the end of every instruction line,
+  from the official execution time tables with the effective address of
+  each operand. Instructions that depend on runtime data show their range
+  (`10/8` for a branch taken/not taken, `38-70` for MULU). Select lines to
+  see their total in the status bar. Shown when `m68k.cpu` is `68000`; on an
+  Amiga, chip RAM accesses can take longer while DMA is busy.
+- **Custom chip registers**: hover any register name (`DMACON`, `BPLCON0`,
+  `COLOR17`) or `$DFFxxx` address for its access, chip, chipset and bit
+  fields. The value a line writes is decoded, including copper MOVE pairs
+  in `dc.w` lists: `move.w #$8380,DMACON(a6)` shows
+  `SET DMAEN|BPLEN|COPEN`. Reading a write-only register, read-modify-write
+  on one, and writing a read-only register are flagged. Register names
+  complete. Covers OCS, ECS and AGA.
 - **Build tasks**: `m68k-asm` as a task (hunk executable by default), with
   errors and warnings in the Problems panel, including errors raised inside
   macro expansions.

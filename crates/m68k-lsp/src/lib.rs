@@ -16,6 +16,7 @@
 pub mod analysis;
 pub mod backend;
 pub mod completion;
+pub mod custom_regs;
 pub mod definition;
 pub mod diagnostics;
 pub mod document;
