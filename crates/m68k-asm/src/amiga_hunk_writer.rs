@@ -323,7 +323,7 @@ fn write_hunk_exe(
         // Reserved size again, so a label pointing into a BSS section's `DS`
         // space still falls inside the range and keeps its HUNK_SYMBOL entry.
         let end = base + section.reserved_size() as u32;
-        let section_symbols: Vec<(&str, u32)> = symbols
+        let mut section_symbols: Vec<(&str, u32)> = symbols
             .iter()
             .filter(|(_, entry)| {
                 entry.defined && entry.section.as_deref() == Some(kind.name())
@@ -334,6 +334,9 @@ fn write_hunk_exe(
             })
             .map(|(name, entry)| (name.as_str(), entry.value))
             .collect();
+        // The symbol table is a hash map; without a fixed order the same
+        // source produced different executables from run to run.
+        section_symbols.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(b.0)));
 
         if !section_symbols.is_empty() {
             push_u32(&mut out, HUNK_SYMBOL);
@@ -493,6 +496,17 @@ len     equ 16
             .assemble(" SECTION x,DATA,SLOW\n dc.w 1\n")
             .map(|_| ());
         assert!(bad.unwrap_err().message.contains("memory type"));
+    }
+
+    #[test]
+    fn output_is_identical_across_runs() {
+        // Each assembler has its own hash-map seed, so a symbol order taken
+        // from the map differs between instances.
+        let src = " SECTION code,CODE\na: nop\nb: nop\nc: nop\nd: rts\n SECTION data,DATA\ne: dc.l a\nf: dc.l b\n";
+        let first = relocatable(src).unwrap();
+        for _ in 0..16 {
+            assert_eq!(relocatable(src).unwrap(), first);
+        }
     }
 
     #[test]
