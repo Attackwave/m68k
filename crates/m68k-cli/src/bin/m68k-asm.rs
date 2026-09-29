@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use m68k_asm::amiga_hunk_writer::generate_hunk_exe;
+use m68k_asm::amiga_hunk_writer::generate_relocatable_hunk_exe;
 use m68k_asm::assembler::Assembler;
 use m68k_asm::ieee695::generate_ieee695_sections;
 use m68k_asm::output::{
@@ -155,19 +155,25 @@ fn run(args: Args) -> Result<(), String> {
             .map_err(|e| format!("{}: cannot read: {}", input_name, e))?
     };
 
-    // Assemble
-    let mut asm = Assembler::new(origin);
-    asm.set_cpu(&args.cpu);
-    asm.set_optimize(args.optimize);
-    for dir in &args.include_paths {
-        asm.add_include_path(dir.clone());
-    }
-    // With stdin there is no source directory to resolve relative INCLUDEs
-    // against; the current directory (and any -I paths) is all we have.
-    if !reading_stdin && let Some(parent) = args.input.parent() {
-        asm.set_source_root(parent.to_path_buf());
-    }
-    asm.errors.filename = input_name.clone();
+    // Assemble. The hunk writer assembles again with sections moved, so the
+    // setup lives in one place.
+    let new_assembler = |origin: u32| {
+        let mut asm = Assembler::new(origin);
+        asm.set_cpu(&args.cpu);
+        asm.set_optimize(args.optimize);
+        for dir in &args.include_paths {
+            asm.add_include_path(dir.clone());
+        }
+        // With stdin there is no source directory to resolve relative
+        // INCLUDEs against; the current directory (and any -I paths) is all
+        // we have.
+        if !reading_stdin && let Some(parent) = args.input.parent() {
+            asm.set_source_root(parent.to_path_buf());
+        }
+        asm.errors.filename = input_name.clone();
+        asm
+    };
+    let mut asm = new_assembler(origin);
 
     // Translate through the source map before reporting: INCLUDE and
     // macro expansion both change line numbers, so the number the
@@ -318,7 +324,21 @@ fn run(args: Args) -> Result<(), String> {
             return write_auxiliary_outputs(&asm, &args, &input_name);
         }
         OutputFormatArg::HunkExe => {
-            let hunk = generate_hunk_exe(&asm.sections, &asm.symbols);
+            let hunk = generate_relocatable_hunk_exe(&asm, |origin, overrides| {
+                let mut moved = new_assembler(origin);
+                for (kind, at) in overrides {
+                    moved.sections.set_origin_override(kind.clone(), *at);
+                }
+                moved.assemble(&source)?;
+                Ok(moved)
+            })
+            .map_err(|e| {
+                format!(
+                    "{}: {}",
+                    source_location(&asm, e.line_no, &input_name),
+                    e.message
+                )
+            })?;
             write_output(&output_path, &hunk)?;
             eprintln!(
                 "Assembled {} instructions, {} bytes -> {}",

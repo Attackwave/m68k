@@ -230,6 +230,9 @@ pub struct SectionManager {
     /// Incremented for each newly created section, giving every one a
     /// stable declaration index despite the HashMap.
     next_order: usize,
+    /// Origins for sections created later, keyed by kind. Lets the hunk
+    /// writer re-assemble with one section moved to find its relocations.
+    origin_overrides: HashMap<SectionKind, u32>,
 }
 
 impl SectionManager {
@@ -238,7 +241,11 @@ impl SectionManager {
             sections: HashMap::new(),
             current_section: None,
             default_origin,
-            next_order: 0,
+            // The default text section below takes order 0; starting here
+            // too made the first declared section tie with it, and the
+            // HashMap then decided which one became hunk 0 (the entry).
+            next_order: 1,
+            origin_overrides: HashMap::new(),
         };
         // Create default text section
         mgr.sections.insert(
@@ -276,12 +283,24 @@ impl SectionManager {
         if !self.sections.contains_key(&kind) {
             let order = self.next_order;
             self.next_order += 1;
+            let origin = self
+                .origin_overrides
+                .get(&kind)
+                .copied()
+                .unwrap_or(self.default_origin);
             self.sections.insert(
                 kind.clone(),
-                Section::with_order(kind.clone(), self.default_origin, order),
+                Section::with_order(kind.clone(), origin, order),
             );
         }
         self.current_section = Some(kind);
+    }
+
+    /// Place a section (other than the default text section, which follows
+    /// the assembler origin) at `origin` when it is first declared. An
+    /// explicit `SECTION name,origin` still wins.
+    pub fn set_origin_override(&mut self, kind: SectionKind, origin: u32) {
+        self.origin_overrides.insert(kind, origin);
     }
 
     pub fn add_instruction(&mut self, instr: AssembledInstruction) {
