@@ -13,8 +13,9 @@ debug adapter ship with the extension; nothing else needs to be on `PATH`.
   directories.
 - **Cycle counts**: exact 68000 timing at the end of every instruction line,
   from the official execution time tables with the effective address of
-  each operand. Instructions that depend on runtime data show their range
-  (`10/8` for a branch taken/not taken, `38-70` for MULU). Select lines to
+  each operand, shown as `(12 cyc)`. Instructions that depend on runtime
+  data show their range (`(10/8 cyc)` for a branch taken/not taken,
+  `(38-70 cyc)` for MULU). Select lines to
   see their total in the status bar. Shown when `m68k.cpu` is `68000`; on an
   Amiga, chip RAM accesses can take longer while DMA is busy.
 - **Custom chip registers**: hover any register name (`DMACON`, `BPLCON0`,

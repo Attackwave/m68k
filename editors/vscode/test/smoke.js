@@ -62,7 +62,7 @@ lsp.stdout.on('data', (chunk) => {
       send({ id: 4, method: 'textDocument/hover', params: { textDocument: doc, position: { line: 4, character: 18 } } });
     }
     if (msg.id === 2) {
-      assert.deepStrictEqual(msg.result.map((h) => [h.position.line, h.label]), [[2, '4'], [3, '16']]);
+      assert.deepStrictEqual(msg.result.map((h) => [h.position.line, h.label]), [[2, '(4 cyc)'], [3, '(16 cyc)']]);
       pending.delete('hints');
     }
     if (msg.id === 3) {

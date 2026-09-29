@@ -15,7 +15,9 @@ pub fn compute_inlay_hints(doc: &Document, range: Range) -> Vec<InlayHint> {
             let timing = instruction_timing(mnemonic, size, operands)?;
             Some(InlayHint {
                 position: Position::new(line as u32, raw.encode_utf16().count() as u32),
-                label: InlayHintLabel::String(timing.label),
+                // Bracketed with a unit, so a count is never read as an
+                // operand or a flag (`C` would suggest the carry flag).
+                label: InlayHintLabel::String(format!("({} cyc)", timing.label)),
                 kind: None,
                 text_edits: None,
                 tooltip: Some(InlayHintTooltip::String(format!(
@@ -166,7 +168,10 @@ mod tests {
             .collect();
         assert_eq!(
             got,
-            vec![(1, 23, "4".to_string()), (3, 7, "16".to_string())]
+            vec![
+                (1, 23, "(4 cyc)".to_string()),
+                (3, 7, "(16 cyc)".to_string())
+            ]
         );
     }
 
