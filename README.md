@@ -120,6 +120,7 @@ m68k-asm hello.s -f hunk-exe -o hello         # Amiga Hunk executable (LoadSeg()
 - `--map <file>` — export a memory map (address ranges per instruction).
 - `-I`, `--include <dir>` — add a directory to the `INCLUDE` search path (repeatable). Needed for sources that include the Amiga system headers by their logical path, e.g. `include 'exec/types.i'`.
 - `--optimize` — enable size-changing optimizations (see below). Off by default.
+- `--linedebug` — add source line debug info to a `hunk-exe` (see below).
 
 #### Optimization
 
@@ -169,10 +170,20 @@ project's own Hunk reader (`m68k_core::amiga_hunk`, also used by
 `m68k-disasm` to load Amiga executables directly).
 
 `-f elf`, `-f ieee695`, and `-f hunk-exe` emit one section/hunk per
-non-empty `SECTION` in the source. The assembler resolves all symbols to
-absolute addresses during assembly and does not emit relocation entries —
-`hunk-exe` output is a directly loadable executable, not a relinkable
-object file.
+non-empty `SECTION` in the source. The ELF and IEEE-695 writers resolve all
+symbols to absolute addresses and emit no relocation entries.
+
+`hunk-exe` output is a directly loadable executable, not a relinkable object
+file. It carries a `HUNK_RELOC32` table, so every 32-bit absolute address
+(`LEA label,A0`, `MOVE.L #label,D0`, `DC.L label`) is patched to wherever
+`LoadSeg()` places each hunk. An address in a smaller field
+(`MOVE.W #label,D0`) or a scaled one (`#label*2`) cannot be relocated and is
+reported as an error with its line. A `_C`/`_F` type suffix
+(`SECTION gfx,DATA_C`) or a `CHIP`/`FAST` argument (`SECTION buf,BSS,FAST`)
+sets the hunk's memory requirement, so bitplanes and samples land in chip RAM.
+`--linedebug` adds `LINE` debug hunks that map addresses back to source lines
+for debuggers; they embed absolute source paths, so leave the option off for
+release builds.
 
 ### Supported Directives
 
@@ -180,7 +191,7 @@ object file.
 |---|---|
 | `org <addr>` | Set origin address |
 | `equ <expr>` | Define constant |
-| `dc.b/w/l` | Define byte/word/long data |
+| `dc.b/w/l` | Define byte/word/long data. A value must fit its size (signed or unsigned). In `dc.b` a quoted literal is a byte string (`'it''s'` embeds a quote); in `dc.w`/`dc.l` it is a character constant (`'ab'` = `$6162`). Word and long data at an odd address draws a warning. |
 | `dc.s/d/x` | Define single/double/extended float |
 | `dc.p` | Define packed decimal (raw hex) |
 | `ds.b/w/l` | Define storage space |
