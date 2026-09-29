@@ -458,6 +458,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "m68k-dap"
+version = "2.3.0"
+dependencies = [
+ "m68k-asm",
+ "m68k-core",
+ "m68k-disasm",
+ "serde_json",
+]
+
+[[package]]
 name = "m68k-disasm"
 version = "2.4.7"
 dependencies = [

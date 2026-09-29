@@ -19,7 +19,8 @@
   ],
   "main": "./out/extension.js",
   "activationEvents": [
-    "workspaceContains:**/*.{s,asm,i}"
+    "workspaceContains:**/*.{s,asm,i}",
+    "onDebugResolve:m68k"
   ],
   "contributes": {
     "languages": [
@@ -73,6 +74,19 @@
           },
           "default": [],
           "description": "Additional INCLUDE directories passed to m68k-asm (-I), e.g. the Amiga NDK includes."
+        },
+        "m68k.emulator": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a UAE build with a GDB remote debugger (patched FS-UAE, or WinUAE with gdbserver). Used by F5 debugging."
+        },
+        "m68k.emulatorArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra emulator arguments, e.g. --amiga_model=A1200 or --kickstart_file=/path/kick.rom."
         }
       }
     },
@@ -144,6 +158,80 @@
       {
         "command": "m68k.restartServer",
         "title": "m68k: Restart Language Server"
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "m68k"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "m68k",
+        "label": "Amiga (UAE)",
+        "languages": [
+          "m68k"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Hunk executable to debug (built with --linedebug for source stepping)."
+              },
+              "emulator": {
+                "type": "string",
+                "description": "Emulator binary. Defaults to the m68k.emulator setting; omit both to attach to an already running emulator."
+              },
+              "emulatorArgs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Extra emulator arguments."
+              },
+              "serverPort": {
+                "type": "number",
+                "default": 2345,
+                "description": "Remote debugger port."
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Stop at the first instruction."
+              },
+              "build": {
+                "type": "boolean",
+                "default": true,
+                "description": "Assemble the program's source before launching."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "m68k",
+            "request": "launch",
+            "name": "Debug in UAE",
+            "program": "${fileDirname}/${fileBasenameNoExtension}",
+            "stopOnEntry": true
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "m68k: Debug in UAE",
+            "body": {
+              "type": "m68k",
+              "request": "launch",
+              "name": "Debug in UAE",
+              "program": "^\"\\${fileDirname}/\\${fileBasenameNoExtension}\"",
+              "stopOnEntry": true
+            }
+          }
+        ]
       }
     ]
   },
