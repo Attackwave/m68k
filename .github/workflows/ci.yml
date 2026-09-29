@@ -13,6 +13,14 @@ env:
 permissions:
   contents: read
 
+# A push to main is always a merged PR: branch protection requires the PR
+# to be up to date with main, so the PR run already tested this exact tree
+# on every platform. The push run therefore only repeats the quick checks
+# (Linux build, lints, tests, cargo audit) as a safety net for anything
+# that reaches main another way; the Windows/macOS builds, the MSRV check
+# and the fuzz smoke run are skipped there. Job names are unchanged, since
+# the branch protection's required checks refer to them.
+
 jobs:
   build:
     name: build (${{ matrix.os }})
@@ -23,7 +31,7 @@ jobs:
       # Windows-only path bug is distinguishable from a real regression.
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'push' && github.ref == 'refs/heads/main' && '["ubuntu-latest"]' || '["ubuntu-latest", "windows-latest", "macos-latest"]') }}
         include:
           # Lints and release artifacts only need to run once. Linux is the
           # primary target and the one the release binaries are cut from.
@@ -76,6 +84,7 @@ jobs:
 
   msrv:
     name: msrv (1.88)
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -117,6 +126,7 @@ jobs:
         run: cargo audit
 
   fuzz-smoke:
+    if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
