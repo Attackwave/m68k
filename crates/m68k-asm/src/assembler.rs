@@ -1520,6 +1520,81 @@ fn undefined_symbol_name(text: &str, symbols: &SymbolTable) -> Option<String> {
     }
 }
 
+/// The first identifier in an operand that names no defined symbol.
+///
+/// [`undefined_symbol_name`] only covers an operand that is a bare
+/// identifier. Inside a displacement or an expression the evaluator falls
+/// back to 0 so pass 1 can size forward references, and nothing looked
+/// again in pass 2: `GM_HEIGHT(A2)` with `GM_HEIGHT` never defined
+/// assembled to `0(A2)`. This scans every identifier of the operand and
+/// asks the evaluator about each, so built-in names and local labels are
+/// judged exactly as they are everywhere else.
+fn undefined_symbol_in_operand(text: &str, symbols: &SymbolTable, pc: u32) -> Option<String> {
+    const SPECIAL: &[&str] = &[
+        "pc", "zpc", "sr", "ccr", "usp", "ssp", "msp", "isp", "vbr", "sfc", "dfc", "cacr", "caar",
+        "fpcr", "fpsr", "fpiar", "tc", "itt0", "itt1", "dtt0", "dtt1", "mmusr", "urp", "srp",
+        "crp", "psr", "pcsr", "tt0", "tt1", "buscr", "pcr", "acr0", "acr1", "acr2", "acr3",
+        "mmubar", "rombar", "rambar", "rambar0", "rambar1", "mbar", "val", "cal", "scc", "ac",
+        "drp", "bad", "bac", // CINV/CPUSH cache selectors
+        "nc", "dc", "ic", "bc",
+    ];
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        let run_end = |from: usize| {
+            from + bytes[from..]
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'@'))
+                .count()
+        };
+        match c {
+            b'"' | b'\'' => {
+                // String literal: skip to the closing quote.
+                i += 1 + bytes[i + 1..].iter().take_while(|&&b| b != c).count() + 1;
+            }
+            // Numbers: $hex, %bin, @oct and decimal.
+            b'$' | b'%' | b'@' | b'0'..=b'9' => i = run_end(i + 1),
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'.' => {
+                let end = run_end(i + 1);
+                let token = &text[i..end];
+                i = end;
+                // `label.w`, `d0.l`: the size suffix is not part of the name.
+                let name = match token.rsplit_once('.') {
+                    Some((base, sfx))
+                        if !base.is_empty()
+                            && matches!(
+                                sfx.to_ascii_lowercase().as_str(),
+                                "b" | "w" | "l" | "s"
+                            ) =>
+                    {
+                        base
+                    }
+                    _ => token,
+                };
+                let lower = name.to_ascii_lowercase();
+                let is_reg = parse_register(name).is_some()
+                    || SPECIAL.contains(&lower.as_str())
+                    || (lower.len() == 3
+                        && (lower.starts_with("fp")
+                            || lower.starts_with("za")
+                            || lower.starts_with("zd"))
+                        && lower.as_bytes()[2].is_ascii_digit());
+                if is_reg {
+                    continue;
+                }
+                if let Err(e) = evaluate_expr_str(name, symbols, pc)
+                    && e.message.contains("undefined symbol")
+                {
+                    return Some(name.to_string());
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// An error at a known place in a known file, needing no translation.
 ///
 /// `file` is `None` for the top-level source, whose line numbers the
@@ -3892,6 +3967,13 @@ impl Assembler {
             // status 0: working output for a program that cannot run.
             Ok(Operand::Address(0)) if undefined_symbol_name(text, symbols).is_some() => {
                 let name = undefined_symbol_name(text, symbols).unwrap();
+                operand_error.get_or_insert(AsmError::new(format!("undefined symbol: {name}")));
+                None
+            }
+            // An undefined symbol inside a displacement or expression
+            // evaluated to 0 above; by pass 2 that can only be a mistake.
+            Ok(_) if undefined_symbol_in_operand(text, symbols, pc).is_some() => {
+                let name = undefined_symbol_in_operand(text, symbols, pc).unwrap();
                 operand_error.get_or_insert(AsmError::new(format!("undefined symbol: {name}")));
                 None
             }
@@ -7615,6 +7697,36 @@ mymexc MACRO
             "error should name the missing symbol, got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn test_undefined_symbol_in_displacement_is_an_error() {
+        // The evaluator falls back to 0 for pass-1 sizing; `GM_HEIGHT(A2)`
+        // with GM_HEIGHT never defined used to assemble to `0(A2)`.
+        for src in [
+            " MOVE.W GM_HEIGHT(A2),D4",
+            " MOVE.W (GM_HEIGHT,A2),D4",
+            " MOVE.W GM_HEIGHT(A2,D0.W),D4",
+            " MOVE.W GM_HEIGHT+2(A2),D4",
+            " MOVE.W D4,GM_HEIGHT(A2)",
+            " LEA GM_HEIGHT(PC),A0",
+        ] {
+            let err = Assembler::new(0).assemble(src).map(|_| ()).unwrap_err();
+            assert!(err.message.contains("GM_HEIGHT"), "{src}: {}", err.message);
+        }
+        // Defined names, forward references, local labels, registers with
+        // size suffixes and cache selectors all still assemble.
+        let ok = "\
+F EQU 4
+fn: MOVE.W F(A2,D0.W),D4
+ MOVE.W later(PC),D0
+.l: BRA.S .l
+ CINVA BC
+later: DC.W 0
+";
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68040");
+        asm.assemble(ok).unwrap();
     }
 
     #[test]
