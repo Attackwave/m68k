@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use m68k_asm::amiga_hunk_writer::generate_hunk_exe;
+use m68k_asm::amiga_hunk_writer::{LineOf, generate_relocatable_hunk_exe};
 use m68k_asm::assembler::Assembler;
 use m68k_asm::ieee695::generate_ieee695_sections;
 use m68k_asm::output::{
@@ -46,6 +46,11 @@ struct Args {
     /// suffix always yields the short form regardless.
     #[arg(long)]
     optimize: bool,
+
+    /// Add source line debug info (`LINE` debug hunks) to a hunk
+    /// executable, for source-level debugging.
+    #[arg(long)]
+    linedebug: bool,
 
     /// S-Record header name (used with -f srecord)
     #[arg(long, default_value = "m68k-asm")]
@@ -155,19 +160,25 @@ fn run(args: Args) -> Result<(), String> {
             .map_err(|e| format!("{}: cannot read: {}", input_name, e))?
     };
 
-    // Assemble
-    let mut asm = Assembler::new(origin);
-    asm.set_cpu(&args.cpu);
-    asm.set_optimize(args.optimize);
-    for dir in &args.include_paths {
-        asm.add_include_path(dir.clone());
-    }
-    // With stdin there is no source directory to resolve relative INCLUDEs
-    // against; the current directory (and any -I paths) is all we have.
-    if !reading_stdin && let Some(parent) = args.input.parent() {
-        asm.set_source_root(parent.to_path_buf());
-    }
-    asm.errors.filename = input_name.clone();
+    // Assemble. The hunk writer assembles again with sections moved, so the
+    // setup lives in one place.
+    let new_assembler = |origin: u32| {
+        let mut asm = Assembler::new(origin);
+        asm.set_cpu(&args.cpu);
+        asm.set_optimize(args.optimize);
+        for dir in &args.include_paths {
+            asm.add_include_path(dir.clone());
+        }
+        // With stdin there is no source directory to resolve relative
+        // INCLUDEs against; the current directory (and any -I paths) is all
+        // we have.
+        if !reading_stdin && let Some(parent) = args.input.parent() {
+            asm.set_source_root(parent.to_path_buf());
+        }
+        asm.errors.filename = input_name.clone();
+        asm
+    };
+    let mut asm = new_assembler(origin);
 
     // Translate through the source map before reporting: INCLUDE and
     // macro expansion both change line numbers, so the number the
@@ -318,7 +329,35 @@ fn run(args: Args) -> Result<(), String> {
             return write_auxiliary_outputs(&asm, &args, &input_name);
         }
         OutputFormatArg::HunkExe => {
-            let hunk = generate_hunk_exe(&asm.sections, &asm.symbols);
+            // Debuggers open these paths, so they are absolute; diagnostics
+            // keep the short names.
+            // `absolute`, not `canonicalize`: no `\\?\` prefix on Windows,
+            // and symlinks stay as the editor sees them.
+            let main_file = std::path::absolute(&args.input).unwrap_or_else(|_| args.input.clone());
+            let line_of = |line_no: usize| {
+                let origin = asm.source_origin(line_no)?;
+                let path = match &origin.file {
+                    Some(name) => asm.include_paths_resolved.get(name)?,
+                    None => &main_file,
+                };
+                Some((path.to_string_lossy().into_owned(), origin.line as u32))
+            };
+            let line_of: Option<LineOf> = args.linedebug.then_some(&line_of as LineOf);
+            let hunk = generate_relocatable_hunk_exe(&asm, line_of, |origin, overrides| {
+                let mut moved = new_assembler(origin);
+                for (kind, at) in overrides {
+                    moved.sections.set_origin_override(kind.clone(), *at);
+                }
+                moved.assemble(&source)?;
+                Ok(moved)
+            })
+            .map_err(|e| {
+                format!(
+                    "{}: {}",
+                    source_location(&asm, e.line_no, &input_name),
+                    e.message
+                )
+            })?;
             write_output(&output_path, &hunk)?;
             eprintln!(
                 "Assembled {} instructions, {} bytes -> {}",
@@ -419,7 +458,10 @@ fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Re
         let mut sym_out = String::new();
         sym_out.push_str(&format!("; Symbol table for {}\n\n", input_name));
         let mut syms: Vec<_> = asm.symbols.iter().collect();
-        syms.sort_by_key(|(name, _)| name.to_lowercase());
+        // Case-insensitive order, ties broken by the exact name: `err_exist`
+        // and `ERR_EXIST` otherwise came out in hash-map order, so the file
+        // differed from run to run.
+        syms.sort_by_cached_key(|(name, _)| (name.to_lowercase(), name.to_string()));
         for (name, entry) in &syms {
             sym_out.push_str(&format!("{:<20} = ${:06X}\n", name, entry.value));
         }
@@ -454,7 +496,10 @@ fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Re
     if asm.symbols.iter().count() > 0 {
         eprintln!("\nSymbols:");
         let mut syms: Vec<_> = asm.symbols.iter().collect();
-        syms.sort_by_key(|(name, _)| name.to_lowercase());
+        // Case-insensitive order, ties broken by the exact name: `err_exist`
+        // and `ERR_EXIST` otherwise came out in hash-map order, so the file
+        // differed from run to run.
+        syms.sort_by_cached_key(|(name, _)| (name.to_lowercase(), name.to_string()));
         for (name, entry) in syms {
             eprintln!("  {:<20} ${:08X}", name, entry.value);
         }

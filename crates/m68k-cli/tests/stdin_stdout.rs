@@ -156,3 +156,49 @@ fn disasm_empty_stdin_is_an_error() {
         stderr
     );
 }
+
+/// Symbols differing only in case sorted equal, so their order came from
+/// hash-map iteration and the file changed between identical runs.
+#[test]
+fn symbol_table_is_deterministic() {
+    let dir = std::env::temp_dir().join(format!("m68k-sym-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = dir.join("s.s");
+    let mut text = String::new();
+    for i in 0..40 {
+        text.push_str(&format!("ERR_{i} EQU {i}\nerr_{i}: nop\n"));
+    }
+    std::fs::write(&src, text).unwrap();
+
+    let tables: Vec<String> = (0..5)
+        .map(|n| {
+            let sym = dir.join(format!("{n}.sym"));
+            let out = Command::new(asm())
+                .args([
+                    src.to_str().unwrap(),
+                    "-o",
+                    dir.join("s.bin").to_str().unwrap(),
+                ])
+                .args(["--sym", sym.to_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            std::fs::read_to_string(sym).unwrap()
+        })
+        .collect();
+    assert!(
+        tables.windows(2).all(|w| w[0] == w[1]),
+        "symbol table differs between runs"
+    );
+    // Exact-name tie break: upper case first.
+    let first = tables[0]
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("err_0 "))
+        .unwrap();
+    assert!(first.starts_with("ERR_0 "), "{first}");
+    std::fs::remove_dir_all(&dir).ok();
+}

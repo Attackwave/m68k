@@ -1520,6 +1520,81 @@ fn undefined_symbol_name(text: &str, symbols: &SymbolTable) -> Option<String> {
     }
 }
 
+/// The first identifier in an operand that names no defined symbol.
+///
+/// [`undefined_symbol_name`] only covers an operand that is a bare
+/// identifier. Inside a displacement or an expression the evaluator falls
+/// back to 0 so pass 1 can size forward references, and nothing looked
+/// again in pass 2: `GM_HEIGHT(A2)` with `GM_HEIGHT` never defined
+/// assembled to `0(A2)`. This scans every identifier of the operand and
+/// asks the evaluator about each, so built-in names and local labels are
+/// judged exactly as they are everywhere else.
+fn undefined_symbol_in_operand(text: &str, symbols: &SymbolTable, pc: u32) -> Option<String> {
+    const SPECIAL: &[&str] = &[
+        "pc", "zpc", "sr", "ccr", "usp", "ssp", "msp", "isp", "vbr", "sfc", "dfc", "cacr", "caar",
+        "fpcr", "fpsr", "fpiar", "tc", "itt0", "itt1", "dtt0", "dtt1", "mmusr", "urp", "srp",
+        "crp", "psr", "pcsr", "tt0", "tt1", "buscr", "pcr", "acr0", "acr1", "acr2", "acr3",
+        "mmubar", "rombar", "rambar", "rambar0", "rambar1", "mbar", "val", "cal", "scc", "ac",
+        "drp", "bad", "bac", // CINV/CPUSH cache selectors
+        "nc", "dc", "ic", "bc",
+    ];
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        let run_end = |from: usize| {
+            from + bytes[from..]
+                .iter()
+                .take_while(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$' | b'@'))
+                .count()
+        };
+        match c {
+            b'"' | b'\'' => {
+                // String literal: skip to the closing quote.
+                i += 1 + bytes[i + 1..].iter().take_while(|&&b| b != c).count() + 1;
+            }
+            // Numbers: $hex, %bin, @oct and decimal.
+            b'$' | b'%' | b'@' | b'0'..=b'9' => i = run_end(i + 1),
+            b'a'..=b'z' | b'A'..=b'Z' | b'_' | b'.' => {
+                let end = run_end(i + 1);
+                let token = &text[i..end];
+                i = end;
+                // `label.w`, `d0.l`: the size suffix is not part of the name.
+                let name = match token.rsplit_once('.') {
+                    Some((base, sfx))
+                        if !base.is_empty()
+                            && matches!(
+                                sfx.to_ascii_lowercase().as_str(),
+                                "b" | "w" | "l" | "s"
+                            ) =>
+                    {
+                        base
+                    }
+                    _ => token,
+                };
+                let lower = name.to_ascii_lowercase();
+                let is_reg = parse_register(name).is_some()
+                    || SPECIAL.contains(&lower.as_str())
+                    || (lower.len() == 3
+                        && (lower.starts_with("fp")
+                            || lower.starts_with("za")
+                            || lower.starts_with("zd"))
+                        && lower.as_bytes()[2].is_ascii_digit());
+                if is_reg {
+                    continue;
+                }
+                if let Err(e) = evaluate_expr_str(name, symbols, pc)
+                    && e.message.contains("undefined symbol")
+                {
+                    return Some(name.to_string());
+                }
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
 /// An error at a known place in a known file, needing no translation.
 ///
 /// `file` is `None` for the top-level source, whose line numbers the
@@ -1833,6 +1908,11 @@ pub struct Assembler {
     pub register_aliases: HashMap<String, String>,
     /// Files already spliced in, so each is included only once.
     included_files: std::collections::HashSet<PathBuf>,
+    /// Absolute path of every included file, keyed by the name
+    /// [`SourceOrigin::file`] carries (the name as written in `INCLUDE`).
+    /// Debug info needs a path a debugger can open; diagnostics keep the
+    /// short name.
+    pub include_paths_resolved: HashMap<String, PathBuf>,
     /// Most recent global (non-local) label, used to scope local labels.
     ///
     /// A local label (`.loop`) belongs to the global label above it, so
@@ -1950,6 +2030,7 @@ impl Assembler {
             conditional_results: HashMap::new(),
             register_aliases: HashMap::new(),
             included_files: std::collections::HashSet::new(),
+            include_paths_resolved: HashMap::new(),
             conditional_stack: Vec::new(),
             macro_definitions: HashMap::new(),
             macro_unique_counter: 0,
@@ -1970,6 +2051,25 @@ impl Assembler {
         self.sections.add_instruction(instr.clone());
         self.code.push(instr);
         self.sections.set_current_pc(self.pc + size);
+    }
+
+    /// Warn about word or long data starting at an odd address.
+    ///
+    /// Instructions are padded to an even address, data is not: moving it
+    /// would shift every label after it. A word or long access to an odd
+    /// address raises an address error on the 68000, so the layout is kept
+    /// and the line flagged.
+    fn warn_if_odd(&mut self, directive: &str, element_size: u32, line: &ParsedLine) {
+        if element_size >= 2 && !self.pc.is_multiple_of(2) {
+            self.errors.warning(
+                format!(
+                    "{directive} at odd address ${:X}: word and long accesses to it raise an \
+                     address error on the 68000 (EVEN before it aligns it)",
+                    self.pc
+                ),
+                Some(line.line_no),
+            );
+        }
     }
 
     /// Emit a single zero pad byte to restore word alignment.
@@ -2763,6 +2863,11 @@ impl Assembler {
             if !self.included_files.insert(canonical) {
                 continue;
             }
+            // Not the canonical path: on Windows that carries a `\\?\`
+            // prefix no editor uses, so a debugger could not match it.
+            let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+            self.include_paths_resolved
+                .insert(filename.clone(), absolute);
 
             let content = std::fs::read_to_string(&path).map_err(|e| {
                 here(
@@ -3137,7 +3242,7 @@ impl Assembler {
                     let trimmed = value_str.trim();
                     if matches!(size_suffix, "s" | "d" | "x" | "p") {
                         total = total.saturating_add(element_size);
-                    } else if trimmed.starts_with('"') || trimmed.starts_with('\'') {
+                    } else if crate::directives::is_string_literal(trimmed) && element_size == 1 {
                         let bytes = crate::directives::parse_dc_string(trimmed).map_err(|e| {
                             AsmError::with_line(format!("invalid DC string: {}", e), line_no)
                         })?;
@@ -3884,6 +3989,13 @@ impl Assembler {
                 operand_error.get_or_insert(AsmError::new(format!("undefined symbol: {name}")));
                 None
             }
+            // An undefined symbol inside a displacement or expression
+            // evaluated to 0 above; by pass 2 that can only be a mistake.
+            Ok(_) if undefined_symbol_in_operand(text, symbols, pc).is_some() => {
+                let name = undefined_symbol_in_operand(text, symbols, pc).unwrap();
+                operand_error.get_or_insert(AsmError::new(format!("undefined symbol: {name}")));
+                None
+            }
             Ok(op) => Some(op),
             Err(e) => {
                 operand_error.get_or_insert(e);
@@ -4602,6 +4714,11 @@ impl Assembler {
                 ));
             }
         };
+        self.warn_if_odd(
+            &format!("DC.{}", size_suffix.to_ascii_uppercase()),
+            element_size,
+            line,
+        );
 
         let mut words = Vec::new();
         let mut total_bytes: usize = 0;
@@ -4618,14 +4735,10 @@ impl Assembler {
                 continue;
             }
 
-            // Check if it's a string literal
-            if trimmed.starts_with('"') || trimmed.starts_with('\'') {
-                if element_size != 1 {
-                    return Err(AsmError::with_line(
-                        "string literals only supported with DC.B",
-                        line.line_no,
-                    ));
-                }
+            // A string literal is a byte sequence in DC.B. In DC.W/DC.L it is
+            // a character constant and goes through the expression
+            // evaluator below like any other value ('ab' = $6162).
+            if crate::directives::is_string_literal(trimmed) && element_size == 1 {
                 let bytes = parse_dc_string(trimmed).map_err(|e| {
                     AsmError::with_line(format!("invalid DC string: {}", e), line.line_no)
                 })?;
@@ -4641,6 +4754,38 @@ impl Assembler {
             } else {
                 let value = evaluate_expr_str(value_str, &self.symbols, self.pc)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
+
+                // Signed or unsigned, but it has to fit: masking made
+                // `DC.B 300` emit $2C and `DC.W $12345` emit $2345.
+                // Symbols are stored as 32-bit values, so `X EQU -1` comes
+                // back as $FFFFFFFF; read the upper half of the 32-bit
+                // range as negative, as the CPU would.
+                let signed32 = |v: i64| {
+                    if (0x8000_0000..=0xFFFF_FFFF).contains(&v) {
+                        v - (1i64 << 32)
+                    } else {
+                        v
+                    }
+                };
+                let bits = element_size as u32 * 8;
+                let value = if bits < 32 { signed32(value) } else { value };
+                if value < -(1i64 << (bits - 1)) || value > (1i64 << bits) - 1 {
+                    let name = match element_size {
+                        1 => "DC.B",
+                        2 => "DC.W",
+                        _ => "DC.L",
+                    };
+                    return Err(AsmError::with_line(
+                        format!(
+                            "value {value} ({}${:X}) does not fit {name} ({}..{})",
+                            if value < 0 { "-" } else { "" },
+                            value.unsigned_abs(),
+                            -(1i64 << (bits - 1)),
+                            (1i64 << bits) - 1
+                        ),
+                        line.line_no,
+                    ));
+                }
 
                 match element_size {
                     1 => {
@@ -4723,6 +4868,11 @@ impl Assembler {
                 ));
             }
         };
+        self.warn_if_odd(
+            &format!("DS.{}", size_suffix.to_ascii_uppercase()),
+            element_size,
+            line,
+        );
 
         // DS reserves space but doesn't emit code
         // Just advance the PC
@@ -4767,6 +4917,11 @@ impl Assembler {
                 ));
             }
         };
+        self.warn_if_odd(
+            &format!("DCB.{}", size_suffix.to_ascii_uppercase()),
+            element_size,
+            line,
+        );
         // Reject before allocating: element_size * count can overflow u32
         // (panicking on a crafted DCB.L $80000000,0) and, even unchecked,
         // a huge count would otherwise drive an unbounded Vec allocation
@@ -7603,6 +7758,103 @@ mymexc MACRO
             err.message.contains("NOSUCHSYM"),
             "error should name the missing symbol, got: {}",
             err.message
+        );
+    }
+
+    #[test]
+    fn test_undefined_symbol_in_displacement_is_an_error() {
+        // The evaluator falls back to 0 for pass-1 sizing; `GM_HEIGHT(A2)`
+        // with GM_HEIGHT never defined used to assemble to `0(A2)`.
+        for src in [
+            " MOVE.W GM_HEIGHT(A2),D4",
+            " MOVE.W (GM_HEIGHT,A2),D4",
+            " MOVE.W GM_HEIGHT(A2,D0.W),D4",
+            " MOVE.W GM_HEIGHT+2(A2),D4",
+            " MOVE.W D4,GM_HEIGHT(A2)",
+            " LEA GM_HEIGHT(PC),A0",
+        ] {
+            let err = Assembler::new(0).assemble(src).map(|_| ()).unwrap_err();
+            assert!(err.message.contains("GM_HEIGHT"), "{src}: {}", err.message);
+        }
+        // Defined names, forward references, local labels, registers with
+        // size suffixes and cache selectors all still assemble.
+        let ok = "\
+F EQU 4
+fn: MOVE.W F(A2,D0.W),D4
+ MOVE.W later(PC),D0
+.l: BRA.S .l
+ CINVA BC
+later: DC.W 0
+";
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68040");
+        asm.assemble(ok).unwrap();
+    }
+
+    #[test]
+    fn test_character_constants_pack_up_to_four_bytes() {
+        let bytes = |src: &str| Assembler::new(0).assemble_bytes(src).unwrap();
+        // Immediates took only the first character: #'Hell' was #'H'.
+        assert_eq!(
+            bytes(" CMPI.L #'Hell',D0"),
+            [0x0C, 0x80, 0x48, 0x65, 0x6C, 0x6C]
+        );
+        assert_eq!(bytes(" MOVE.W #'ab',D1"), [0x32, 0x3C, 0x61, 0x62]);
+        // In DC.W/DC.L a quoted literal is a right-justified constant.
+        assert_eq!(bytes(" DC.L 'Hell'"), [0x48, 0x65, 0x6C, 0x6C]);
+        assert_eq!(bytes(" DC.L 'ab'"), [0, 0, 0x61, 0x62]);
+        assert_eq!(bytes(" DC.W 'ab'"), [0x61, 0x62]);
+        // DC.B: an expression starting with a quote is evaluated, not
+        // copied as text; a doubled quote is one embedded quote.
+        assert_eq!(bytes(" DC.B 'x'+1"), [0x79]);
+        assert_eq!(bytes(" DC.B 'it''s'"), b"it's");
+        let err = Assembler::new(0)
+            .assemble(" MOVE.L #'Hello',D0")
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.message.contains("1 to 4 characters"), "{}", err.message);
+    }
+
+    #[test]
+    fn test_dc_values_must_fit_their_size() {
+        let fails = |src: &str| {
+            Assembler::new(0)
+                .assemble(src)
+                .map(|_| ())
+                .unwrap_err()
+                .message
+        };
+        assert!(fails(" DC.B 300").contains("does not fit DC.B"));
+        assert!(fails(" DC.B -129").contains("-$81"));
+        assert!(fails(" DC.W $12345").contains("does not fit DC.W"));
+        assert!(fails(" DC.W 'abc'").contains("does not fit DC.W"));
+        // Both signed and unsigned readings are accepted, and a negative
+        // EQU (stored as 32 bits) still fits a byte.
+        let ok = "M1 EQU -1\n DC.B -128,255,M1\n EVEN\n DC.W -32768,$FFFF\n DC.L -1,$FFFFFFFF\n";
+        #[rustfmt::skip]
+        let expected = [
+            0x80, 0xFF, 0xFF, 0x00, // bytes, padded by EVEN
+            0x80, 0x00, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        ];
+        assert_eq!(Assembler::new(0).assemble_bytes(ok).unwrap(), expected);
+    }
+
+    #[test]
+    fn test_word_data_at_odd_address_warns_without_moving() {
+        let mut asm = Assembler::new(0);
+        let bytes = asm
+            .assemble_bytes(" DC.B 1\nw: DC.W 2\n DS.L 1\n EVEN\n DC.L 4\n DC.B 5\n DC.B 6\n")
+            .unwrap();
+        // Layout unchanged: DC.W still starts at 1.
+        assert_eq!(&bytes[..3], &[1, 0, 2]);
+        assert_eq!(asm.symbols.get("w").unwrap().value, 1);
+        let lines: Vec<Option<usize>> = asm.errors.warnings.iter().map(|w| w.line_no).collect();
+        assert_eq!(lines, vec![Some(2), Some(3)]);
+        assert!(
+            asm.errors.warnings[0]
+                .message
+                .contains("DC.W at odd address $1")
         );
     }
 

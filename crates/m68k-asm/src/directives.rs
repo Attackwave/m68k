@@ -61,6 +61,9 @@ pub struct Section {
     /// hunk writer mapped every `Named` section to `HUNK_CODE`, turning a
     /// declared data section into executable code in the output file.
     pub declared_kind: Option<SectionKind>,
+    /// Memory the loader must allocate the section in, from a `_C`/`_F`
+    /// type suffix or a `CHIP`/`FAST` argument.
+    pub memory: Memory,
     /// Position of this section's first `SECTION` directive in the source.
     ///
     /// Sections live in a `HashMap`, whose iteration order is arbitrary, so
@@ -85,6 +88,7 @@ impl Section {
         Self {
             kind,
             declared_kind: None,
+            memory: Memory::Any,
             order,
             origin,
             pc: origin,
@@ -230,6 +234,9 @@ pub struct SectionManager {
     /// Incremented for each newly created section, giving every one a
     /// stable declaration index despite the HashMap.
     next_order: usize,
+    /// Origins for sections created later, keyed by kind. Lets the hunk
+    /// writer re-assemble with one section moved to find its relocations.
+    origin_overrides: HashMap<SectionKind, u32>,
 }
 
 impl SectionManager {
@@ -238,7 +245,11 @@ impl SectionManager {
             sections: HashMap::new(),
             current_section: None,
             default_origin,
-            next_order: 0,
+            // The default text section below takes order 0; starting here
+            // too made the first declared section tie with it, and the
+            // HashMap then decided which one became hunk 0 (the entry).
+            next_order: 1,
+            origin_overrides: HashMap::new(),
         };
         // Create default text section
         mgr.sections.insert(
@@ -276,12 +287,24 @@ impl SectionManager {
         if !self.sections.contains_key(&kind) {
             let order = self.next_order;
             self.next_order += 1;
+            let origin = self
+                .origin_overrides
+                .get(&kind)
+                .copied()
+                .unwrap_or(self.default_origin);
             self.sections.insert(
                 kind.clone(),
-                Section::with_order(kind.clone(), self.default_origin, order),
+                Section::with_order(kind.clone(), origin, order),
             );
         }
         self.current_section = Some(kind);
+    }
+
+    /// Place a section (other than the default text section, which follows
+    /// the assembler origin) at `origin` when it is first declared. An
+    /// explicit `SECTION name,origin` still wins.
+    pub fn set_origin_override(&mut self, kind: SectionKind, origin: u32) {
+        self.origin_overrides.insert(kind, origin);
     }
 
     pub fn add_instruction(&mut self, instr: AssembledInstruction) {
@@ -532,6 +555,29 @@ pub fn handle_even_pass2(
 /// attribute suffixes (`_C` chip, `_F` fast, `_P` public) are accepted and
 /// ignored, since this assembler resolves everything to absolute addresses
 /// and never emits the hunk memory flags they control.
+/// Memory requirement of a section, carried into the hunk header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Memory {
+    #[default]
+    Any,
+    Chip,
+    Fast,
+}
+
+impl Memory {
+    /// From a type suffix (`DATA_C`) or a separate memory argument (`CHIP`).
+    fn parse(word: &str) -> Option<Memory> {
+        let upper = word.trim().to_ascii_uppercase();
+        let tag = upper.rsplit_once('_').map_or(upper.as_str(), |(_, t)| t);
+        match tag {
+            "C" | "CHIP" => Some(Memory::Chip),
+            "F" | "FAST" => Some(Memory::Fast),
+            "P" | "PUBLIC" => Some(Memory::Any),
+            _ => None,
+        }
+    }
+}
+
 fn section_type_keyword(arg: &str) -> Option<SectionKind> {
     let upper = arg.trim().to_ascii_uppercase();
     let base = upper
@@ -610,6 +656,24 @@ pub fn handle_section(
         && let Some(section) = sections.sections.get_mut(&kind)
     {
         section.declared_kind = Some(declared);
+        // `DATA_C`, or `DATA,CHIP` as a third argument. Dropping this put
+        // bitplanes and samples in fast RAM, where the custom chips cannot
+        // reach them.
+        let memory = args[1]
+            .contains('_')
+            .then(|| Memory::parse(&args[1]))
+            .flatten();
+        let memory = match (memory, args.get(2)) {
+            (Some(m), _) => m,
+            (None, Some(arg)) => Memory::parse(arg).ok_or_else(|| {
+                AsmError::with_line(
+                    format!("unknown SECTION memory type: {}", arg.trim()),
+                    line_no,
+                )
+            })?,
+            (None, None) => Memory::Any,
+        };
+        section.memory = memory;
     }
 
     Ok(DirectiveResult::with_pc(sections.current_pc()))
@@ -870,10 +934,19 @@ fn tokenize_expr(text: &str, pc: u32) -> Result<Vec<ExprToken>, String> {
             if i < chars.len() {
                 i += 1; // skip closing quote
             }
-            // Return first character as number for DC.B "string" handling
-            if !s.is_empty() {
-                tokens.push(ExprToken::Num(s.as_bytes()[0] as i64));
+            // A character constant: up to four bytes packed big-endian and
+            // right-justified, so 'ab' is $6162 and 'Hell' is $48656C6C.
+            // Taking only the first byte made `CMPI.L #'Hell',D0` compare
+            // against 'H' without any message.
+            let bytes = s.as_bytes();
+            if bytes.is_empty() || bytes.len() > 4 {
+                return Err(format!(
+                    "character constant {quote}{s}{quote} must have 1 to 4 characters"
+                ));
             }
+            tokens.push(ExprToken::Num(
+                bytes.iter().fold(0i64, |v, &b| (v << 8) | b as i64),
+            ));
             continue;
         }
 
@@ -1580,8 +1653,33 @@ pub fn parse_string_literal(s: &str) -> Result<String, String> {
 }
 
 /// Parse DC string argument into bytes.
+/// Whether `s` is exactly one quoted literal, e.g. `'abc'` or `"a\"b"`,
+/// as opposed to an expression that merely starts with one (`'x'+1`).
+pub fn is_string_literal(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    let Some(&quote) = bytes.first().filter(|&&q| q == b'"' || q == b'\'') else {
+        return false;
+    };
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            // A doubled quote is an embedded quote character.
+            q if q == quote && bytes.get(i + 1) == Some(&quote) => i += 2,
+            q if q == quote => return i == bytes.len() - 1,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
 pub fn parse_dc_string(s: &str) -> Result<Vec<u8>, String> {
     let parsed = parse_string_literal(s)?;
+    // A doubled delimiter is one embedded quote: 'it''s' is `it's`.
+    let parsed = match s.chars().next() {
+        Some(q @ ('\'' | '"')) => parsed.replace(&format!("{q}{q}"), &q.to_string()),
+        _ => parsed,
+    };
     Ok(parsed.as_bytes().to_vec())
 }
 

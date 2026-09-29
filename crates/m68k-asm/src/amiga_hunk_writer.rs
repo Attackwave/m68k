@@ -10,23 +10,28 @@
 //! (this crate's own Hunk reader, itself checked against reference
 //! -Fhunkexe` output) and manually inspected with `hexdump`.
 //!
-//! # Limitations
+//! # Relocations
 //!
-//! Like the ELF32/IEEE-695 writers, the assembler resolves all symbol
-//! references to absolute values before this writer ever sees them, so
-//! there are no `HUNK_RELOC32`/`HUNK_EXT` records — every hunk is emitted
-//! as already-relocated, self-contained code/data. This matches how
-//! `generate_binary` and friends already work; it does *not* produce a
-//! relinkable object, only a directly loadable executable.
+//! The assembler resolves every symbol to an absolute value and does not
+//! track which values are addresses. [`generate_relocatable_hunk_exe`]
+//! recovers the `HUNK_RELOC32` table by assembling once more per section
+//! with that section moved by [`RELOC_PROBE`]: a longword that moves by
+//! exactly the probe is an address in that section. Without these records
+//! `LoadSeg()` leaves every absolute reference pointing at the assembly
+//! origin instead of where the hunk was loaded. [`generate_hunk_exe`]
+//! alone writes no relocations and suits position-independent code only.
 
-use crate::assembler::SymbolTable;
-use crate::directives::{Section, SectionKind, SectionManager};
+use crate::assembler::{Assembler, SymbolTable};
+use crate::directives::{Memory, Section, SectionKind, SectionManager};
+use m68k_core::errors::AsmError;
 
 const HUNK_HEADER: u32 = 0x03F3;
 const HUNK_CODE: u32 = 0x03E9;
 const HUNK_DATA: u32 = 0x03EA;
 const HUNK_BSS: u32 = 0x03EB;
+const HUNK_RELOC32: u32 = 0x03EC;
 const HUNK_SYMBOL: u32 = 0x03F0;
+const HUNK_DEBUG: u32 = 0x03F1;
 const HUNK_END: u32 = 0x03F2;
 
 fn push_u32(buf: &mut Vec<u8>, v: u32) {
@@ -53,6 +58,177 @@ fn push_name(buf: &mut Vec<u8>, name: &str) {
 /// writer's section ordering. Returns an empty `Vec` if there are no
 /// non-empty sections.
 pub fn generate_hunk_exe(sections: &SectionManager, symbols: &SymbolTable) -> Vec<u8> {
+    write_hunk_exe(sections, symbols, &[], None)
+}
+
+/// Maps an expanded source line number to `(source file, line in that file)`
+/// for `LINE` debug info.
+pub type LineOf<'a> = &'a dyn Fn(usize) -> Option<(String, u32)>;
+
+/// How far a section is moved to find its relocations. 4 KiB-aligned so
+/// `ALIGN`/`CNOP` padding stays the same, and it changes both words of a
+/// longword, so a word-sized use of an address shows up as a change that
+/// no longword relocation explains.
+pub const RELOC_PROBE: u32 = 0x0001_1000;
+
+/// Relocations of one hunk: `(target hunk, offsets into this hunk)`.
+type HunkRelocs = Vec<(usize, Vec<u32>)>;
+
+/// Generate a hunk executable with a `HUNK_RELOC32` table.
+///
+/// `base` is the already assembled program. `reassemble(origin, overrides)`
+/// must assemble the same source again with the assembler origin set to
+/// `origin` and each listed section placed via
+/// [`SectionManager::set_origin_override`].
+///
+/// With `line_of`, each hunk also gets `HUNK_DEBUG` blocks in the `LINE`
+/// format, one per source file, which is how debuggers map addresses back
+/// to source lines.
+///
+/// Fails when an address is used in a way a longword relocation cannot
+/// express (e.g. `move.w #label,d0`), or when moving a section changes the
+/// code size (absolute-short optimisation picking different sizes).
+// ponytail: one extra assembly per section; fine for hand-written
+// assembly, track relocatable values in the expression evaluator if a
+// many-section build ever gets slow.
+pub fn generate_relocatable_hunk_exe<F>(
+    base: &Assembler,
+    line_of: Option<LineOf>,
+    reassemble: F,
+) -> Result<Vec<u8>, AsmError>
+where
+    F: Fn(u32, &[(SectionKind, u32)]) -> Result<Assembler, AsmError>,
+{
+    let ordered: Vec<(&SectionKind, &Section)> = base
+        .sections
+        .iter_sections()
+        .filter(|(_, s)| !s.is_empty())
+        .collect();
+    let origin = base.origin();
+    let mut relocs: Vec<HunkRelocs> = vec![Vec::new(); ordered.len()];
+
+    for (target, (target_kind, _)) in ordered.iter().enumerate() {
+        // The default text section follows the assembler origin, every
+        // other section is pinned explicitly so only `target` moves.
+        let moved_origin = |kind: &SectionKind| {
+            if kind == *target_kind {
+                origin.wrapping_add(RELOC_PROBE)
+            } else {
+                origin
+            }
+        };
+        let overrides: Vec<(SectionKind, u32)> = ordered
+            .iter()
+            .filter(|(k, _)| **k != SectionKind::Text)
+            .map(|(k, _)| ((*k).clone(), moved_origin(k)))
+            .collect();
+        // An address squeezed into a smaller field assembles at the original
+        // origin but overflows once moved; say why instead of just "out of
+        // range" for code that assembled fine.
+        let moved =
+            reassemble(moved_origin(&SectionKind::Text), &overrides).map_err(|e| AsmError {
+                message: format!(
+                    "{} (the value depends on the address of section {}, which a hunk \
+                 executable can only hold in a full 32-bit field)",
+                    e.message,
+                    target_kind.name()
+                ),
+                ..e
+            })?;
+
+        for (hunk, (kind, section)) in ordered.iter().enumerate() {
+            let old = section.to_bytes();
+            let new = moved
+                .sections
+                .get_section(kind)
+                .map(Section::to_bytes)
+                .unwrap_or_default();
+            if old.len() != new.len() {
+                return Err(AsmError::new(format!(
+                    "section {} changes size when relocated; hunk executables \
+                     cannot use absolute-short optimisation for addresses",
+                    kind.name()
+                )));
+            }
+            let mut explained = vec![false; old.len()];
+            let mut offsets = Vec::new();
+            for k in (0..old.len().saturating_sub(3)).step_by(2) {
+                let a = u32::from_be_bytes(old[k..k + 4].try_into().unwrap());
+                let b = u32::from_be_bytes(new[k..k + 4].try_into().unwrap());
+                if b.wrapping_sub(a) == RELOC_PROBE {
+                    offsets.push(k as u32);
+                    explained[k..k + 4].fill(true);
+                }
+            }
+            if let Some(k) = (0..old.len()).find(|&k| old[k] != new[k] && !explained[k]) {
+                let msg = format!(
+                    "address in section {} used in a non-relocatable way \
+                     (only full 32-bit addresses can be relocated)",
+                    target_kind.name()
+                );
+                let line = section.instructions.iter().find(|i| {
+                    let start = (i.pc - section.base_addr()) as usize;
+                    (start..start + i.size_bytes()).contains(&k)
+                });
+                return Err(match line.and_then(|i| i.line_no) {
+                    Some(line) => AsmError::with_line(msg, line),
+                    None => AsmError::new(msg),
+                });
+            }
+            if !offsets.is_empty() {
+                relocs[hunk].push((target, offsets));
+            }
+        }
+    }
+    Ok(write_hunk_exe(
+        &base.sections,
+        &base.symbols,
+        &relocs,
+        line_of,
+    ))
+}
+
+/// `HUNK_DEBUG` blocks in `LINE` format for one hunk: per source file, the
+/// hunk offset of every line that emitted something.
+fn push_line_debug(out: &mut Vec<u8>, section: &Section, line_of: LineOf) {
+    let base = section.base_addr();
+    let mut files: Vec<(String, Vec<(u32, u32)>)> = Vec::new();
+    let mut instrs: Vec<_> = section
+        .instructions
+        .iter()
+        .filter(|i| i.size_bytes() > 0)
+        .collect();
+    instrs.sort_by_key(|i| i.pc);
+    for instr in instrs {
+        let Some((file, line)) = instr.line_no.and_then(line_of) else {
+            continue;
+        };
+        let entry = (line, instr.pc - base);
+        match files.iter_mut().find(|(f, _)| *f == file) {
+            Some((_, lines)) => lines.push(entry),
+            None => files.push((file, vec![entry])),
+        }
+    }
+    for (file, lines) in files {
+        let name_longs = file.len().div_ceil(4);
+        push_u32(out, HUNK_DEBUG);
+        push_u32(out, (3 + name_longs + 2 * lines.len()) as u32);
+        push_u32(out, 0); // base offset: entries below are hunk offsets
+        out.extend_from_slice(b"LINE");
+        push_name(out, &file);
+        for (line, offset) in lines {
+            push_u32(out, line);
+            push_u32(out, offset);
+        }
+    }
+}
+
+fn write_hunk_exe(
+    sections: &SectionManager,
+    symbols: &SymbolTable,
+    relocs: &[HunkRelocs],
+    line_of: Option<LineOf>,
+) -> Vec<u8> {
     // A BSS section holding nothing but `DS` reservations has no
     // instructions at all, so filtering on `instructions.is_empty()` dropped
     // it from the executable — code referencing a label in it then pointed
@@ -85,11 +261,31 @@ pub fn generate_hunk_exe(sections: &SectionManager, symbols: &SymbolTable) -> Ve
     for (_, section) in &ordered {
         // `reserved_size`, not `to_bytes().len()`: a BSS section's `DS`
         // space emits no bytes but still occupies the hunk.
-        push_u32(&mut out, (section.reserved_size().div_ceil(4)) as u32);
+        // Bits 30/31 tell LoadSeg() to allocate chip or fast memory.
+        let memory = match section.memory {
+            Memory::Any => 0,
+            Memory::Chip => 1 << 30,
+            Memory::Fast => 1 << 31,
+        };
+        push_u32(
+            &mut out,
+            (section.reserved_size().div_ceil(4)) as u32 | memory,
+        );
     }
 
-    for (kind, section) in &ordered {
-        let data = section.to_bytes();
+    for (hunk, (kind, section)) in ordered.iter().enumerate() {
+        let mut data = section.to_bytes();
+        let hunk_relocs = relocs.get(hunk).map(Vec::as_slice).unwrap_or(&[]);
+        // A relocated longword holds an offset into its target hunk, which
+        // `LoadSeg()` turns into an address by adding the load address.
+        for (target, offsets) in hunk_relocs {
+            let target_base = ordered[*target].1.base_addr();
+            for &k in offsets {
+                let k = k as usize;
+                let v = u32::from_be_bytes(data[k..k + 4].try_into().unwrap());
+                data[k..k + 4].copy_from_slice(&v.wrapping_sub(target_base).to_be_bytes());
+            }
+        }
         let word_count = section.reserved_size().div_ceil(4);
 
         // `effective_kind` honours an explicit `SECTION name,TYPE`: a named
@@ -109,6 +305,18 @@ pub fn generate_hunk_exe(sections: &SectionManager, symbols: &SymbolTable) -> Ve
             out.extend_from_slice(&data);
             // Pad to a longword boundary.
             out.resize(out.len() + (word_count * 4 - data.len()), 0);
+        }
+
+        if !hunk_relocs.is_empty() {
+            push_u32(&mut out, HUNK_RELOC32);
+            for (target, offsets) in hunk_relocs {
+                push_u32(&mut out, offsets.len() as u32);
+                push_u32(&mut out, *target as u32);
+                for &k in offsets {
+                    push_u32(&mut out, k);
+                }
+            }
+            push_u32(&mut out, 0);
         }
 
         let base = section.base_addr();
@@ -142,6 +350,12 @@ pub fn generate_hunk_exe(sections: &SectionManager, symbols: &SymbolTable) -> Ve
                 push_u32(&mut out, value.saturating_sub(base));
             }
             push_u32(&mut out, 0); // terminator
+        }
+
+        if let Some(line_of) = line_of
+            && hunk_type != HUNK_BSS
+        {
+            push_line_debug(&mut out, section, line_of);
         }
 
         push_u32(&mut out, HUNK_END);
@@ -196,5 +410,118 @@ mod tests {
 
         let syms = loaded.all_symbols();
         assert!(syms.contains(&("start".to_string(), 0x1000)));
+    }
+
+    /// Assemble `src` the way the CLI does for `-f hunk-exe`.
+    fn relocatable(src: &str) -> Result<Vec<u8>, AsmError> {
+        with_lines(src, None)
+    }
+
+    fn with_lines(src: &str, line_of: Option<LineOf>) -> Result<Vec<u8>, AsmError> {
+        let assemble = |origin: u32, overrides: &[(SectionKind, u32)]| {
+            let mut asm = Assembler::new(origin);
+            for (kind, at) in overrides {
+                asm.sections.set_origin_override(kind.clone(), *at);
+            }
+            asm.assemble(src)?;
+            Ok(asm)
+        };
+        generate_relocatable_hunk_exe(&assemble(0, &[])?, line_of, assemble)
+    }
+
+    fn long_at(data: &[u8], k: usize) -> u32 {
+        u32::from_be_bytes(data[k..k + 4].try_into().unwrap())
+    }
+
+    #[test]
+    fn absolute_references_are_relocated_across_sections() {
+        let src = "
+    SECTION code,CODE
+start:
+    lea     msg,a0
+    move.l  #buf,d0
+    lea     start(pc),a1
+    move.l  #len,d1
+    move.l  #msg_end-msg,d2
+    rts
+    SECTION data,DATA
+msg:    dc.b 'hi'
+msg_end:
+    even
+ptr:    dc.l start
+    SECTION bss,BSS
+buf:    ds.b 16
+len     equ 16
+";
+        let exe = relocatable(src).unwrap();
+        let loaded = read_hunk_executable(&exe, 0x2_0000).unwrap();
+        let [code, data, bss] = &loaded.sections[..] else {
+            panic!("expected three hunks");
+        };
+        // lea msg,a0 / move.l #buf,d0: addresses of the loaded hunks.
+        assert_eq!(long_at(&code.data, 2), data.address);
+        assert_eq!(long_at(&code.data, 8), bss.address);
+        // PC-relative, EQU and label differences stay as assembled.
+        assert_eq!(&code.data[12..16], &[0x43, 0xFA, 0xFF, 0xF2]);
+        assert_eq!(long_at(&code.data, 18), 16);
+        assert_eq!(long_at(&code.data, 24), 2);
+        // A pointer in the data hunk back into code.
+        assert_eq!(long_at(&data.data, 2), code.address);
+        assert_eq!(code.relocs.len(), 2);
+    }
+
+    #[test]
+    fn memory_type_goes_into_the_hunk_header() {
+        let src = "
+    SECTION code,CODE
+    rts
+    SECTION gfx,DATA_C
+    dc.w 1
+    SECTION buf,BSS,FAST
+    ds.l 2
+    SECTION any,DATA
+    dc.w 2
+";
+        let exe = relocatable(src).unwrap();
+        let sizes: Vec<u32> = (0..4).map(|i| long_at(&exe, 20 + 4 * i)).collect();
+        assert_eq!(sizes, vec![1, 0x4000_0001, 0x8000_0002, 1]);
+        // The reader masks the flags off, so sizes stay sane.
+        let loaded = read_hunk_executable(&exe, 0x1000).unwrap();
+        assert_eq!(loaded.sections[1].data.len(), 4);
+
+        let bad = Assembler::new(0)
+            .assemble(" SECTION x,DATA,SLOW\n dc.w 1\n")
+            .map(|_| ());
+        assert!(bad.unwrap_err().message.contains("memory type"));
+    }
+
+    #[test]
+    fn word_sized_address_is_rejected_with_its_line() {
+        let err = relocatable(" move.w #msg,d0\n rts\nmsg: dc.b 0\n").unwrap_err();
+        assert!(err.message.contains("32-bit field"), "{}", err.message);
+        assert_eq!(err.line_no, Some(1));
+    }
+
+    #[test]
+    fn line_debug_roundtrips_through_the_reader() {
+        let line_of = |n: usize| Some(("/src/main.s".to_string(), n as u32));
+        let exe = with_lines(" nop\n\n move.l #1,d0\n rts\n", Some(&line_of)).unwrap();
+        let loaded = read_hunk_executable(&exe, 0x1000).unwrap();
+        let file = "/src/main.s".to_string();
+        assert_eq!(
+            loaded.sections[0].lines,
+            vec![
+                (file.clone(), 1, 0x1000),
+                (file.clone(), 3, 0x1002),
+                (file, 4, 0x1008)
+            ]
+        );
+    }
+
+    #[test]
+    fn scaled_address_is_rejected_with_its_line() {
+        let err = relocatable(" nop\n move.l #msg*2,d0\n rts\nmsg: dc.b 0\n").unwrap_err();
+        assert!(err.message.contains("non-relocatable"), "{}", err.message);
+        assert_eq!(err.line_no, Some(2));
     }
 }
