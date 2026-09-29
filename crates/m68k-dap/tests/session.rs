@@ -11,6 +11,40 @@ use m68k_dap::{Msg, Session, rsp};
 use serde_json::{Value, json};
 
 const LOAD: u32 = 0x2_0000;
+/// A copper list in the fake machine's chip RAM, pointed at by COP1LC.
+const COPPER: u32 = 0x3000;
+const COPPER_LIST: [u16; 6] = [0x0180, 0x0F80, 0x2C07, 0xFFFE, 0xFFFF, 0xFFFE];
+
+/// The fake machine's memory: the program, a copper list and the custom
+/// chip block the emulator reports at $DFF000.
+fn peek(code: &[u8], addr: u32) -> u8 {
+    let word = |words: &[u16], off: u32| {
+        words
+            .get((off / 2) as usize)
+            .map(|w| w.to_be_bytes()[(off % 2) as usize])
+    };
+    if let Some(off) = addr
+        .checked_sub(LOAD)
+        .filter(|&o| (o as usize) < code.len())
+    {
+        return code[off as usize];
+    }
+    if let Some(b) = addr
+        .checked_sub(COPPER)
+        .and_then(|off| word(&COPPER_LIST, off))
+    {
+        return b;
+    }
+    let mut custom = [0u16; 0xFF];
+    custom[0x080 / 2] = (COPPER >> 16) as u16; // COP1LCH
+    custom[0x082 / 2] = COPPER as u16; // COP1LCL
+    custom[0x100 / 2] = 0x4200; // BPLCON0
+    custom[0x096 / 2] = 0x0380; // DMACON state
+    addr.checked_sub(0xDFF000)
+        .filter(|&o| o < 0x1FE)
+        .and_then(|o| word(&custom, o))
+        .unwrap_or(0)
+}
 const SOURCE: &str = "start:\n moveq #1,d0\n\n moveq #2,d1\n moveq #3,d2\n rts\n";
 
 /// DAP output: the adapter flushes after every message.
@@ -58,10 +92,7 @@ fn fake_stub(listener: TcpListener, code: Vec<u8>) {
                 let addr = u32::from_str_radix(addr, 16).unwrap();
                 let len = u32::from_str_radix(len, 16).unwrap();
                 let bytes: String = (addr..addr + len)
-                    .map(|a| {
-                        let byte = a.checked_sub(LOAD).and_then(|o| code.get(o as usize));
-                        format!("{:02x}", byte.copied().unwrap_or(0))
-                    })
+                    .map(|a| format!("{:02x}", peek(&code, a)))
                     .collect();
                 reply(&mut sock, &bytes);
             }
@@ -234,6 +265,50 @@ fn breakpoint_continue_step_and_registers() {
     c.request("continue", json!({ "threadId": 1 }));
     assert_eq!(c.expect_event("stopped")["reason"], "breakpoint");
     assert_eq!(c.current_line(), 6);
+
+    // Custom chip state, including write-only registers, and the copper
+    // list COP1LC points at.
+    let scopes = c.request("scopes", json!({ "frameId": 0 }));
+    let names: Vec<&str> = scopes["scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|s| s["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "Registers",
+            "Custom chips",
+            "Copper list (COP1LC)",
+            "Copper list 2 (COP2LC)"
+        ]
+    );
+    let custom = c.request("variables", json!({ "variablesReference": 2 }));
+    let bplcon0 = custom["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|v| v["name"] == "BPLCON0")
+        .unwrap();
+    assert_eq!(bplcon0["value"], "$4200  BPU=4|COLOR");
+    let copper = c.request("variables", json!({ "variablesReference": 3 }));
+    let lines: Vec<(&str, &str)> = copper["variables"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| (v["name"].as_str().unwrap(), v["value"].as_str().unwrap()))
+        .collect();
+    assert_eq!(
+        lines,
+        [
+            ("$003000", "MOVE COLOR00 = $0F80  R=15 G=8 B=0"),
+            ("$003004", "WAIT v=$2C h=$06"),
+            ("$003008", "END"),
+        ]
+    );
+    let copper2 = c.request("variables", json!({ "variablesReference": 4 }));
+    assert_eq!(copper2["variables"][0]["value"], "not set");
 
     let hover = c.request("evaluate", json!({ "expression": "start" }));
     assert_eq!(hover["result"], format!("${LOAD:08x} ({LOAD})"));

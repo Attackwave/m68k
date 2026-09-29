@@ -36,6 +36,13 @@ debug adapter ship with the extension; nothing else needs to be on `PATH`.
     registers and labels
   - Call stack recovered from return addresses on the stack
   - Disassembly with symbols and source lines
+  - **Custom chips** scope: every custom register with its current value
+    and decoded bit fields, including write-only ones such as `DMACON`,
+    `BPLCON0` or `COP1LC` (the emulator reports the value last written)
+  - **Copper list** scopes for `COP1LC` and `COP2LC`: the list decoded
+    instruction by instruction (`MOVE COLOR00 = $0F00  R=15 G=0 B=0`,
+    `WAIT v=$2C h=$06`, `END`), with MOVEs the copper cannot perform
+    flagged
 
 ## Debugging setup
 

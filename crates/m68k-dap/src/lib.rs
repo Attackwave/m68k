@@ -31,6 +31,19 @@ const MAX_STEPS: usize = 100_000;
 const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
 const CALL_TIMEOUT: Duration = Duration::from_secs(24 * 3600);
+/// Variables references of the scopes.
+const VARS_CPU: i64 = 1;
+const VARS_CUSTOM: i64 = 2;
+const VARS_COPPER1: i64 = 3;
+const VARS_COPPER2: i64 = 4;
+/// The custom chip block the emulator reports: $DFF000-$DFF1FD. Reading it
+/// through the remote debugger returns the emulator's register state, so
+/// write-only registers (DMACON, BPLCON0, COP1LC) read back what was last
+/// written, which the hardware itself cannot do.
+const CUSTOM_BASE: u32 = 0xDFF000;
+const CUSTOM_LEN: u32 = 0x1FE;
+/// Longest copper list shown before giving up on finding its end.
+const MAX_COPPER: usize = 512;
 /// Bytes of stack searched for return addresses.
 const STACK_SCAN: u32 = 512;
 const MAX_FRAMES: usize = 32;
@@ -201,9 +214,19 @@ impl<W: Write> Session<W> {
             "threads" => Ok(json!({ "threads": [{ "id": CPU, "name": "CPU" }] })),
             "stackTrace" => self.stack_trace(),
             "scopes" => Ok(json!({
-                "scopes": [{ "name": "Registers", "variablesReference": 1, "expensive": false }]
+                "scopes": [
+                    { "name": "Registers", "variablesReference": VARS_CPU, "expensive": false },
+                    { "name": "Custom chips", "variablesReference": VARS_CUSTOM, "expensive": true },
+                    { "name": "Copper list (COP1LC)", "variablesReference": VARS_COPPER1, "expensive": true },
+                    { "name": "Copper list 2 (COP2LC)", "variablesReference": VARS_COPPER2, "expensive": true },
+                ]
             })),
-            "variables" => self.variables(),
+            "variables" => match args["variablesReference"].as_i64() {
+                Some(VARS_CUSTOM) => self.custom_registers(),
+                Some(VARS_COPPER1) => self.copper_list(0x080),
+                Some(VARS_COPPER2) => self.copper_list(0x084),
+                _ => self.variables(),
+            },
             "continue" => {
                 self.resume()?;
                 Ok(json!({ "allThreadsContinued": true }))
@@ -812,6 +835,79 @@ impl<W: Write> Session<W> {
             .map(|&(bit, c)| if sr & (1 << bit) != 0 { c } else { '-' })
             .collect();
         vars.push(json!({ "name": "sr", "value": format!("${sr:04x}  {flags}"), "variablesReference": 0 }));
+        Ok(json!({ "variables": vars }))
+    }
+
+    /// The emulator's custom chip register state.
+    fn custom_block(&mut self) -> Result<Vec<u8>, String> {
+        let block = self.read_bytes(CUSTOM_BASE, CUSTOM_LEN)?;
+        if block.len() < CUSTOM_LEN as usize {
+            return Err("the emulator does not report custom chip state".into());
+        }
+        Ok(block)
+    }
+
+    fn custom_registers(&mut self) -> Result<Value, String> {
+        use m68k_core::amiga_custom::{self, Access};
+        let block = self.custom_block()?;
+        let vars: Vec<Value> = amiga_custom::REGISTERS
+            .iter()
+            .filter(|r| matches!(r.access, Access::Read | Access::Write) && r.name != "NOOP")
+            .map(|r| {
+                let at = r.offset as usize;
+                let value = u16::from_be_bytes([block[at], block[at + 1]]);
+                let mut shown = format!("${value:04X}");
+                if !amiga_custom::fields(r).is_empty() {
+                    shown.push_str("  ");
+                    shown.push_str(&amiga_custom::summarize(r, value));
+                }
+                json!({ "name": r.name, "value": shown, "variablesReference": 0 })
+            })
+            .collect();
+        Ok(json!({ "variables": vars }))
+    }
+
+    /// The copper list whose start is held at `offset` (COP1LC or COP2LC).
+    fn copper_list(&mut self, offset: usize) -> Result<Value, String> {
+        use m68k_core::amiga_copper::{self, CopperInsn};
+        let block = self.custom_block()?;
+        let start = u32::from_be_bytes(block[offset..offset + 4].try_into().unwrap());
+        let register = if offset == 0x080 { "COP1LC" } else { "COP2LC" };
+        if start == 0 {
+            return Ok(json!({ "variables": [
+                { "name": register, "value": "not set", "variablesReference": 0 }
+            ]}));
+        }
+        let bytes = self.read_range(start, (MAX_COPPER * 4) as u32);
+        let words: Vec<u16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|w| u16::from_be_bytes(*w))
+            .collect();
+        let insns = amiga_copper::decode_list(&words);
+        let mut vars: Vec<Value> = insns
+            .iter()
+            .enumerate()
+            .map(|(i, insn)| {
+                let addr = start + 4 * i as u32;
+                json!({
+                    "name": format!("${addr:06X}"),
+                    "value": amiga_copper::format(insn),
+                    "variablesReference": 0,
+                    "memoryReference": format!("0x{addr:x}"),
+                })
+            })
+            .collect();
+        if insns.last() != Some(&CopperInsn::End) && !insns.last().is_some_and(|i| {
+            matches!(i, CopperInsn::Move { offset, .. } if amiga_copper::move_effect(*offset) == amiga_copper::MoveEffect::Stops)
+        }) {
+            vars.push(json!({
+                "name": "…",
+                "value": format!("no END within {} instructions (or memory unreadable)", insns.len()),
+                "variablesReference": 0,
+            }));
+        }
         Ok(json!({ "variables": vars }))
     }
 
