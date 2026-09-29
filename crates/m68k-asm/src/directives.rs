@@ -300,6 +300,22 @@ impl SectionManager {
         self.current_section = Some(kind);
     }
 
+    /// Start a pass over the source: back in the default text section.
+    ///
+    /// A pass that began wherever the previous one ended put everything
+    /// before the first `SECTION` directive into the last declared section,
+    /// so a source opening with code and declaring `SECTION gfx,DATA_C`
+    /// later came out as one chip-RAM data hunk holding the code.
+    ///
+    /// Every section's location counter goes back to its origin too: the
+    /// pass that follows replays the source and moves them again.
+    pub fn restart_pass(&mut self) {
+        self.current_section = Some(SectionKind::Text);
+        for section in self.sections.values_mut() {
+            section.pc = section.origin;
+        }
+    }
+
     /// Place a section (other than the default text section, which follows
     /// the assembler origin) at `origin` when it is first declared. An
     /// explicit `SECTION name,origin` still wins.
@@ -612,6 +628,12 @@ pub fn handle_section(
     if args.is_empty() {
         return Err(AsmError::with_line("SECTION requires a name", line_no));
     }
+
+    // Leaving a section: keep where it got to. Only the encoding pass
+    // tracked this before, so in the sizing pass a second
+    // `SECTION code` restarted at the section's origin and every label
+    // after it was assigned an address inside the first part.
+    sections.set_current_pc(pc);
 
     let section_name = args[0].trim();
     let declared_kind = args.get(1).and_then(|a| section_type_keyword(a));

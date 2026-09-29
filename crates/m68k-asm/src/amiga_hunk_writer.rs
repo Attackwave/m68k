@@ -499,6 +499,36 @@ len     equ 16
     }
 
     #[test]
+    fn code_before_the_first_section_stays_in_the_code_hunk() {
+        // Pass 2 used to resume in the last declared section, so this came
+        // out as one chip-RAM data hunk holding the code.
+        let exe =
+            relocatable("start: moveq #1,d0\n rts\n SECTION gfx,DATA_C\nv: dc.w 1\n").unwrap();
+        let loaded = read_hunk_executable(&exe, 0x1000).unwrap();
+        assert_eq!(loaded.sections.len(), 2);
+        assert_eq!(loaded.sections[0].kind, ReadSectionKind::Code);
+        assert_eq!(&loaded.sections[0].data[..4], &[0x70, 0x01, 0x4E, 0x75]);
+        assert_eq!(long_at(&exe, 24), 0x4000_0001);
+    }
+
+    #[test]
+    fn reentered_sections_continue_where_they_left_off() {
+        // The sizing pass restarted a section at its origin when it was
+        // declared again, so `w` got offset 0 and `lea w` pointed at `v`.
+        let src = "start: lea w,a0\n rts\n SECTION dat,DATA\nv: dc.w 1\n SECTION code,CODE\nmore: rts\n SECTION dat,DATA\nw: dc.w 2\n";
+        let exe = relocatable(src).unwrap();
+        let loaded = read_hunk_executable(&exe, 0x1000).unwrap();
+        let (code, data) = (&loaded.sections[0], &loaded.sections[1]);
+        assert_eq!(long_at(&code.data, 2), data.address + 2);
+        assert_eq!(&data.data[..4], &[0, 1, 0, 2]);
+        let syms = loaded.all_symbols();
+        assert!(
+            syms.contains(&("more".to_string(), code.address + 8)),
+            "{syms:?}"
+        );
+    }
+
+    #[test]
     fn output_is_identical_across_runs() {
         // Each assembler has its own hash-map seed, so a symbol order taken
         // from the map differs between instances.
