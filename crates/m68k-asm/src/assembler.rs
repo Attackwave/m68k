@@ -1833,6 +1833,11 @@ pub struct Assembler {
     pub register_aliases: HashMap<String, String>,
     /// Files already spliced in, so each is included only once.
     included_files: std::collections::HashSet<PathBuf>,
+    /// Resolved path of every included file, keyed by the name
+    /// [`SourceOrigin::file`] carries (the name as written in `INCLUDE`).
+    /// Debug info needs a path a debugger can open; diagnostics keep the
+    /// short name.
+    pub include_paths_resolved: HashMap<String, PathBuf>,
     /// Most recent global (non-local) label, used to scope local labels.
     ///
     /// A local label (`.loop`) belongs to the global label above it, so
@@ -1950,6 +1955,7 @@ impl Assembler {
             conditional_results: HashMap::new(),
             register_aliases: HashMap::new(),
             included_files: std::collections::HashSet::new(),
+            include_paths_resolved: HashMap::new(),
             conditional_stack: Vec::new(),
             macro_definitions: HashMap::new(),
             macro_unique_counter: 0,
@@ -2760,9 +2766,11 @@ impl Assembler {
 
             // Already pulled in? Drop the directive and move on.
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if !self.included_files.insert(canonical) {
+            if !self.included_files.insert(canonical.clone()) {
                 continue;
             }
+            self.include_paths_resolved
+                .insert(filename.clone(), canonical);
 
             let content = std::fs::read_to_string(&path).map_err(|e| {
                 here(

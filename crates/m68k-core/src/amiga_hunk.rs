@@ -79,6 +79,10 @@ pub struct Section {
     /// pointed-to addresses as code entry points when the target is a
     /// `Code` hunk. Sorted ascending and deduplicated.
     pub relocs: Vec<u32>,
+    /// `(source file, line, address)` from `LINE` debug blocks
+    /// (`m68k-asm --linedebug`), addresses relocated like the symbols.
+    /// Empty when the file carries no line info.
+    pub lines: Vec<(String, u32, u32)>,
 }
 
 /// A parsed and relocated Amiga executable.
@@ -163,16 +167,6 @@ impl<'a> Reader<'a> {
         Ok(buf)
     }
 
-    fn skip(&mut self, n: u64) -> Result<(), HunkError> {
-        self.cursor.set_position(
-            self.cursor
-                .position()
-                .checked_add(n)
-                .ok_or_else(|| HunkError::new("hunk length overflow while skipping data"))?,
-        );
-        Ok(())
-    }
-
     /// Read a length-prefixed name/symbol string: a longword count of
     /// following longwords, then that many bytes of (NUL-padded) name data.
     /// Returns `None` at a terminating zero-length marker.
@@ -222,6 +216,36 @@ fn apply_relocations(
         reloc_sites[i].push(offsets[i].wrapping_add(offset as u32));
     }
     Ok(())
+}
+
+/// Parse a `LINE` debug block: base offset, `"LINE"`, a length-prefixed
+/// file name, then `(line, offset)` pairs. Returns `(file, line, address)`.
+fn parse_line_debug(body: &[u8], hunk_address: u32) -> Option<Vec<(String, u32, u32)>> {
+    let long = |k: usize| {
+        body.get(k..k + 4)
+            .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+    };
+    if body.get(4..8)? != b"LINE" {
+        return None;
+    }
+    let base = hunk_address.wrapping_add(long(0)?);
+    let name_end = 12usize.checked_add(long(8)? as usize * 4)?;
+    let name = body.get(12..name_end)?;
+    let name = String::from_utf8_lossy(name)
+        .trim_end_matches('\0')
+        .to_string();
+    Some(
+        body[name_end..]
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|pair| {
+                let line = u32::from_be_bytes(pair[0..4].try_into().unwrap()) & 0x00FF_FFFF;
+                let offset = u32::from_be_bytes(pair[4..8].try_into().unwrap());
+                (name.clone(), line, base.wrapping_add(offset))
+            })
+            .collect(),
+    )
 }
 
 /// Parse and relocate an Amiga Hunk executable (`HUNK_HEADER` load file).
@@ -320,6 +344,7 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
     let mut names: Vec<Option<String>> = vec![None; hunk_count];
     let mut symbols: Vec<Vec<(String, u32)>> = vec![Vec::new(); hunk_count];
     let mut reloc_sites: Vec<Vec<u32>> = vec![Vec::new(); hunk_count];
+    let mut lines: Vec<Vec<(String, u32, u32)>> = vec![Vec::new(); hunk_count];
 
     let mut i = 0usize;
     let mut pending_name: Option<String> = None;
@@ -420,7 +445,11 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
             }
             HUNK_DEBUG => {
                 let word_count = r.u32()?;
-                r.skip(word_count as u64 * 4)?;
+                let body = r.bytes(word_count as usize * 4)?;
+                // Other debug formats are skipped, as is a malformed LINE block.
+                if let Some(entries) = parse_line_debug(&body, offsets[i]) {
+                    lines[i].extend(entries);
+                }
             }
             HUNK_NAME => {
                 // name for the *next* code/data/bss hunk.
@@ -452,6 +481,7 @@ pub fn read_hunk_executable(data: &[u8], load_base: u32) -> Result<HunkExecutabl
             address: offsets[idx],
             data: std::mem::take(&mut contents[idx]),
             symbols: std::mem::take(&mut symbols[idx]),
+            lines: std::mem::take(&mut lines[idx]),
             relocs: {
                 // A malformed file may list the same offset twice, and
                 // separate HUNK_RELOC32 blocks (one per target hunk) each

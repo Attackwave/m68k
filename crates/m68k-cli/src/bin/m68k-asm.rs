@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use m68k_asm::amiga_hunk_writer::generate_relocatable_hunk_exe;
+use m68k_asm::amiga_hunk_writer::{LineOf, generate_relocatable_hunk_exe};
 use m68k_asm::assembler::Assembler;
 use m68k_asm::ieee695::generate_ieee695_sections;
 use m68k_asm::output::{
@@ -46,6 +46,11 @@ struct Args {
     /// suffix always yields the short form regardless.
     #[arg(long)]
     optimize: bool,
+
+    /// Add source line debug info (`LINE` debug hunks) to a hunk
+    /// executable, for source-level debugging.
+    #[arg(long)]
+    linedebug: bool,
 
     /// S-Record header name (used with -f srecord)
     #[arg(long, default_value = "m68k-asm")]
@@ -324,7 +329,19 @@ fn run(args: Args) -> Result<(), String> {
             return write_auxiliary_outputs(&asm, &args, &input_name);
         }
         OutputFormatArg::HunkExe => {
-            let hunk = generate_relocatable_hunk_exe(&asm, |origin, overrides| {
+            // Debuggers open these paths, so they are absolute; diagnostics
+            // keep the short names.
+            let main_file = fs::canonicalize(&args.input).unwrap_or_else(|_| args.input.clone());
+            let line_of = |line_no: usize| {
+                let origin = asm.source_origin(line_no)?;
+                let path = match &origin.file {
+                    Some(name) => asm.include_paths_resolved.get(name)?,
+                    None => &main_file,
+                };
+                Some((path.to_string_lossy().into_owned(), origin.line as u32))
+            };
+            let line_of: Option<LineOf> = args.linedebug.then_some(&line_of as LineOf);
+            let hunk = generate_relocatable_hunk_exe(&asm, line_of, |origin, overrides| {
                 let mut moved = new_assembler(origin);
                 for (kind, at) in overrides {
                     moved.sections.set_origin_override(kind.clone(), *at);
