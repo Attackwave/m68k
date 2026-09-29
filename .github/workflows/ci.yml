@@ -117,6 +117,7 @@ jobs:
           for tool in m68k-asm m68k-lsp m68k-dap; do
             cp "target/release/$tool$ext" editors/vscode/bin/
           done
+          cp LICENSE editors/vscode/
 
       - name: Build and test extension
         working-directory: editors/vscode
