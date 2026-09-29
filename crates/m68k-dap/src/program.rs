@@ -96,11 +96,11 @@ impl Program {
     }
 }
 
-/// Paths from the debug info and from the editor may differ in separators
-/// and, on Windows, in case.
+/// Paths from the debug info and from the editor may differ in separators,
+/// a Windows verbatim prefix (`\\?\`) and, on Windows, in case.
 pub fn same_path(a: &str, b: &str) -> bool {
     let norm = |p: &str| {
-        let p = p.replace('\\', "/");
+        let p = p.strip_prefix(r"\\?\").unwrap_or(p).replace('\\', "/");
         if cfg!(windows) { p.to_lowercase() } else { p }
     };
     norm(a) == norm(b)
@@ -135,6 +135,12 @@ mod tests {
         let p = program();
         assert_eq!(p.address_of("/p/main.s", 4), Some((0x1004, 5)));
         assert_eq!(p.address_of("/p/main.s", 10), None);
+    }
+
+    #[test]
+    fn verbatim_prefix_and_separators_do_not_matter() {
+        assert!(same_path(r"\\?\C:/p/main.s", r"C:\p\main.s"));
+        assert!(!same_path("/p/main.s", "/p/other.s"));
     }
 
     #[test]
