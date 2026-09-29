@@ -116,6 +116,11 @@
           "output": {
             "type": "string",
             "description": "Output file (default: next to the source)."
+          },
+          "linedebug": {
+            "type": "boolean",
+            "default": false,
+            "description": "Add source line debug info (embeds absolute source paths). F5 debugging sets this itself."
           }
         }
       }

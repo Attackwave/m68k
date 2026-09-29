@@ -27,7 +27,10 @@ async function startClient(context: vscode.ExtensionContext) {
 
 function buildTask(context: vscode.ExtensionContext, def: vscode.TaskDefinition, scope: vscode.WorkspaceFolder) {
   const cfg = vscode.workspace.getConfiguration('m68k', scope);
-  const args = [def.file, '-f', def.format ?? 'hunk-exe', '-c', cfg.get<string>('cpu', '68000')];
+  const format = def.format ?? 'hunk-exe';
+  const args = [def.file, '-f', format, '-c', cfg.get<string>('cpu', '68000')];
+  // Line info embeds absolute source paths, so only debug builds carry it.
+  if (def.linedebug && format === 'hunk-exe') args.push('--linedebug');
   for (const dir of cfg.get<string[]>('includePaths', [])) args.push('-I', dir);
   if (def.output) args.push('-o', def.output);
 
@@ -91,7 +94,7 @@ function debugConfigurations(context: vscode.ExtensionContext): vscode.DebugConf
         await doc.save();
         const file = path.relative(scope.uri.fsPath, doc.uri.fsPath);
         const output = path.relative(scope.uri.fsPath, config.program);
-        const code = await runTask(buildTask(context, { type: 'm68k', file, output }, scope));
+        const code = await runTask(buildTask(context, { type: 'm68k', file, output, linedebug: true }, scope));
         if (code !== 0) return undefined; // errors are in the Problems panel
       }
       return config;
