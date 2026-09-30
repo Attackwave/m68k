@@ -77,14 +77,14 @@ dependencies = [
 
 [[package]]
 name = "m68k-asm"
-version = "2.4.3"
+version = "2.4.4"
 dependencies = [
  "m68k-core",
 ]
 
 [[package]]
 name = "m68k-core"
-version = "2.4.3"
+version = "2.4.4"
 dependencies = [
  "bitflags",
  "thiserror",
@@ -92,14 +92,14 @@ dependencies = [
 
 [[package]]
 name = "m68k-disasm"
-version = "2.4.3"
+version = "2.4.4"
 dependencies = [
  "m68k-core",
 ]
 
 [[package]]
 name = "m68k-floppy"
-version = "2.4.3"
+version = "2.4.4"
 dependencies = [
  "m68k-core",
  "thiserror",
