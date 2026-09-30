@@ -3299,8 +3299,14 @@ impl Assembler {
                 Ok(0)
             }
             "incbin" => {
-                let result =
-                    handle_incbin_pass1(args, &self.symbols, self.pc, &self.source_root, line_no)?;
+                let result = handle_incbin_pass1(
+                    args,
+                    &self.symbols,
+                    self.pc,
+                    &self.source_root,
+                    &self.include_paths,
+                    line_no,
+                )?;
                 if result.bytes_emitted > 0 {
                     self.pc += result.bytes_emitted;
                 }
@@ -4527,6 +4533,7 @@ impl Assembler {
                     &self.symbols,
                     self.pc,
                     &self.source_root,
+                    &self.include_paths,
                     line.line_no,
                     &line.raw,
                 )?;
@@ -7859,6 +7866,23 @@ later: DC.W 0
                 .message
                 .contains("DC.W at odd address $1")
         );
+    }
+
+    #[test]
+    fn test_incbin_searches_include_paths() {
+        // INCLUDE searched the -I directories, INCBIN only the source's own.
+        let dir = std::env::temp_dir().join(format!("m68k-incbin-{}", std::process::id()));
+        let inc = dir.join("inc");
+        std::fs::create_dir_all(&inc).unwrap();
+        std::fs::write(inc.join("data.bin"), b"ABCD").unwrap();
+        let mut asm = Assembler::new(0);
+        asm.set_source_root(dir.join("src"));
+        asm.add_include_path(inc);
+        assert_eq!(
+            asm.assemble_bytes(" INCBIN \"data.bin\"\n").unwrap(),
+            b"ABCD"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
