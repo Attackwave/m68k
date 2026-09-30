@@ -4099,7 +4099,7 @@ impl Assembler {
                 } else {
                     let ea = parse_operand_text(&operand_texts[2], &self.symbols, pc)
                         .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                    crate::enc_mmu::enc_pflush(fc, mask, &ea, pc + 2, &self.cpu)
+                    crate::enc_mmu::enc_pflush(fc, mask, &ea, pc + 6, &self.cpu)
                         .map_err(|e| AsmError::with_line(e.message, line.line_no))?
                 }
             }
@@ -4180,7 +4180,7 @@ impl Assembler {
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
                 let ea = parse_operand_text(&operand_texts[2], &self.symbols, pc)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                crate::enc_logic::enc_cas(&dc, &du, &ea, sz, pc + 4, &self.cpu)
+                crate::enc_logic::enc_cas(&dc, &du, &ea, sz, pc + 6, &self.cpu)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?
             }
             "PACK" | "UNPK" => {
@@ -4245,7 +4245,7 @@ impl Assembler {
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
                 let d = parse_operand_text(dst_text, &self.symbols, pc)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                crate::enc_fpu::enc_fmove(&s, &d, size, Some(kfactor), pc + 2, &self.cpu)
+                crate::enc_fpu::enc_fmove(&s, &d, size, Some(kfactor), pc + 6, &self.cpu)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?
             }
             _ => {

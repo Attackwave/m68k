@@ -6,6 +6,15 @@ use m68k_core::operands::{MemoryIndirectOperand, Operand};
 
 pub type EAEncoded = (u8, u8, Vec<u16>);
 
+/// Encode an effective address operand.
+///
+/// `ext_pc` is the address of the operand's first extension word **plus
+/// 2**: a PC-relative displacement is measured from the address of the
+/// extension word that holds it. For an operand whose extension follows
+/// the opword directly that is `instruction + 4`; every word placed in
+/// between (a bit number, a register mask, a 68020 or FPU extension word)
+/// adds 2. Callers that got this wrong encoded PC-relative operands 2 or 4
+/// bytes past their target; `tests/pc_relative.rs` checks every form.
 pub fn encode_ea(
     op: &Operand,
     size: &str,
