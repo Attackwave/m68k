@@ -94,46 +94,51 @@ struct Args {
     #[arg(long)]
     ffs: bool,
 
+    // Every write option can be given more than once. The pair options
+    // used to be collected into one flat list of which only the first two
+    // values were read, so a second --add-file was silently dropped.
     /// Write a local file into the image: --add-file LOCAL AMIGA_PATH
+    /// (repeatable)
     #[arg(long, num_args = 2, value_names = ["LOCAL", "AMIGA_PATH"])]
-    add_file: Option<Vec<String>>,
+    add_file: Vec<String>,
 
-    /// Delete a file from the image
+    /// Delete a file from the image (repeatable)
     #[arg(long, value_name = "PATH")]
-    delete_file: Option<String>,
+    delete_file: Vec<String>,
 
-    /// Create a directory in the image
+    /// Create a directory in the image (repeatable; created before files
+    /// are added)
     #[arg(long, value_name = "PATH")]
-    make_dir: Option<String>,
+    make_dir: Vec<String>,
 
-    /// Delete an empty directory from the image
+    /// Delete an empty directory from the image (repeatable)
     #[arg(long, value_name = "PATH")]
-    delete_dir: Option<String>,
+    delete_dir: Vec<String>,
 
-    /// Rename or move an entry: --rename FROM TO
+    /// Rename or move an entry: --rename FROM TO (repeatable)
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"])]
-    rename: Option<Vec<String>>,
+    rename: Vec<String>,
 
-    /// Set an entry's comment: --set-comment PATH TEXT
+    /// Set an entry's comment: --set-comment PATH TEXT (repeatable)
     #[arg(long, num_args = 2, value_names = ["PATH", "TEXT"])]
-    set_comment: Option<Vec<String>>,
+    set_comment: Vec<String>,
 
     /// Set an entry's protection bits: --set-protection PATH BITS
-    /// (decimal, or hex with a 0x prefix)
+    /// (decimal, or hex with a 0x prefix; repeatable)
     #[arg(long, num_args = 2, value_names = ["PATH", "BITS"])]
-    set_protection: Option<Vec<String>>,
+    set_protection: Vec<String>,
 }
 
 /// Whether any option that modifies the filesystem was given.
 fn has_write_ops(args: &Args) -> bool {
     args.format.is_some()
-        || args.add_file.is_some()
-        || args.delete_file.is_some()
-        || args.make_dir.is_some()
-        || args.delete_dir.is_some()
-        || args.rename.is_some()
-        || args.set_comment.is_some()
-        || args.set_protection.is_some()
+        || !args.add_file.is_empty()
+        || !args.delete_file.is_empty()
+        || !args.make_dir.is_empty()
+        || !args.delete_dir.is_empty()
+        || !args.rename.is_empty()
+        || !args.set_comment.is_empty()
+        || !args.set_protection.is_empty()
 }
 
 /// Apply every requested filesystem modification, in a fixed order, to a
@@ -171,14 +176,15 @@ fn run_write_ops(args: &Args) -> Result<(), String> {
         let mut fs = AmigaFsWriter::mount(&mut image)
             .map_err(|e| format!("cannot mount filesystem for writing: {}", e))?;
 
-        if let Some(path) = &args.make_dir {
+        // Kinds run in a fixed order (directories first, deletions last);
+        // within a kind, in the order given.
+        for path in &args.make_dir {
             fs.create_dir(path)
                 .map_err(|e| format!("cannot create directory {:?}: {}", path, e))?;
             eprintln!("Created directory {}", path);
         }
 
-        if let Some(pair) = &args.add_file {
-            let (local, amiga) = (&pair[0], &pair[1]);
+        for [local, amiga] in args.add_file.as_chunks::<2>().0 {
             let data =
                 std::fs::read(local).map_err(|e| format!("cannot read {:?}: {}", local, e))?;
             fs.write_file(amiga, &data)
@@ -186,18 +192,18 @@ fn run_write_ops(args: &Args) -> Result<(), String> {
             eprintln!("Wrote {} ({} bytes) to {}", local, data.len(), amiga);
         }
 
-        if let Some(pair) = &args.rename {
+        for pair in args.rename.as_chunks::<2>().0 {
             fs.rename(&pair[0], &pair[1])
                 .map_err(|e| format!("cannot rename {:?}: {}", pair[0], e))?;
             eprintln!("Renamed {} to {}", pair[0], pair[1]);
         }
 
-        if let Some(pair) = &args.set_comment {
+        for pair in args.set_comment.as_chunks::<2>().0 {
             fs.set_comment(&pair[0], &pair[1])
                 .map_err(|e| format!("cannot set comment on {:?}: {}", pair[0], e))?;
         }
 
-        if let Some(pair) = &args.set_protection {
+        for pair in args.set_protection.as_chunks::<2>().0 {
             let raw = &pair[1];
             let bits = match raw.strip_prefix("0x").or_else(|| raw.strip_prefix("0X")) {
                 Some(hex) => u32::from_str_radix(hex, 16),
@@ -208,13 +214,13 @@ fn run_write_ops(args: &Args) -> Result<(), String> {
                 .map_err(|e| format!("cannot set protection on {:?}: {}", pair[0], e))?;
         }
 
-        if let Some(path) = &args.delete_file {
+        for path in &args.delete_file {
             fs.delete_file(path)
                 .map_err(|e| format!("cannot delete {:?}: {}", path, e))?;
             eprintln!("Deleted {}", path);
         }
 
-        if let Some(path) = &args.delete_dir {
+        for path in &args.delete_dir {
             fs.delete_dir(path)
                 .map_err(|e| format!("cannot delete directory {:?}: {}", path, e))?;
             eprintln!("Deleted directory {}", path);
