@@ -125,10 +125,25 @@ jobs:
       - name: Audit dependencies
         run: cargo audit
 
-  fuzz-smoke:
+  # One job per fuzz target, in parallel: run one after another they took
+  # about eight minutes and were the slowest part of every pull request.
+  fuzz:
+    name: fuzz (${{ matrix.target }})
     if: ${{ !(github.event_name == 'push' && github.ref == 'refs/heads/main') }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - disassemble
+          - amiga_hunk_parse
+          - assembler_pipeline
+          - floppy_adf
+          - floppy_uae
+          - floppy_ipf
+          - floppy_amigados
+          - floppy_amigados_write
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
@@ -147,7 +162,7 @@ jobs:
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked
 
-      - name: Fuzz smoke run (60s per target)
+      - name: Fuzz smoke run (60s)
         # Not a full fuzzing campaign — just enough per-PR signal to catch
         # an obviously broken target or an immediately-reachable panic,
         # the same class of bug that a 60s local run already found twice
@@ -159,9 +174,19 @@ jobs:
         # discovered coverage edge.
         env:
           ASAN_OPTIONS: symbolize=0
+        run: cargo fuzz run "${{ matrix.target }}" -- -max_total_time=60 -timeout=10
+
+  # The required status check is named fuzz-smoke; this job keeps that name
+  # and fails unless every target passed (or all were skipped on main).
+  fuzz-smoke:
+    if: ${{ always() }}
+    needs: fuzz
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: All fuzz targets passed
         run: |
-          for target in disassemble amiga_hunk_parse assembler_pipeline floppy_adf floppy_uae floppy_ipf floppy_amigados; do
-            echo "::group::fuzz $target"
-            cargo fuzz run "$target" -- -max_total_time=60 -timeout=10
-            echo "::endgroup::"
-          done
+          case "${{ needs.fuzz.result }}" in
+            success|skipped) echo "fuzz: ${{ needs.fuzz.result }}" ;;
+            *) echo "fuzz: ${{ needs.fuzz.result }}"; exit 1 ;;
+          esac
