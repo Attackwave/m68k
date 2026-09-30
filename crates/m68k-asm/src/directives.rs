@@ -728,6 +728,7 @@ pub fn handle_incbin_pass1(
     symbols: &SymbolTable,
     _pc: u32,
     source_root: &Path,
+    include_paths: &[PathBuf],
     line_no: usize,
 ) -> Result<DirectiveResult, AsmError> {
     if args.is_empty() {
@@ -735,7 +736,8 @@ pub fn handle_incbin_pass1(
     }
 
     let filename = strip_quotes(&args[0]);
-    let path = resolve_include_path(filename, source_root)?;
+    // Searched like INCLUDE: next to the source, then each -I directory.
+    let path = resolve_include_path_in(filename, source_root, include_paths)?;
 
     let data = fs::read(&path).map_err(|e| {
         AsmError::with_line(
@@ -773,6 +775,7 @@ pub fn handle_incbin_pass2(
     symbols: &SymbolTable,
     pc: u32,
     source_root: &Path,
+    include_paths: &[PathBuf],
     line_no: usize,
     source: &str,
 ) -> Result<(DirectiveResult, Option<AssembledInstruction>), AsmError> {
@@ -781,7 +784,7 @@ pub fn handle_incbin_pass2(
     }
 
     let filename = strip_quotes(&args[0]);
-    let path = resolve_include_path(filename, source_root)?;
+    let path = resolve_include_path_in(filename, source_root, include_paths)?;
 
     let data = fs::read(&path).map_err(|e| {
         AsmError::with_line(
