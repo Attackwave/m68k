@@ -175,7 +175,8 @@ fn enc_mul(
                 }
             };
             let is_64bit = matches!(dst, Operand::RegPair(..));
-            let (src_mode, src_reg, src_ext) = encode_ea(src, "l", pc, DATA, cpu)?;
+            // The 68020 extension word comes before the EA's own extension.
+            let (src_mode, src_reg, src_ext) = encode_ea(src, "l", pc + 2, DATA, cpu)?;
             let op = 0x4C00 | ((src_mode as u16) << 3) | (src_reg as u16);
             let ext = (dl << 12)
                 | (if is_signed { 0x0800 } else { 0 })
@@ -260,7 +261,8 @@ fn enc_div(
                 }
             };
             let is_64bit = matches!(dst, Operand::RegPair(..));
-            let (src_mode, src_reg, src_ext) = encode_ea(src, "l", pc, DATA, cpu)?;
+            // The 68020 extension word comes before the EA's own extension.
+            let (src_mode, src_reg, src_ext) = encode_ea(src, "l", pc + 2, DATA, cpu)?;
             let op = 0x4C40 | ((src_mode as u16) << 3) | (src_reg as u16);
             let ext = (dq << 12)
                 | (if is_signed { 0x0800 } else { 0 })

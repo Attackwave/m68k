@@ -277,14 +277,14 @@ pub fn encode_instruction(
         // JMP/JSR
         "JMP" => {
             if let Some(d) = src.or(dst) {
-                enc_jmp(d, pc + 2, cpu)
+                enc_jmp(d, pc + 4, cpu)
             } else {
                 Err(AsmError::new("JMP requires destination operand"))
             }
         }
         "JSR" => {
             if let Some(d) = src.or(dst) {
-                enc_jsr(d, pc + 2, cpu)
+                enc_jsr(d, pc + 4, cpu)
             } else {
                 Err(AsmError::new("JSR requires destination operand"))
             }
@@ -449,13 +449,13 @@ pub fn encode_instruction(
         }
         "DIVSL" => match (src, dst) {
             (Some(s), Some(d @ Operand::RegPair(..))) => {
-                enc_divsl_ul(s, d, pc + 4, cpu, true, "DIVSL")
+                enc_divsl_ul(s, d, pc + 6, cpu, true, "DIVSL")
             }
             _ => Err(AsmError::new("DIVSL requires source and Dr:Dq")),
         },
         "DIVUL" => match (src, dst) {
             (Some(s), Some(d @ Operand::RegPair(..))) => {
-                enc_divsl_ul(s, d, pc + 4, cpu, false, "DIVUL")
+                enc_divsl_ul(s, d, pc + 6, cpu, false, "DIVUL")
             }
             _ => Err(AsmError::new("DIVUL requires source and Dr:Dq")),
         },
@@ -522,35 +522,35 @@ pub fn encode_instruction(
         "NOT" => {
             let sz = size.unwrap_or("w");
             match src.or(dst) {
-                Some(d) => enc_not(d, sz, pc + 2, cpu),
+                Some(d) => enc_not(d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("NOT requires destination operand")),
             }
         }
         "CLR" => {
             let sz = size.unwrap_or("w");
             match src.or(dst) {
-                Some(d) => enc_clr(d, sz, pc + 2, cpu),
+                Some(d) => enc_clr(d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("CLR requires destination operand")),
             }
         }
         "NEG" => {
             let sz = size.unwrap_or("w");
             match src.or(dst) {
-                Some(d) => enc_neg(d, sz, pc + 2, cpu),
+                Some(d) => enc_neg(d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("NEG requires destination operand")),
             }
         }
         "NEGX" => {
             let sz = size.unwrap_or("w");
             match src.or(dst) {
-                Some(d) => enc_negx(d, sz, pc + 2, cpu),
+                Some(d) => enc_negx(d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("NEGX requires destination operand")),
             }
         }
         "TST" => {
             let sz = size.unwrap_or("w");
             match src.or(dst) {
-                Some(d) => enc_tst(d, sz, pc + 2, cpu),
+                Some(d) => enc_tst(d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("TST requires destination operand")),
             }
         }
@@ -596,8 +596,8 @@ pub fn encode_instruction(
                 // word-sized and by one. With only one operand the parser
                 // delivers it as `src`, so matching on `dst` alone missed
                 // it and produced "Shift requires destination operand".
-                (Some(d), None) | (None, Some(d)) => enc_shift_mem(&mn, d, "w", pc + 2, cpu),
-                (Some(_), Some(d)) => enc_shift_mem(&mn, d, "w", pc + 2, cpu),
+                (Some(d), None) | (None, Some(d)) => enc_shift_mem(&mn, d, "w", pc + 4, cpu),
+                (Some(_), Some(d)) => enc_shift_mem(&mn, d, "w", pc + 4, cpu),
                 _ => Err(AsmError::new("Shift requires destination operand")),
             }
         }
@@ -607,7 +607,7 @@ pub fn encode_instruction(
             let mn = mnemonic.to_lowercase();
             match (src, dst) {
                 (Some(Operand::Immediate(n)), Some(d)) => {
-                    enc_bit_imm(&mn, *n as u16, d, pc + 4, cpu)
+                    enc_bit_imm(&mn, *n as u16, d, pc + 6, cpu)
                 }
                 (Some(Operand::DataReg(rn)), Some(d)) => enc_bit_reg(&mn, *rn, d, pc + 4, cpu),
                 _ => Err(AsmError::new("Bit operation requires bit and destination")),
@@ -630,7 +630,7 @@ pub fn encode_instruction(
                 let (mode, reg, ext) = crate::ea_encode::encode_ea(
                     d,
                     "w",
-                    pc + 2,
+                    pc + 4,
                     m68k_core::ea_categories::ea::DATA_ALT,
                     cpu,
                 )?;
@@ -655,7 +655,7 @@ pub fn encode_instruction(
                 let (mode, reg, ext) = crate::ea_encode::encode_ea(
                     d,
                     "w",
-                    pc + 2,
+                    pc + 4,
                     m68k_core::ea_categories::ea::DATA_ALT,
                     cpu,
                 )?;
@@ -669,7 +669,7 @@ pub fn encode_instruction(
                 let (mode, reg, ext) = crate::ea_encode::encode_ea(
                     s,
                     "w",
-                    pc + 2,
+                    pc + 4,
                     m68k_core::ea_categories::ea::DATA,
                     cpu,
                 )?;
@@ -683,7 +683,7 @@ pub fn encode_instruction(
                 let (mode, reg, ext) = crate::ea_encode::encode_ea(
                     s,
                     "w",
-                    pc + 2,
+                    pc + 4,
                     m68k_core::ea_categories::ea::DATA,
                     cpu,
                 )?;
@@ -759,10 +759,10 @@ pub fn encode_instruction(
                 // as a mask the source is the register list, matching the
                 // Immediate arms' original order.
                 (Some(s), Some(d)) if as_mask(s).is_some() => {
-                    enc_movem_rm(as_mask(s).unwrap(), d, sz, pc + 4, cpu)
+                    enc_movem_rm(as_mask(s).unwrap(), d, sz, pc + 6, cpu)
                 }
                 (Some(s), Some(d)) if as_mask(d).is_some() => {
-                    enc_movem_mr(s, as_mask(d).unwrap(), sz, pc + 4, cpu)
+                    enc_movem_mr(s, as_mask(d).unwrap(), sz, pc + 6, cpu)
                 }
                 _ => Err(AsmError::new(
                     "MOVEM requires register mask and destination/source",
@@ -908,7 +908,7 @@ pub fn encode_instruction(
             };
             let d = src.or(dst);
             match d {
-                Some(d) => enc_scc(cond, d, pc + 2, cpu),
+                Some(d) => enc_scc(cond, d, pc + 4, cpu),
                 _ => Err(AsmError::new("Scc requires destination operand")),
             }
         }
@@ -939,14 +939,14 @@ pub fn encode_instruction(
         "NBCD" => {
             let d = src.or(dst);
             match d {
-                Some(d) => enc_nbcd(d, pc + 2, cpu),
+                Some(d) => enc_nbcd(d, pc + 4, cpu),
                 _ => Err(AsmError::new("NBCD requires destination operand")),
             }
         }
         "TAS" => {
             let d = src.or(dst);
             match d {
-                Some(d) => enc_tas(d, pc + 2, cpu),
+                Some(d) => enc_tas(d, pc + 4, cpu),
                 _ => Err(AsmError::new("TAS requires destination operand")),
             }
         }
@@ -1028,7 +1028,7 @@ pub fn encode_instruction(
         "MOVES" => {
             let sz = size.unwrap_or("w");
             match (src, dst) {
-                (Some(s), Some(d)) => enc_moves(s, d, sz, pc + 2, cpu),
+                (Some(s), Some(d)) => enc_moves(s, d, sz, pc + 6, cpu),
                 _ => Err(AsmError::new("MOVES requires two operands")),
             }
         }
@@ -1044,7 +1044,7 @@ pub fn encode_instruction(
             let sz = size.unwrap_or("w");
             let is_chk2 = mnemonic == "CHK2";
             match (src, dst) {
-                (Some(s), Some(d)) => enc_chk2_cmp2(s, d, sz, pc + 2, cpu, is_chk2),
+                (Some(s), Some(d)) => enc_chk2_cmp2(s, d, sz, pc + 6, cpu, is_chk2),
                 _ => Err(AsmError::new(format!("{} requires <ea>,Dn/An", mnemonic))),
             }
         }
@@ -1057,17 +1057,17 @@ pub fn encode_instruction(
 
         // CALLM (68020+)
         "CALLM" => match (src, dst) {
-            (Some(a), Some(e)) => enc_callm(a, e, pc + 2, cpu),
+            (Some(a), Some(e)) => enc_callm(a, e, pc + 6, cpu),
             _ => Err(AsmError::new("CALLM requires #arg,<ea>")),
         },
 
         // Bitfield instructions (68020+): BFxxx ea{offset:width}[,Dn]
         "BFTST" | "BFCHG" | "BFCLR" | "BFSET" | "BFEXTU" | "BFEXTS" | "BFFFO" => match (src, dst) {
             (Some(bf @ Operand::Bitfield(..)), Some(Operand::DataReg(rn))) => {
-                enc_bitfield(mnemonic, bf, Some(*rn), pc + 2, cpu)
+                enc_bitfield(mnemonic, bf, Some(*rn), pc + 6, cpu)
             }
             (Some(bf @ Operand::Bitfield(..)), None) => {
-                enc_bitfield(mnemonic, bf, None, pc + 2, cpu)
+                enc_bitfield(mnemonic, bf, None, pc + 6, cpu)
             }
             _ => Err(AsmError::new(format!(
                 "{} requires bitfield operand: ea{{offset:width}}[,Dn]",
@@ -1077,13 +1077,13 @@ pub fn encode_instruction(
         // BFINS Dn,ea{offset:width} - operand order is reversed vs. the other BFxxx forms
         "BFINS" => match (src, dst) {
             (Some(Operand::DataReg(rn)), Some(bf @ Operand::Bitfield(..))) => {
-                enc_bitfield("BFINS", bf, Some(*rn), pc + 2, cpu)
+                enc_bitfield("BFINS", bf, Some(*rn), pc + 6, cpu)
             }
             _ => Err(AsmError::new("BFINS requires Dn,ea{offset:width}")),
         },
         // BFINV (non-standard bitfield invert)
         "BFINV" => match src {
-            Some(bf @ Operand::Bitfield(..)) => enc_bfinv(bf, pc + 2, cpu),
+            Some(bf @ Operand::Bitfield(..)) => enc_bfinv(bf, pc + 6, cpu),
             _ => Err(AsmError::new(
                 "BFINV requires bitfield operand: ea{offset:width}",
             )),
@@ -1093,8 +1093,8 @@ pub fn encode_instruction(
         _ if fpu_arith_cmd(mnemonic).is_some() => {
             let cmd = fpu_arith_cmd(mnemonic).unwrap();
             match (src, dst) {
-                (Some(s), None) => enc_fpu_arith(cmd, s, None, size, pc + 2, cpu),
-                (Some(s), Some(d)) => enc_fpu_arith(cmd, s, Some(d), size, pc + 2, cpu),
+                (Some(s), None) => enc_fpu_arith(cmd, s, None, size, pc + 6, cpu),
+                (Some(s), Some(d)) => enc_fpu_arith(cmd, s, Some(d), size, pc + 6, cpu),
                 _ => Err(AsmError::new(format!(
                     "{} requires an fp register or EA operand",
                     mnemonic
@@ -1107,7 +1107,7 @@ pub fn encode_instruction(
             let cmd = fpu_short_cmd(mnemonic).unwrap();
             match (src, dst) {
                 (Some(s), Some(Operand::FpReg(fpd))) => {
-                    enc_fpu_short(cmd, s, *fpd, size, pc + 2, cpu)
+                    enc_fpu_short(cmd, s, *fpd, size, pc + 6, cpu)
                 }
                 _ => Err(AsmError::new(format!("{} requires <ea>,FPn", mnemonic))),
             }
@@ -1122,7 +1122,7 @@ pub fn encode_instruction(
         // operand (`{...}` suffix on the destination) that this
         // dispatcher's `(src, dst)` shape has no slot for.
         "FMOVE" => match (src, dst) {
-            (Some(s), Some(d)) => enc_fmove(s, d, size, None, pc + 2, cpu),
+            (Some(s), Some(d)) => enc_fmove(s, d, size, None, pc + 6, cpu),
             _ => Err(AsmError::new("FMOVE requires two operands")),
         },
 
@@ -1135,24 +1135,24 @@ pub fn encode_instruction(
         // FMOVEM: FPn-list<->mem, ctrl-reg-list<->mem
         "FMOVEM" => match (src, dst) {
             (Some(Operand::Immediate(mask)), Some(d)) => {
-                enc_fmovem_regs_to_mem(FpRegSet(*mask as u8), d, pc + 2, cpu)
+                enc_fmovem_regs_to_mem(FpRegSet(*mask as u8), d, pc + 6, cpu)
             }
             (Some(s), Some(Operand::Immediate(mask))) => {
-                enc_fmovem_mem_to_regs(s, FpRegSet(*mask as u8), pc + 2, cpu)
+                enc_fmovem_mem_to_regs(s, FpRegSet(*mask as u8), pc + 6, cpu)
             }
             // A single FPn (not a `/`-list) parses as Operand::FpReg rather than
             // Operand::Immediate(mask); treat it as a one-register mask.
             (Some(Operand::FpReg(fp)), Some(d)) => {
-                enc_fmovem_regs_to_mem(FpRegSet(1 << fp), d, pc + 2, cpu)
+                enc_fmovem_regs_to_mem(FpRegSet(1 << fp), d, pc + 6, cpu)
             }
             (Some(s), Some(Operand::FpReg(fp))) => {
-                enc_fmovem_mem_to_regs(s, FpRegSet(1 << fp), pc + 2, cpu)
+                enc_fmovem_mem_to_regs(s, FpRegSet(1 << fp), pc + 6, cpu)
             }
             (Some(Operand::FpCtrlList(mask)), Some(d)) => {
-                enc_fmovem_ctrl_to_mem(*mask, d, pc + 2, cpu)
+                enc_fmovem_ctrl_to_mem(*mask, d, pc + 6, cpu)
             }
             (Some(s), Some(Operand::FpCtrlList(mask))) => {
-                enc_fmovem_mem_to_ctrl(s, *mask, pc + 2, cpu)
+                enc_fmovem_mem_to_ctrl(s, *mask, pc + 6, cpu)
             }
             _ => Err(AsmError::new(
                 "FMOVEM requires a register list/range and an EA operand",
@@ -1188,7 +1188,7 @@ pub fn encode_instruction(
         _ if mnemonic.starts_with("FS") && fpu_cc(&mnemonic[2..]).is_some() => {
             let cc = fpu_cc(&mnemonic[2..]).unwrap();
             match src.or(dst) {
-                Some(d) => enc_fscc(cc, d, pc + 2, cpu),
+                Some(d) => enc_fscc(cc, d, pc + 6, cpu),
                 _ => Err(AsmError::new(format!(
                     "{} requires a destination operand",
                     mnemonic
@@ -1208,11 +1208,11 @@ pub fn encode_instruction(
 
         // FSAVE / FRESTORE
         "FSAVE" => match src.or(dst) {
-            Some(d) => enc_fsave(d, pc + 2, cpu),
+            Some(d) => enc_fsave(d, pc + 4, cpu),
             _ => Err(AsmError::new("FSAVE requires a destination operand")),
         },
         "FRESTORE" => match src.or(dst) {
-            Some(s) => enc_frestore(s, pc + 2, cpu),
+            Some(s) => enc_frestore(s, pc + 4, cpu),
             _ => Err(AsmError::new("FRESTORE requires a source operand")),
         },
 
@@ -1222,10 +1222,10 @@ pub fn encode_instruction(
         // PMOVE <ea>,MMUreg or PMOVE MMUreg,<ea> (68030+)
         "PMOVE" => match (src, dst) {
             (Some(mmu @ (Operand::Special(_) | Operand::Immediate(_))), Some(ea_op)) => {
-                enc_pmove(ea_op, mmu, false, pc + 2, cpu)
+                enc_pmove(ea_op, mmu, false, pc + 6, cpu)
             }
             (Some(ea_op), Some(mmu @ (Operand::Special(_) | Operand::Immediate(_)))) => {
-                enc_pmove(ea_op, mmu, true, pc + 2, cpu)
+                enc_pmove(ea_op, mmu, true, pc + 6, cpu)
             }
             _ => Err(AsmError::new(
                 "PMOVE requires one MMU register and one EA operand",
@@ -1302,11 +1302,11 @@ pub fn encode_instruction(
 
         // PSAVE / PRESTORE (68030+)
         "PSAVE" => match src.or(dst) {
-            Some(d) => enc_psave(d, pc + 2, cpu),
+            Some(d) => enc_psave(d, pc + 4, cpu),
             _ => Err(AsmError::new("PSAVE requires a destination operand")),
         },
         "PRESTORE" => match src.or(dst) {
-            Some(s) => enc_prestore(s, pc + 2, cpu),
+            Some(s) => enc_prestore(s, pc + 4, cpu),
             _ => Err(AsmError::new("PRESTORE requires a source operand")),
         },
 
@@ -1318,7 +1318,7 @@ pub fn encode_instruction(
         // pushed to the 3-operand path, which only sees `src,FPc,FPs`.
         "FSINCOS" => match (src, dst) {
             (Some(s), Some(Operand::RegPair(cos_dst, sin_dst))) => {
-                enc_fsincos(s, *cos_dst, *sin_dst, size, pc + 2, cpu)
+                enc_fsincos(s, *cos_dst, *sin_dst, size, pc + 6, cpu)
             }
             _ => Err(AsmError::new(
                 "FSINCOS requires src,FPc:FPs (or src,FPcos,FPsin)",
@@ -1355,7 +1355,7 @@ pub fn encode_instruction_ex(
     if mnemonic == "FSINCOS" {
         return match (src, dst, extra) {
             (Some(s), Some(Operand::FpReg(cos_dst)), Some(Operand::FpReg(sin_dst))) => {
-                enc_fsincos(s, *cos_dst, *sin_dst, size, pc + 2, cpu)
+                enc_fsincos(s, *cos_dst, *sin_dst, size, pc + 6, cpu)
             }
             _ => Err(AsmError::new("FSINCOS requires src,FPcos,FPsin")),
         };
@@ -1363,7 +1363,7 @@ pub fn encode_instruction_ex(
     if mnemonic == "PFLUSH" {
         return match (src, dst, extra) {
             (Some(Operand::Immediate(fc)), Some(Operand::Immediate(mask)), Some(ea_op)) => {
-                enc_pflush(*fc, *mask, ea_op, pc + 2, cpu)
+                enc_pflush(*fc, *mask, ea_op, pc + 6, cpu)
             }
             // Two operands: the no-EA form.
             (Some(Operand::Immediate(fc)), Some(Operand::Immediate(mask)), None) => {
