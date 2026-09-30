@@ -2902,6 +2902,7 @@ impl Assembler {
     /// Pass 1: Collect labels, build symbol table, estimate sizes.
     fn pass1(&mut self, lines: &[ParsedLine]) -> Result<(), AsmError> {
         self.pc = self.origin;
+        self.sections.restart_pass();
         // Per-pass state, like `pc`: RS walks a struct from its base
         // every time the source is walked. Leaving it where the previous
         // pass stopped made pass 2 continue counting, so every field
@@ -3610,6 +3611,7 @@ impl Assembler {
     fn recalculate_pcs(&mut self, lines: &[ParsedLine]) {
         self.line_pcs.clear();
         self.pc = self.origin;
+        self.sections.restart_pass();
         self.rs_counter = 0;
         let mut cond_stack: Vec<bool> = Vec::new();
         // Rebuild the local-label scope from the top, as both passes do.
@@ -3808,6 +3810,7 @@ impl Assembler {
     /// Pass 2: Encode all instructions with resolved symbols.
     fn pass2(&mut self, lines: &[ParsedLine]) -> Result<(), AsmError> {
         self.pc = self.origin;
+        self.sections.restart_pass();
         self.rs_counter = 0;
         self.code.clear();
         self.conditional_stack.clear();
