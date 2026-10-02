@@ -2475,6 +2475,7 @@ impl Assembler {
 
             // --- REPT: repeat block N times ---
             if mnemonic1 == "rept" && !operands1.is_empty() {
+                let repeat_line = i;
                 let count: usize = match operands1[0].parse() {
                     Ok(n) => n,
                     Err(_) => {
@@ -2519,7 +2520,7 @@ impl Assembler {
                     } else if mne == "rept" || mne == "irp" || mne == "irpc" {
                         depth += 1;
                     }
-                    body.push(lines[i].to_string());
+                    body.push((lines[i].to_string(), i));
                     i += 1;
                 }
                 if i < lines.len() {
@@ -2528,17 +2529,21 @@ impl Assembler {
 
                 if let Some(ref lbl) = lbl1 {
                     output.push(format!("{} EQU $", lbl));
-                    trace.push((i, None));
+                    trace.push((repeat_line, None));
                 }
 
                 for _ in 0..count {
-                    output.extend(body.clone());
+                    for (line, input_line) in &body {
+                        output.push(line.clone());
+                        trace.push((*input_line, None));
+                    }
                 }
                 continue;
             }
 
             // --- IRP: iterate over list of values ---
             if mnemonic1 == "irp" && operands1.len() >= 2 {
+                let repeat_line = i;
                 let mut param_name = operands1[0].clone();
                 if let Some(stripped) = param_name.strip_prefix('\\') {
                     param_name = stripped.to_string();
@@ -2558,7 +2563,7 @@ impl Assembler {
                     } else if mne == "rept" || mne == "irp" || mne == "irpc" {
                         depth += 1;
                     }
-                    body.push(lines[i].to_string());
+                    body.push((lines[i].to_string(), i));
                     i += 1;
                 }
                 if i < lines.len() {
@@ -2567,14 +2572,14 @@ impl Assembler {
 
                 if let Some(ref lbl) = lbl1 {
                     output.push(format!("{} EQU $", lbl));
-                    trace.push((i, None));
+                    trace.push((repeat_line, None));
                 }
 
                 let key = format!("\\{}", param_name);
                 for value in &values {
-                    for line in &body {
+                    for (line, input_line) in &body {
                         output.push(line.replace(&key, value));
-                        trace.push((i, None));
+                        trace.push((*input_line, None));
                     }
                 }
                 continue;
@@ -2582,6 +2587,7 @@ impl Assembler {
 
             // --- IRPC: iterate over characters of a string ---
             if mnemonic1 == "irpc" && operands1.len() >= 2 {
+                let repeat_line = i;
                 let mut param_name = operands1[0].clone();
                 if let Some(stripped) = param_name.strip_prefix('\\') {
                     param_name = stripped.to_string();
@@ -2601,7 +2607,7 @@ impl Assembler {
                     } else if mne == "rept" || mne == "irp" || mne == "irpc" {
                         depth += 1;
                     }
-                    body.push(lines[i].to_string());
+                    body.push((lines[i].to_string(), i));
                     i += 1;
                 }
                 if i < lines.len() {
@@ -2610,14 +2616,14 @@ impl Assembler {
 
                 if let Some(ref lbl) = lbl1 {
                     output.push(format!("{} EQU $", lbl));
-                    trace.push((i, None));
+                    trace.push((repeat_line, None));
                 }
 
                 let key = format!("\\{}", param_name);
                 for ch in &chars {
-                    for line in &body {
+                    for (line, input_line) in &body {
                         output.push(line.replace(&key, &ch.to_string()));
-                        trace.push((i, None));
+                        trace.push((*input_line, None));
                     }
                 }
                 continue;
@@ -2705,6 +2711,7 @@ impl Assembler {
             i += 1;
         }
 
+        debug_assert_eq!(output.len(), trace.len());
         // Compose this pass's trace with the map built so far, so an
         // origin survives however many expansion rounds a source needs.
         if !self.source_map.is_empty() {
@@ -6485,6 +6492,19 @@ loop REPT 2
         // "ABC" is odd-length, so a pad byte precedes the RTS.
         let (bytes, _) = crate::output::generate_binary(&asm.code).unwrap();
         assert_eq!(bytes, vec![0x41, 0x42, 0x43, 0x00, 0x4E, 0x75]);
+    }
+
+    #[test]
+    fn repeated_lines_keep_their_source_origin() {
+        let mut asm = Assembler::new(0);
+        let expanded = asm
+            .debug_expand("    IRP \\r,D0,D1\n    NOP\n    ENDR\n    IRPC \\c,XY\n    NOP\n    ENDR\n    RTS\n")
+            .unwrap();
+        assert_eq!(expanded.lines().count(), 5);
+        let origins: Vec<_> = (1..=5)
+            .map(|line| asm.source_origin(line).unwrap().line)
+            .collect();
+        assert_eq!(origins, [2, 2, 5, 5, 7]);
     }
 
     #[test]
