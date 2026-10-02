@@ -461,21 +461,47 @@ impl<'a> AmigaFsWriter<'a> {
         Ok(None)
     }
 
-    /// Insert an already-written header block into a directory's hash
-    /// chain. New entries go to the front of their bucket, which is what
-    /// AmigaDOS does and keeps this O(1).
+    /// Insert an already-written header block into its bucket in ascending
+    /// block-number order. This also handles a renamed entry whose block
+    /// number is lower than entries already in the destination bucket.
     fn link_into_dir(&mut self, dir_block: u32, entry_block: u32) -> Result<(), FloppyError> {
         let entry_off = self.check_block(entry_block)?;
         let name = read_bcpl_string(self.image, entry_off + OFF_NAME, 30);
         let bucket = amiga_hash(name.as_bytes()) as usize;
         let dir_off = self.check_block(dir_block)?;
 
-        let head = read_u32(self.image, dir_off + OFF_TABLE + bucket * 4);
-        write_u32(self.image, entry_off + OFF_HASH_CHAIN, head);
+        let bucket_off = dir_off + OFF_TABLE + bucket * 4;
+        let mut previous = None;
+        let mut current = read_u32(self.image, bucket_off);
+        let mut steps = 0u32;
+        while current != 0 && current < entry_block {
+            steps += 1;
+            if steps > self.total_blocks {
+                return Err(FloppyError::new(format!(
+                    "hash chain in directory block {} does not terminate",
+                    dir_block
+                )));
+            }
+            let current_off = self.check_block(current)?;
+            previous = Some(current);
+            current = read_u32(self.image, current_off + OFF_HASH_CHAIN);
+        }
+        if current == entry_block {
+            return Err(FloppyError::new(format!(
+                "block {} is already in directory block {}",
+                entry_block, dir_block
+            )));
+        }
+        write_u32(self.image, entry_off + OFF_HASH_CHAIN, current);
         write_u32(self.image, entry_off + OFF_PARENT, dir_block);
-        write_u32(self.image, dir_off + OFF_TABLE + bucket * 4, entry_block);
-
         fix_block_checksum(self.image, entry_block, OFF_CHECKSUM);
+        if let Some(previous) = previous {
+            let previous_off = self.check_block(previous)?;
+            write_u32(self.image, previous_off + OFF_HASH_CHAIN, entry_block);
+            fix_block_checksum(self.image, previous, OFF_CHECKSUM);
+        } else {
+            write_u32(self.image, bucket_off, entry_block);
+        }
         fix_block_checksum(self.image, dir_block, OFF_CHECKSUM);
         self.touch_dir(dir_block)?;
         Ok(())
@@ -979,7 +1005,7 @@ fn amiga_now() -> (u32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::adf_writer::format_empty_ofs_disk;
+    use crate::adf_writer::{format_empty_ffs_disk, format_empty_ofs_disk};
 
     /// Standard DD floppy: 1760 blocks, root at 880.
     fn fresh() -> (Vec<u8>, u32, u32) {
@@ -1316,6 +1342,60 @@ mod tests {
         assert_eq!(listed.len(), names.len(), "some entries went missing");
         for (i, n) in names.iter().enumerate() {
             assert_eq!(read_file(&image, n), format!("body-{}", i).as_bytes());
+        }
+    }
+
+    #[test]
+    fn colliding_entries_stay_in_block_order_after_rename_and_reuse() {
+        // A fresh disk allocates increasing header blocks. Renaming an older
+        // entry into a bucket, then reusing a freed block, exercises insertion
+        // at the head and in the middle as well as ordinary tail insertion.
+        let bucket = amiga_hash(b"COLLISION");
+        let names: Vec<String> = (0..1000)
+            .map(|i| format!("N{i}"))
+            .filter(|name| amiga_hash(name.as_bytes()) == bucket)
+            .take(5)
+            .collect();
+        assert_eq!(names.len(), 5);
+
+        for mut image in [
+            format_empty_ofs_disk("TestDisk").unwrap(),
+            format_empty_ffs_disk("TestDisk").unwrap(),
+        ] {
+            let root = (image.len() / BLOCK_SIZE / 2) as u32;
+            {
+                let mut w = AmigaFsWriter::mount(&mut image).unwrap();
+                w.write_file("TEMP_HEAD", b"head").unwrap();
+                w.write_file(&names[0], b"first").unwrap();
+                w.write_file("TEMP_MID", b"middle").unwrap();
+                w.write_file(&names[1], b"last").unwrap();
+                w.rename("TEMP_MID", &names[2]).unwrap();
+                w.rename("TEMP_HEAD", &names[3]).unwrap();
+                w.delete_file(&names[0]).unwrap();
+                w.write_file(&names[4], b"reused").unwrap();
+            }
+
+            let mut block = read_u32(&image, block_offset(root) + OFF_TABLE + bucket as usize * 4);
+            let mut previous = 0;
+            let mut count = 0;
+            while block != 0 {
+                assert!(block > previous, "hash chain is not ascending");
+                let off = block_offset(block);
+                assert_eq!(
+                    read_u32(&image, off + OFF_CHECKSUM),
+                    block_checksum(&image[off..off + BLOCK_SIZE], OFF_CHECKSUM),
+                    "header {block} has an invalid checksum"
+                );
+                previous = block;
+                block = read_u32(&image, off + OFF_HASH_CHAIN);
+                count += 1;
+                assert!(count <= 4, "hash chain does not terminate");
+            }
+            assert_eq!(count, 4);
+            assert_eq!(read_file(&image, &names[4]), b"reused");
+            assert_eq!(read_file(&image, &names[3]), b"head");
+            assert_eq!(read_file(&image, &names[2]), b"middle");
+            assert_eq!(read_file(&image, &names[1]), b"last");
         }
     }
 
