@@ -370,7 +370,10 @@ pub fn split_line(line: &str) -> (Option<String>, String, String, Vec<String>) {
     if parts.len() == 2
         && is_valid_ident(parts[0])
         && !takes_cache_scope_operand(parts[0])
-        && !is_mnemonic(parts[0])
+        // A size suffix is part of the instruction token, not of a label.
+        // Otherwise `BPL.S fail` looks like label `BPL.S` followed by the
+        // FAIL directive, while `BPL fail` parses correctly.
+        && !is_mnemonic(parts[0].split('.').next().unwrap_or(parts[0]))
     {
         let rest = parts[1].trim();
         let rest_parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
@@ -695,6 +698,22 @@ mod tests {
         );
         assert_eq!(result.0, Some("myLabel".to_string()));
         assert_eq!(result.1, "instruction");
+    }
+
+    #[test]
+    fn sized_branch_to_directive_named_label_is_an_instruction() {
+        for (instruction, expected_mnemonic, expected_size, expected_target) in [
+            ("BPL.S fail", "bpl", "s", "fail"),
+            ("BNE.S FAIL", "bne", "s", "FAIL"),
+            ("BRA.S fail", "bra", "s", "fail"),
+            ("BRA.W end", "bra", "w", "end"),
+        ] {
+            let (label, mnemonic, size, operands) = split_line(instruction);
+            assert_eq!(label, None, "{instruction}");
+            assert_eq!(mnemonic, expected_mnemonic, "{instruction}");
+            assert_eq!(size, expected_size, "{instruction}");
+            assert_eq!(operands, [expected_target], "{instruction}");
+        }
     }
 
     #[test]
