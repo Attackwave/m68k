@@ -1,0 +1,129 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-08-30T18:46:00.000Z",
+  "title": "Design System: m68k Studio",
+  "extensions": {
+    "colorMeta": {
+      "primary": {
+        "role": "primary",
+        "displayName": "Electric Cobalt Blue",
+        "canonical": "#3B82F6",
+        "tonalRamp": ["#0b1a30", "#122b52", "#1a3d75", "#25539d", "#3B82F6", "#60a5fa", "#93c5fd", "#dbeafe"]
+      },
+      "neutral-bg": {
+        "role": "neutral",
+        "displayName": "Obsidian Canvas",
+        "canonical": "#0F1117",
+        "tonalRamp": ["#07080b", "#0F1117", "#161922", "#1E222D", "#2D3344", "#475569", "#94A3B8", "#E2E8F0"]
+      }
+    },
+    "typographyMeta": {
+      "display": {
+        "displayName": "Display / Brand",
+        "purpose": "TitleBar Brand and Modal Dialog Headers."
+      },
+      "label": {
+        "displayName": "Label / Monospace",
+        "purpose": "Code editor, disassembler, registers, hex dumps, and cycle budgets."
+      }
+    },
+    "shadows": [
+      {
+        "name": "modal-elevation",
+        "value": "0 25px 50px -12px rgba(0, 0, 0, 0.7)",
+        "purpose": "Floating modals, Command Palette, and context menus."
+      }
+    ],
+    "motion": [
+      {
+        "name": "ease-standard",
+        "value": "cubic-bezier(0.4, 0, 0.2, 1)",
+        "purpose": "Default easing for hover and panel transitions."
+      }
+    ],
+    "breakpoints": [
+      {
+        "name": "sm",
+        "value": "640px"
+      },
+      {
+        "name": "md",
+        "value": "768px"
+      },
+      {
+        "name": "lg",
+        "value": "1024px"
+      }
+    ]
+  },
+  "components": [
+    {
+      "name": "Build Button",
+      "kind": "button",
+      "refersTo": "button-primary",
+      "description": "Primary build action button in top TitleBar.",
+      "html": "<button class=\"ds-btn-build\">🔨 Build (F7)</button>",
+      "css": ".ds-btn-build { background: #3B82F6; color: #ffffff; font-weight: 700; font-size: 12px; padding: 4px 12px; border-radius: 6px; border: none; cursor: pointer; transition: background 0.15s ease; } .ds-btn-build:hover { background: #2563EB; }"
+    },
+    {
+      "name": "Run Button",
+      "kind": "button",
+      "refersTo": "button-success",
+      "description": "Primary emulator launch button in TitleBar.",
+      "html": "<button class=\"ds-btn-run\">▶ Run (F5)</button>",
+      "css": ".ds-btn-run { background: #10B981; color: #ffffff; font-weight: 700; font-size: 12px; padding: 4px 12px; border-radius: 6px; border: none; cursor: pointer; transition: background 0.15s ease; } .ds-btn-run:hover { background: #059669; }"
+    },
+    {
+      "name": "Editor Tab",
+      "kind": "custom",
+      "refersTo": "tab-active",
+      "description": "Active file tab in Monaco Editor header.",
+      "html": "<div class=\"ds-tab-active\"><span>🐍 main.py</span><button class=\"ds-tab-close\">✕</button></div>",
+      "css": ".ds-tab-active { background: #1E222D; color: #ffffff; font-size: 12px; font-weight: 500; height: 32px; padding: 0 12px; display: inline-flex; align-items: center; gap: 8px; border-top: 2px solid #3B82F6; border-right: 1px solid #2A2F3D; } .ds-tab-close { background: transparent; border: none; color: #94A3B8; cursor: pointer; font-size: 10px; padding: 2px; border-radius: 4px; } .ds-tab-close:hover { background: #2D3344; color: #ffffff; }"
+    }
+  ],
+  "narrative": {
+    "northStar": "The Precision Workbench",
+    "overview": "m68k Studio ist eine hochpräzise, fokussierte Dark-Studio-Umgebung für Entwickler, die Motorola 68000–68060 Maschinencode, Python-Transpilate und hardwarenahe Demos bauen. Das Design verbindet die funktionale Klarheit moderner IDEs (VS Code) mit der unverwechselbaren Ästhetik ingenieurmäßiger Retro-Hardware-Werkzeuge.",
+    "keyCharacteristics": [
+      "Tonal Layering: Konsequente räumliche Schichtung über vier dunkle Helligkeitsstufen statt unruhiger Schlagschatten.",
+      "Micro-Precision Monospace: Präzise Ausrichtung von Opcodes, Hex-Dumps, Cycles und Registern in gestochen scharfer Festbreitenschrift.",
+      "Restrained Vibrant Accents: Reines Cobalt-Blau (#3B82F6) und Horizon-Blau (#007acc) führen den Blick; Retro-Farben (Amiga-Orange/Blau) markieren Plattform-Spezifika.",
+      "Tactile Density: Kompakte Bedienelemente (8px/12px Rhythmus, 4px/8px Radien) für maximalen Code-Editor- und Tool-Raum."
+    ],
+    "rules": [
+      {
+        "name": "The Emitted Light Rule",
+        "body": "Das Studio selbst ist dunkel und ruhig; Farbe leuchtet nur dort auf, wo der Code, die Hardware (Copper/Raster) oder der Compiler-Zustand direkte Information ausgibt.",
+        "section": "colors"
+      },
+      {
+        "name": "The Functional Accent Rule",
+        "body": "Primärblau wird auf weniger als 5% der Bildschirmfläche verwendet. Jeder blaue Pixel signalisiert unmittelbare Interaktivität oder aktiven Fokus.",
+        "section": "colors"
+      },
+      {
+        "name": "The Strict Alignment Rule",
+        "body": "Alle Zahlen, Adressen ($0000), Register (D0-D7, A0-A7) und Zyklenwerte werden ausnahmslos in Monospace gesetzt, um tabellarische Lesbarkeit ohne Versatz zu garantieren.",
+        "section": "typography"
+      },
+      {
+        "name": "The Clean Surface Rule",
+        "body": "Innerhalb des regulären Workbench-Layouts existieren keine diffusen Schatten. Tiefe entsteht ausschließlich durch Tonwertabstufung und 1px Konturlinien.",
+        "section": "elevation"
+      }
+    ],
+    "dos": [
+      "Do alle Hexadezimal-Adressen, Disassembler-Bytes, Cycle-Zahlen und Register in font-mono setzen.",
+      "Do Farbcodierungen einheitlich halten (Rot = Fehler, Gelb = Warnung, Grün = Erfolg/Run, Blau = Selektion).",
+      "Do Tastaturkürzel (Ctrl+P, F1, F5, F7, Ctrl+B, Ctrl+J) in allen Tooltips und Menüs anzeigen.",
+      "Do Modale Dialoge mit weichem backdrop-blur-md vom Hintergrund isolieren."
+    ],
+    "donts": [
+      "Don't bunte, unruhige Verläufe oder Schmuckgrafiken in den Code-Editor einbauen.",
+      "Don't mehr als einen prominenten Primär-Button pro Toolbar-Gruppe platzieren.",
+      "Don't Hex-Werte ohne einheitliches Prefix ($ für m68k, 0x für Python) mischen.",
+      "Don't native Browser-Alerts verwenden; alle Rückmeldungen laufen über das NotificationSystem."
+    ]
+  }
+}
