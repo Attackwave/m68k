@@ -20,7 +20,7 @@ struct HunkInfo {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "m68k-disasm")]
+#[command(name = "m68k-disasm", version)]
 #[command(about = "Motorola 68000 disassembler", long_about = None)]
 struct Args {
     /// Input binary file to disassemble (use `-` to read from stdin)

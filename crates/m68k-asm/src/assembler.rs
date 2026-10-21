@@ -1913,6 +1913,9 @@ pub struct Assembler {
     /// Debug info needs a path a debugger can open; diagnostics keep the
     /// short name.
     pub include_paths_resolved: HashMap<String, PathBuf>,
+    /// Every file read through `INCLUDE` or `INCBIN`, once each, in the
+    /// order first read, with the path as resolved (for a make depfile).
+    pub dependencies: Vec<PathBuf>,
     /// Most recent global (non-local) label, used to scope local labels.
     ///
     /// A local label (`.loop`) belongs to the global label above it, so
@@ -1921,6 +1924,12 @@ pub struct Assembler {
     /// while walking is enough to give each local label a unique name —
     /// see [`Assembler::qualify_label`].
     current_global_label: Option<String>,
+    /// Explicit `.S` branches found out of range during pass 2.
+    ///
+    /// Collected instead of returned at once, so one build reports every
+    /// such branch: a change that pushes code apart typically breaks
+    /// several of them together. See [`Assembler::pass2`].
+    short_branch_errors: Vec<AsmError>,
 }
 
 /// Tracks `OPT` directive flags (`OPT flag[n][+-]`, comma-separated,
@@ -2031,6 +2040,7 @@ impl Assembler {
             register_aliases: HashMap::new(),
             included_files: std::collections::HashSet::new(),
             include_paths_resolved: HashMap::new(),
+            dependencies: Vec::new(),
             conditional_stack: Vec::new(),
             macro_definitions: HashMap::new(),
             macro_unique_counter: 0,
@@ -2038,6 +2048,7 @@ impl Assembler {
             rs_counter: 0,
             opt: OptState::default(),
             current_global_label: None,
+            short_branch_errors: Vec::new(),
         }
     }
 
@@ -2742,6 +2753,7 @@ impl Assembler {
         // macros, constants and structures the rest of the source uses,
         // so it has to be in place before macro expansion and parsing.
         self.included_files.clear();
+        self.dependencies.clear();
         self.source_map.clear();
         let included = self.expand_includes(source, 0, None)?;
         let expanded = self.macro_preprocess(&included);
@@ -2870,6 +2882,7 @@ impl Assembler {
             if !self.included_files.insert(canonical) {
                 continue;
             }
+            self.dependencies.push(path.clone());
             // Not the canonical path: on Windows that carries a `\\?\`
             // prefix no editor uses, so a debugger could not match it.
             let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
@@ -3314,6 +3327,15 @@ impl Assembler {
                     &self.include_paths,
                     line_no,
                 )?;
+                // Resolved again only to record it; the call above
+                // already proved the lookup succeeds.
+                let filename = strip_quotes(&args[0]);
+                if let Ok(path) =
+                    resolve_include_path_in(filename, &self.source_root, &self.include_paths)
+                    && !self.dependencies.contains(&path)
+                {
+                    self.dependencies.push(path);
+                }
                 if result.bytes_emitted > 0 {
                     self.pc += result.bytes_emitted;
                 }
@@ -3821,7 +3843,27 @@ impl Assembler {
     // -----------------------------------------------------------------------
 
     /// Pass 2: Encode all instructions with resolved symbols.
+    /// Pass 2. Out-of-range `.S` branches do not abort it: each is
+    /// recorded and encoded as a 2-byte placeholder, the size pass 1
+    /// budgeted, so the layout stays intact and later branches are
+    /// checked against correct addresses. All but the last end up in
+    /// [`Self::errors`]; the last (or a later fatal error) is returned, so
+    /// the collected ones precede it in source order.
     fn pass2(&mut self, lines: &[ParsedLine]) -> Result<(), AsmError> {
+        self.short_branch_errors.clear();
+        let result = self.pass2_lines(lines);
+        let mut deferred = std::mem::take(&mut self.short_branch_errors);
+        let result = match result {
+            Ok(()) => deferred.pop().map_or(Ok(()), Err),
+            Err(e) => Err(e),
+        };
+        for e in deferred {
+            self.errors.error(e.message, e.line_no);
+        }
+        result
+    }
+
+    fn pass2_lines(&mut self, lines: &[ParsedLine]) -> Result<(), AsmError> {
         self.pc = self.origin;
         self.sections.restart_pass();
         self.rs_counter = 0;
@@ -4345,7 +4387,7 @@ impl Assembler {
             && !is_dbcc_mnemonic(mnemonic)
             && (!(-128..=127).contains(&disp) || disp == 0 || disp == -1)
         {
-            return Err(AsmError::with_line(
+            self.short_branch_errors.push(AsmError::with_line(
                 format!(
                     "{}.s target is out of range for a short branch \
                      (displacement {disp}, limit -128..127 excluding 0 and -1); \
@@ -4354,6 +4396,15 @@ impl Assembler {
                 ),
                 line.line_no,
             ));
+            self.push_instruction(AssembledInstruction {
+                pc,
+                words: vec![0x6000],
+                line_no: Some(line.line_no),
+                source: Some(line.raw.clone()),
+                byte_len: None,
+            });
+            self.pc += 2;
+            return Ok(());
         }
 
         let words = match mnemonic {
@@ -6853,6 +6904,17 @@ faraway:
         asm.set_optimize(true);
         asm.assemble("    BRA $0F81\n").unwrap();
         assert_eq!(asm.code[0].words.len(), 2, "disp=-129 should be word");
+    }
+
+    /// A local label is reachable from outside its routine by its
+    /// qualified name, giving a second entry point without a new scope.
+    #[test]
+    fn test_branch_to_qualified_local_label() {
+        let mut asm = Assembler::new(0);
+        asm.assemble("glob:\n    MOVEQ #0,D0\n.words:\n    RTS\nother:\n    BRA glob.words\n")
+            .unwrap();
+        assert_eq!(asm.symbols.resolve("glob.words").unwrap(), 2);
+        assert_eq!(asm.code[2].words, vec![0x6000, 0xFFFC]);
     }
 
     /// Regression for 4.8: determine_branch_size previously had no long

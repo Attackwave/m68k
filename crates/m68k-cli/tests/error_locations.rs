@@ -84,3 +84,54 @@ fn sized_branches_can_target_a_label_named_fail() {
 
     std::fs::remove_dir_all(dir).unwrap();
 }
+
+#[test]
+fn every_out_of_range_short_branch_is_reported_in_one_run() {
+    let dir = std::env::temp_dir().join(format!("m68k-short-branches-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let main = dir.join("far.s");
+    let binary = dir.join("out.bin");
+    std::fs::write(
+        &main,
+        "a:\n    BRA.S .x\n    BEQ.S .x\n    BNE.S .x\n    DCB.B 300,0\n.x:\n    RTS\n",
+    )
+    .unwrap();
+    let result = assemble(&main, &binary);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(!result.status.success());
+    assert!(!binary.exists(), "output written despite errors");
+    for line in 2..=4 {
+        assert!(stderr.contains(&format!("far.s:{line}:")), "{stderr}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn depfile_lists_include_and_incbin_once() {
+    let dir = std::env::temp_dir().join(format!("m68k-depfile-{}", std::process::id()));
+    std::fs::create_dir_all(dir.join("sub dir")).unwrap();
+    std::fs::write(dir.join("sub dir/defs.i"), "    MOVEQ #1,D0\n").unwrap();
+    std::fs::write(dir.join("blob.bin"), [1u8, 2]).unwrap();
+    std::fs::write(
+        dir.join("main.s"),
+        "    INCLUDE \"sub dir/defs.i\"\n    INCLUDE \"sub dir/defs.i\"\n    INCBIN \"blob.bin\"\n    INCBIN \"blob.bin\"\n",
+    )
+    .unwrap();
+    // Relative paths, so the expected text is the same on every platform.
+    let result = Command::new(env!("CARGO_BIN_EXE_m68k-asm"))
+        .current_dir(&dir)
+        .args(["main.s", "-o", "out.bin", "--depfile", "out.d"])
+        .output()
+        .expect("run m68k-asm");
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("out.d")).unwrap(),
+        "out.bin: \\\n  main.s \\\n  sub\\ dir/defs.i \\\n  blob.bin\n\
+         \nsub\\ dir/defs.i:\n\nblob.bin:\n"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

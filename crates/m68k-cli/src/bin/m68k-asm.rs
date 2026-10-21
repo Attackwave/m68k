@@ -12,7 +12,7 @@ use m68k_asm::output::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "m68k-asm")]
+#[command(name = "m68k-asm", version)]
 #[command(about = "Motorola 68000 assembler", long_about = None)]
 struct Args {
     /// Input assembly source file (use `-` to read from stdin)
@@ -67,6 +67,12 @@ struct Args {
     /// Export memory map to file
     #[arg(long)]
     map: Option<PathBuf>,
+
+    /// Write a make dependency file: the output depends on the source
+    /// and every INCLUDE/INCBIN file, each also listed as an empty rule
+    /// so a deleted file does not break the build (like `gcc -MD -MP`)
+    #[arg(long, value_name = "FILE")]
+    depfile: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -130,6 +136,38 @@ fn write_output(path: &Path, data: &[u8]) -> Result<(), String> {
     }
 }
 
+/// Quote a path for a make rule: a space or `#` would end the name or
+/// start a comment, a `$` would start a variable reference.
+fn make_escape(path: &Path) -> String {
+    let mut out = String::new();
+    for c in path.to_string_lossy().chars() {
+        match c {
+            ' ' | '#' => {
+                out.push('\\');
+                out.push(c);
+            }
+            '$' => out.push_str("$$"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `source` is `None` when it came from stdin. It gets no empty rule of
+/// its own: without it there is nothing to build anyway.
+fn depfile_contents(target: &Path, source: Option<&Path>, deps: &[PathBuf]) -> String {
+    let mut out = format!("{}:", make_escape(target));
+    for dep in source.into_iter().chain(deps.iter().map(PathBuf::as_path)) {
+        out.push_str(" \\\n  ");
+        out.push_str(&make_escape(dep));
+    }
+    out.push('\n');
+    for dep in deps {
+        out.push_str(&format!("\n{}:\n", make_escape(dep)));
+    }
+    out
+}
+
 fn output_display(path: &Path) -> String {
     if is_dash(path) {
         "<stdout>".to_string()
@@ -185,6 +223,11 @@ fn run(args: Args) -> Result<(), String> {
     // assembler carries refers to the expanded text, not to any file a
     // reader can open.
     if let Err(e) = asm.assemble_bytes(&source) {
+        // Errors collected before the fatal one (several out-of-range
+        // `.S` branches, ERROR directives) come first, in source order.
+        for diag in &asm.errors.errors {
+            eprintln!("{}", format_diagnostic(diag, &asm, &input_name));
+        }
         // An error that already names its file was raised before the
         // source map existed; its line counts within that file and must
         // not be translated again.
@@ -255,6 +298,20 @@ fn run(args: Args) -> Result<(), String> {
             p
         }
     };
+    // Written ahead of the output, which has several exit paths below.
+    if let Some(dep_path) = &args.depfile {
+        if is_dash(&output_path) {
+            return Err(
+                "--depfile needs an output file to name as the make target, not stdout".into(),
+            );
+        }
+        let source = (!reading_stdin).then_some(args.input.as_path());
+        fs::write(
+            dep_path,
+            depfile_contents(&output_path, source, &asm.dependencies),
+        )
+        .map_err(|e| format!("cannot write depfile '{}': {}", dep_path.display(), e))?;
+    }
 
     // Generate output
     let output_data = match args.format {

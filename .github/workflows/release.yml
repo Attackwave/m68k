@@ -67,6 +67,16 @@ jobs:
           fi
           "$bindir/m68k-disasm${{ matrix.suffix }}" smoke.bin | grep -qi 'moveq'
           "$bindir/m68k-floppy${{ matrix.suffix }}" --help > /dev/null
+          # A tag pushed without the version bump would ship binaries that
+          # report the previous version.
+          tag="${{ github.ref_name }}"
+          for tool in m68k-asm m68k-disasm m68k-floppy; do
+            reported=$("$bindir/$tool${{ matrix.suffix }}" --version)
+            if [ "$reported" != "$tool ${tag#v}" ]; then
+              echo "$tool reports '$reported', tag is $tag" >&2
+              exit 1
+            fi
+          done
           echo "smoke test passed for ${{ matrix.target }}"
 
       - name: Package archive
