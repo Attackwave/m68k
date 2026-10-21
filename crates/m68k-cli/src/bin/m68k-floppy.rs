@@ -34,7 +34,7 @@ impl From<BackendArg> for Backend {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "m68k-floppy")]
+#[command(name = "m68k-floppy", version)]
 #[command(about = "Inspect Amiga floppy disk images and extract data", long_about = None)]
 struct Args {
     /// Path to the disk image (.adf or .ipf)

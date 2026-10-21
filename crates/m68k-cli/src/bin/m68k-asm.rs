@@ -12,7 +12,7 @@ use m68k_asm::output::{
 };
 
 #[derive(Parser, Debug)]
-#[command(name = "m68k-asm")]
+#[command(name = "m68k-asm", version)]
 #[command(about = "Motorola 68000 assembler", long_about = None)]
 struct Args {
     /// Input assembly source file (use `-` to read from stdin)

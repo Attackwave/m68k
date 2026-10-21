@@ -118,6 +118,7 @@ m68k-asm hello.s -f hunk-exe -o hello         # Amiga Hunk executable (LoadSeg()
 - `-l`/`--listing <file>` — write an address/bytes/source listing.
 - `--sym <file>` — export the resolved symbol table.
 - `--map <file>` — export a memory map (address ranges per instruction).
+- `-V`, `--version` — print the version (all three tools).
 - `--depfile <file>` — write make dependencies: the output depends on the source and every `INCLUDE`/`INCBIN` file, each also listed as an empty rule (like `gcc -MD -MP`). Use with `-include` in a Makefile.
 - `-I`, `--include <dir>` — add a directory to the `INCLUDE` search path (repeatable). Needed for sources that include the Amiga system headers by their logical path, e.g. `include 'exec/types.i'`.
 - `--optimize` — enable size-changing optimizations (see below). Off by default.
