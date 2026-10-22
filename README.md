@@ -115,7 +115,7 @@ m68k-asm hello.s -f hunk-exe -o hello         # Amiga Hunk executable (LoadSeg()
 - `-c`, `--cpu`: Target CPU model (`68000`, `68010`, `68020`, `68030`, `68040`, `68060`). Default is `68000`.
 - `--origin <addr>` — default origin if the source has no `ORG` (hex with `$` or `0x` prefix, or decimal).
 - `-f`, `--format`: Output format (`binary`, `srecord`, `intel-hex`, `elf`, `ieee695`, `hunk-exe`). Default is `binary`.
-- `-l`/`--listing <file>` — write an address/bytes/source listing.
+- `-l`/`--listing <file>` — write an address/bytes/cycles/source listing. The cycles column gives 68000 clock periods per instruction (`10/8` for a branch taken/not taken, `38-70` for a data-dependent range); the footer sums them.
 - `--sym <file>` — export the resolved symbol table.
 - `--map <file>` — export a memory map (address ranges per instruction).
 - `-V`, `--version` — print the version (all three tools).
