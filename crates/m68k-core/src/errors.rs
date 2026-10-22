@@ -65,12 +65,19 @@ pub enum Severity {
 }
 
 /// A single diagnostic (error or warning).
+///
+/// `filename` empty means the location is not resolved yet: `line_no`
+/// then counts lines of the preprocessed text and the assembler maps it
+/// to a file and line through its source map. A diagnostic that names its
+/// file is final.
 #[derive(Debug, Clone)]
 pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,
     pub line_no: Option<usize>,
     pub filename: String,
+    /// Macro the line was expanded from, once the location is resolved.
+    pub macro_name: Option<String>,
 }
 
 impl Diagnostic {
@@ -80,6 +87,7 @@ impl Diagnostic {
             message: message.into(),
             line_no,
             filename: String::new(),
+            macro_name: None,
         }
     }
 
@@ -89,6 +97,19 @@ impl Diagnostic {
             message: message.into(),
             line_no,
             filename: String::new(),
+            macro_name: None,
+        }
+    }
+}
+
+impl From<AsmError> for Diagnostic {
+    fn from(e: AsmError) -> Self {
+        Self {
+            severity: Severity::Error,
+            message: e.message,
+            line_no: e.line_no,
+            filename: e.file.unwrap_or_default(),
+            macro_name: None,
         }
     }
 }
@@ -112,10 +133,14 @@ impl fmt::Display for Diagnostic {
             Severity::Warning => "warning",
         };
 
+        let context = match &self.macro_name {
+            Some(m) => format!(" (in macro {m})"),
+            None => String::new(),
+        };
         if loc.is_empty() {
             write!(f, "{}: {}", prefix, self.message)
         } else {
-            write!(f, "{}: {}: {}", loc, prefix, self.message)
+            write!(f, "{}{}: {}: {}", loc, context, prefix, self.message)
         }
     }
 }
@@ -141,34 +166,21 @@ impl ErrorCollector {
         self.warnings.push(Diagnostic::warning(message, line_no));
     }
 
+    pub fn push(&mut self, diagnostic: Diagnostic) {
+        match diagnostic.severity {
+            Severity::Error => self.errors.push(diagnostic),
+            Severity::Warning => self.warnings.push(diagnostic),
+        }
+    }
+
     pub fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
 
-    pub fn format_errors(&self) -> String {
-        let mut lines: Vec<String> = self.errors.iter().map(|d| d.to_string()).collect();
-        lines.extend(self.warnings.iter().map(|d| d.to_string()));
-        lines.join("\n")
-    }
-}
-
-/// Exception containing multiple collected errors.
-#[derive(Debug)]
-pub struct MultiError {
-    pub collector: ErrorCollector,
-}
-
-impl MultiError {
-    pub fn new(collector: ErrorCollector) -> Self {
-        Self { collector }
-    }
-}
-
-impl std::error::Error for MultiError {}
-
-impl fmt::Display for MultiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.collector.format_errors())
+    /// Drop collected diagnostics, keeping the file name.
+    pub fn clear(&mut self) {
+        self.errors.clear();
+        self.warnings.clear();
     }
 }
 

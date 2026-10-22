@@ -119,10 +119,15 @@ m68k-asm hello.s -f hunk-exe -o hello         # Amiga Hunk executable (LoadSeg()
 - `--sym <file>` — export the resolved symbol table.
 - `--map <file>` — export a memory map (address ranges per instruction).
 - `-V`, `--version` — print the version (all three tools).
+- `--Werror` — treat warnings as errors: no output is written and the exit status is 1.
 - `--depfile <file>` — write make dependencies: the output depends on the source and every `INCLUDE`/`INCBIN` file, each also listed as an empty rule (like `gcc -MD -MP`). Use with `-include` in a Makefile.
 - `-I`, `--include <dir>` — add a directory to the `INCLUDE` search path (repeatable). Needed for sources that include the Amiga system headers by their logical path, e.g. `include 'exec/types.i'`.
 - `--optimize` — enable size-changing optimizations (see below). Off by default.
 - `--linedebug` — add source line debug info to a `hunk-exe` (see below).
+
+#### Diagnostics
+
+Every error and warning is printed to stderr as `file:line: severity: message`, located in the file it was written in (an included file is named by its `INCLUDE` name, a line expanded from a macro carries `(in macro name)`). Pass 2 keeps going after an error, so one run reports every line it could not encode — the location counter continues at the address pass 1 gave the next line, so later branch distances and symbols stay right. Any error means no output is written and the exit status is 1; a summary line gives the counts.
 
 #### Optimization
 
