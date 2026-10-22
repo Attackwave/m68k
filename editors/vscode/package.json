@@ -1,0 +1,257 @@
+{
+  "name": "m68k",
+  "displayName": "m68k Assembly",
+  "description": "Motorola 68000 / Amiga assembly: language server, build tasks and diagnostics",
+  "version": "0.1.0",
+  "publisher": "attackwave",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Attackwave/m68k"
+  },
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": [
+    "Programming Languages",
+    "Linters",
+    "Formatters"
+  ],
+  "main": "./out/extension.js",
+  "activationEvents": [
+    "workspaceContains:**/*.{s,asm,i}",
+    "onDebugResolve:m68k"
+  ],
+  "contributes": {
+    "languages": [
+      {
+        "id": "m68k",
+        "aliases": [
+          "m68k Assembly",
+          "m68k"
+        ],
+        "extensions": [
+          ".s",
+          ".asm",
+          ".i",
+          ".68k"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "m68k",
+        "scopeName": "source.m68k",
+        "path": "./syntaxes/m68k.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "title": "m68k",
+      "properties": {
+        "m68k.cpu": {
+          "type": "string",
+          "enum": [
+            "68000",
+            "68010",
+            "68020",
+            "68030",
+            "68040",
+            "68060"
+          ],
+          "default": "68000",
+          "description": "Target CPU for diagnostics and builds."
+        },
+        "m68k.toolsPath": {
+          "type": "string",
+          "default": "",
+          "description": "Directory containing m68k-lsp and m68k-asm. Empty: bundled binaries, then PATH."
+        },
+        "m68k.includePaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Additional INCLUDE directories passed to m68k-asm (-I), e.g. the Amiga NDK includes."
+        },
+        "m68k.emulator": {
+          "type": "string",
+          "default": "",
+          "description": "Path to a UAE build with a GDB remote debugger (patched FS-UAE, or WinUAE with gdbserver). Used by F5 debugging."
+        },
+        "m68k.emulatorArgs": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Extra emulator arguments, e.g. --amiga_model=A1200 or --kickstart_file=/path/kick.rom."
+        }
+      }
+    },
+    "taskDefinitions": [
+      {
+        "type": "m68k",
+        "required": [
+          "file"
+        ],
+        "properties": {
+          "file": {
+            "type": "string",
+            "description": "Source file to assemble."
+          },
+          "format": {
+            "type": "string",
+            "enum": [
+              "binary",
+              "srecord",
+              "intel-hex",
+              "elf",
+              "ieee695",
+              "hunk-exe"
+            ],
+            "default": "hunk-exe"
+          },
+          "output": {
+            "type": "string",
+            "description": "Output file (default: next to the source)."
+          },
+          "linedebug": {
+            "type": "boolean",
+            "default": false,
+            "description": "Add source line debug info (embeds absolute source paths). F5 debugging sets this itself."
+          }
+        }
+      }
+    ],
+    "problemMatchers": [
+      {
+        "name": "m68k-asm",
+        "owner": "m68k",
+        "source": "m68k-asm",
+        "fileLocation": [
+          "autoDetect",
+          "${workspaceFolder}"
+        ],
+        "pattern": {
+          "regexp": "^([Ee]rror|[Ww]arning): (.+?):(\\d+)(?: \\(in macro [^)]*\\))?: (.*)$",
+          "severity": 1,
+          "file": 2,
+          "line": 3,
+          "message": 4
+        }
+      },
+      {
+        "name": "m68k-asm-diag",
+        "owner": "m68k",
+        "source": "m68k-asm",
+        "fileLocation": [
+          "autoDetect",
+          "${workspaceFolder}"
+        ],
+        "pattern": {
+          "regexp": "^(.+?):(\\d+)(?: \\(in macro [^)]*\\))?: (error|warning): (.*)$",
+          "file": 1,
+          "line": 2,
+          "severity": 3,
+          "message": 4
+        }
+      }
+    ],
+    "commands": [
+      {
+        "command": "m68k.restartServer",
+        "title": "m68k: Restart Language Server"
+      }
+    ],
+    "breakpoints": [
+      {
+        "language": "m68k"
+      }
+    ],
+    "debuggers": [
+      {
+        "type": "m68k",
+        "label": "Amiga (UAE)",
+        "languages": [
+          "m68k"
+        ],
+        "configurationAttributes": {
+          "launch": {
+            "required": [
+              "program"
+            ],
+            "properties": {
+              "program": {
+                "type": "string",
+                "description": "Hunk executable to debug (built with --linedebug for source stepping)."
+              },
+              "emulator": {
+                "type": "string",
+                "description": "Emulator binary. Defaults to the m68k.emulator setting; omit both to attach to an already running emulator."
+              },
+              "emulatorArgs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Extra emulator arguments."
+              },
+              "serverPort": {
+                "type": "number",
+                "default": 2345,
+                "description": "Remote debugger port."
+              },
+              "stopOnEntry": {
+                "type": "boolean",
+                "default": false,
+                "description": "Stop at the first instruction."
+              },
+              "build": {
+                "type": "boolean",
+                "default": true,
+                "description": "Assemble the program's source before launching."
+              }
+            }
+          }
+        },
+        "initialConfigurations": [
+          {
+            "type": "m68k",
+            "request": "launch",
+            "name": "Debug in UAE",
+            "program": "${fileDirname}/${fileBasenameNoExtension}",
+            "stopOnEntry": true
+          }
+        ],
+        "configurationSnippets": [
+          {
+            "label": "m68k: Debug in UAE",
+            "body": {
+              "type": "m68k",
+              "request": "launch",
+              "name": "Debug in UAE",
+              "program": "^\"\\${fileDirname}/\\${fileBasenameNoExtension}\"",
+              "stopOnEntry": true
+            }
+          }
+        ]
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p .",
+    "watch": "tsc -watch -p .",
+    "package": "vsce package"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.0.0",
+    "typescript": "^5.5.0"
+  }
+}
