@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "m68k-dap"
-version = "2.3.0"
+version = "2.4.7"
 dependencies = [
  "m68k-asm",
  "m68k-core",
