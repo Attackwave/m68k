@@ -140,7 +140,9 @@ fn write_output(path: &Path, data: &[u8]) -> Result<(), String> {
 /// start a comment, a `$` would start a variable reference.
 fn make_escape(path: &Path) -> String {
     let mut out = String::new();
-    for c in path.to_string_lossy().chars() {
+    // GNU make reads `/` on every platform; a Windows backslash would be
+    // an escape character in a rule.
+    for c in path.to_string_lossy().replace('\\', "/").chars() {
         match c {
             ' ' | '#' => {
                 out.push('\\');
