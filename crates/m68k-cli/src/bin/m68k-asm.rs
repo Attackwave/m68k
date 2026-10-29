@@ -68,6 +68,11 @@ struct Args {
     #[arg(long)]
     map: Option<PathBuf>,
 
+    /// Treat warnings as errors: any warning fails the run and no output
+    /// is written
+    #[arg(long = "Werror")]
+    werror: bool,
+
     /// Write a make dependency file: the output depends on the source
     /// and every INCLUDE/INCBIN file, each also listed as an empty rule
     /// so a deleted file does not break the build (like `gcc -MD -MP`)
@@ -224,47 +229,23 @@ fn run(args: Args) -> Result<(), String> {
     };
     let mut asm = new_assembler(origin);
 
-    // Translate through the source map before reporting: INCLUDE and
-    // macro expansion both change line numbers, so the number the
-    // assembler carries refers to the expanded text, not to any file a
-    // reader can open.
-    if let Err(e) = asm.assemble_bytes(&source) {
-        // Errors collected before the fatal one (several out-of-range
-        // `.S` branches, ERROR directives) come first, in source order.
-        for diag in &asm.errors.errors {
-            eprintln!("{}", format_diagnostic(diag, &asm, &input_name));
-        }
-        // An error that already names its file was raised before the
-        // source map existed; its line counts within that file and must
-        // not be translated again.
-        let where_ = match &e.file {
-            Some(file) => match e.line_no {
-                Some(line) => format!("{file}:{line}"),
-                None => file.clone(),
-            },
-            None => source_location(&asm, e.line_no, &input_name),
-        };
-        return Err(format!("{}: {}", where_, e.message));
+    // Everything the assembler found, located in the file it was written
+    // in, in source order. The run fails on any error, or on a warning
+    // with --Werror; nothing is written then.
+    let result = asm.assemble_bytes(&source);
+    for diag in asm.diagnostics() {
+        eprintln!("{diag}");
     }
-
-    // Print warnings and errors with filename
-    for diag in &asm.errors.warnings {
-        eprintln!("{}", format_diagnostic(diag, &asm, &input_name));
-    }
-    for diag in &asm.errors.errors {
-        eprintln!("{}", format_diagnostic(diag, &asm, &input_name));
-    }
-
-    // The ERROR directive (and other non-fatal diagnostics collected into
-    // asm.errors rather than surfaced via assemble_bytes's Result) doesn't
-    // stop assembly, so assemble_bytes above can return Ok even though the
-    // source contains an ERROR. Previously nothing checked has_errors()
-    // here, so the CLI printed the error but still wrote an output file
-    // and exited 0 — a build script driving this CLI would see success.
-    if asm.errors.has_errors() {
+    let errors = asm.errors.errors.len() + usize::from(result.is_err() && !asm.errors.has_errors());
+    let warnings = asm.errors.warnings.len();
+    if errors > 0 {
         return Err(format!(
-            "{}: assembly reported errors, no output written",
-            input_name
+            "{input_name}: {errors} error(s), {warnings} warning(s), no output written"
+        ));
+    }
+    if args.werror && warnings > 0 {
+        return Err(format!(
+            "{input_name}: {warnings} warning(s) treated as errors (--Werror), no output written"
         ));
     }
 
@@ -415,11 +396,9 @@ fn run(args: Args) -> Result<(), String> {
                 Ok(moved)
             })
             .map_err(|e| {
-                format!(
-                    "{}: {}",
-                    source_location(&asm, e.line_no, &input_name),
-                    e.message
-                )
+                let mut asm_err = m68k_core::errors::Diagnostic::from(e);
+                asm_err.filename = String::new();
+                asm.locate_diagnostic(asm_err).to_string()
             })?;
             write_output(&output_path, &hunk)?;
             eprintln!(
@@ -444,45 +423,6 @@ fn run(args: Args) -> Result<(), String> {
     );
 
     write_auxiliary_outputs(&asm, &args, &input_name)
-}
-
-fn format_diagnostic(
-    diag: &m68k_core::errors::Diagnostic,
-    asm: &Assembler,
-    filename: &str,
-) -> String {
-    let prefix = match diag.severity {
-        m68k_core::errors::Severity::Error => "error",
-        m68k_core::errors::Severity::Warning => "warning",
-    };
-    format!(
-        "{}: {}: {}",
-        source_location(asm, diag.line_no, filename),
-        prefix,
-        diag.message
-    )
-}
-
-/// Render `file:line` for a diagnostic, resolving the expanded line
-/// number back to the file and line it was written in.
-///
-/// A line that came out of a macro body names the macro too: the
-/// invocation is the line a reader can navigate to, but saying so is
-/// what makes the number make sense.
-fn source_location(asm: &Assembler, line_no: Option<usize>, filename: &str) -> String {
-    let Some(line) = line_no else {
-        return filename.to_string();
-    };
-    match asm.source_origin(line) {
-        Some(origin) => {
-            let file = origin.file.as_deref().unwrap_or(filename);
-            match &origin.macro_name {
-                Some(m) => format!("{}:{} (in macro {})", file, origin.line, m),
-                None => format!("{}:{}", file, origin.line),
-            }
-        }
-        None => format!("{}:{}", filename, line),
-    }
 }
 
 fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Result<(), String> {
