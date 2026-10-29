@@ -217,7 +217,14 @@ fn stack_report_text(asm: &Assembler) -> String {
             r.depth.to_string()
         ));
         for (line, p) in &r.problems {
-            out.push_str(&format!("{:width$}    line {line}: {p}\n", ""));
+            let diag =
+                asm.locate_diagnostic(m68k_core::errors::Diagnostic::error(p.clone(), Some(*line)));
+            let where_ = match diag.line_no {
+                Some(l) if !diag.filename.is_empty() => format!("{}:{l}", diag.filename),
+                Some(l) => format!("line {l}"),
+                None => String::new(),
+            };
+            out.push_str(&format!("{:width$}    {where_}: {p}\n", ""));
         }
         for n in &r.notes {
             out.push_str(&format!("{:width$}    {n}\n", ""));
