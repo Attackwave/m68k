@@ -12,12 +12,13 @@ on:
 permissions:
   contents: write
 
-# One run per release. A duplicate run for the same ref (the same tag
-# pushed twice, a second trigger for one push) is cancelled instead of
-# sitting in the environment's approval queue until GitHub fails it after
-# 30 days.
+# One run per released commit. A duplicate run for the same commit (the
+# same tag pushed twice, a second trigger for one push) is cancelled
+# instead of sitting in the environment's approval queue until GitHub
+# fails it after 30 days. Keyed on the commit, not the ref: a later push
+# to main must not cancel a release still waiting for approval.
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ github.sha }}
   cancel-in-progress: true
 
 jobs:
