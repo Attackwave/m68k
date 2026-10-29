@@ -40,7 +40,7 @@ function buildTask(context: vscode.ExtensionContext, def: vscode.TaskDefinition,
     `build ${def.file}`,
     'm68k',
     new vscode.ProcessExecution(tool(context, 'm68k-asm'), args, { cwd: scope.uri.fsPath }),
-    ['$m68k-asm', '$m68k-asm-diag']
+    ['$m68k-asm']
   );
   task.group = vscode.TaskGroup.Build;
   return task;
