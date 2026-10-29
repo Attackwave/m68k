@@ -12,6 +12,14 @@ on:
 permissions:
   contents: write
 
+# One run per release. A duplicate run for the same ref (the same tag
+# pushed twice, a second trigger for one push) is cancelled instead of
+# sitting in the environment's approval queue until GitHub fails it after
+# 30 days.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   version:
     name: Determine version
