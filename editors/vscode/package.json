@@ -135,22 +135,6 @@
           "${workspaceFolder}"
         ],
         "pattern": {
-          "regexp": "^([Ee]rror|[Ww]arning): (.+?):(\\d+)(?: \\(in macro [^)]*\\))?: (.*)$",
-          "severity": 1,
-          "file": 2,
-          "line": 3,
-          "message": 4
-        }
-      },
-      {
-        "name": "m68k-asm-diag",
-        "owner": "m68k",
-        "source": "m68k-asm",
-        "fileLocation": [
-          "autoDetect",
-          "${workspaceFolder}"
-        ],
-        "pattern": {
           "regexp": "^(.+?):(\\d+)(?: \\(in macro [^)]*\\))?: (error|warning): (.*)$",
           "file": 1,
           "line": 2,

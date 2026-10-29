@@ -9,9 +9,11 @@ const path = require('path');
 const bin = (name) => path.join(__dirname, '..', 'bin', process.platform === 'win32' ? `${name}.exe` : name);
 const pkg = require('../package.json');
 
-// Problem matchers: must pick file/line out of real assembler errors, including
-// ones raised inside a macro expansion.
-const [fatal, diag] = pkg.contributes.problemMatchers.map((pm) => pm.pattern);
+// Problem matcher: must pick file, line and severity out of real assembler
+// output, including an error raised inside a macro expansion. Every
+// diagnostic line has the same shape; the summary line after them does
+// not name a file:line and must not match.
+const [diag] = pkg.contributes.problemMatchers.map((pm) => pm.pattern);
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'm68k-'));
 for (const [src, wantLine] of [
   ['start:\n  bogus d0\n', '2'],
@@ -19,12 +21,12 @@ for (const [src, wantLine] of [
 ]) {
   fs.writeFileSync(path.join(dir, 'bad.s'), src);
   const asm = spawnSync(bin('m68k-asm'), ['bad.s', '-f', 'hunk-exe'], { cwd: dir, encoding: 'utf8' });
-  const line = (asm.stderr + asm.stdout).trim().split('\n')[0];
-  const m = new RegExp(fatal.regexp).exec(line);
-  assert(m, `problem matcher did not match: ${line}`);
-  assert.deepStrictEqual([m[fatal.file], m[fatal.line]], ['bad.s', wantLine]);
+  const lines = (asm.stderr + asm.stdout).trim().split('\n');
+  const m = new RegExp(diag.regexp).exec(lines[0]);
+  assert(m, `problem matcher did not match: ${lines[0]}`);
+  assert.deepStrictEqual([m[diag.file], m[diag.line], m[diag.severity]], ['bad.s', wantLine, 'error']);
+  assert(!new RegExp(diag.regexp).exec(lines[lines.length - 1]), `summary line matched: ${lines[lines.length - 1]}`);
 }
-// The non-fatal diagnostic format, as written by format_diagnostic in m68k-asm.rs.
 const d = new RegExp(diag.regexp).exec('src/x.s:7 (in macro m): warning: odd address');
 assert.deepStrictEqual([d[diag.file], d[diag.line], d[diag.severity]], ['src/x.s', '7', 'warning']);
 
