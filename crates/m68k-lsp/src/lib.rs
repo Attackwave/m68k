@@ -16,6 +16,7 @@
 pub mod analysis;
 pub mod backend;
 pub mod completion;
+pub mod custom_regs;
 pub mod definition;
 pub mod diagnostics;
 pub mod document;
@@ -26,6 +27,7 @@ pub mod rename;
 pub mod semantic_tokens;
 pub mod signature;
 pub mod symbols;
+pub mod timing_hints;
 pub mod workspace;
 
 pub use backend::Backend;
