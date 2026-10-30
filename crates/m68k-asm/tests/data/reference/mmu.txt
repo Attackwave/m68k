@@ -1,0 +1,28 @@
+# Reference encodings, list "mmu", assembled with -c 68060.
+# One instruction per line: <source> | <bytes as hex> or <source> | reject.
+# cpu 68060
+pmove (a0),tc | f0104000
+pmove tc,(a0) | f0104200
+pmove (a0),srp | f0104800
+pmove srp,(a0) | f0104a00
+pmove (a0),crp | f0104c00
+pmove crp,(a0) | f0104e00
+pmove (a0),tt0 | f0100800
+pmove tt0,(a0) | f0100a00
+pmove (a0),tt1 | f0100c00
+pmove tt1,(a0) | f0100e00
+pmove (a0),mmusr | f0106000
+pmove mmusr,(a0) | f0106200
+pflusha | f0002400
+pflush #0,#0 | f0003010
+pflush #0,#0,(a0) | f0103810
+pflushn (a0) | f500
+pflushan | f510
+ptestr #1,(a0),#7 | f0109e11
+ptestw #1,(a0),#7 | f0109c11
+ptestr #1,(a0),#7,a2 | f0109f51
+plpar (a0) | f5c8
+plpaw (a0) | f588
+psave (a0) | f110
+prestore (a0) | f150
+lpstop #$2700 | f80001c02700
