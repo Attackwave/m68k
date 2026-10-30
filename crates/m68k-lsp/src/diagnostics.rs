@@ -86,6 +86,8 @@ pub fn compute_diagnostics(doc: &Document, config: &LinterConfig) -> Vec<Diagnos
         }
     }
 
+    diagnostics.extend(crate::custom_regs::diagnostics(doc));
+
     // 2. Assemble in memory for everything the per-line pass cannot see:
     //    operands, branch distances, expressions, directives. Every error
     //    and warning the assembler collected is reported, not just the one

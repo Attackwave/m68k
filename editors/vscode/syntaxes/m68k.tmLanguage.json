@@ -1,0 +1,31 @@
+{
+  "name": "m68k Assembly",
+  "scopeName": "source.m68k",
+  "patterns": [
+    { "name": "comment.line.m68k", "match": "^\\s*\\*.*$" },
+    { "name": "comment.line.semicolon.m68k", "match": ";.*$" },
+    { "name": "string.quoted.double.m68k", "match": "\"([^\"\\\\]|\\\\.)*\"" },
+    { "name": "string.quoted.single.m68k", "match": "'([^'\\\\]|\\\\.)*'" },
+    { "name": "entity.name.label.m68k", "match": "^[A-Za-z_.@][\\w.@$]*:{0,2}" },
+    {
+      "name": "keyword.control.directive.m68k",
+      "match": "(?i)\\b(org|section|dc|dcb|ds|equ|set|even|align|cnop|include|incbin|incdir|macro|endm|rept|endr|if|ifd|ifnd|ifeq|ifne|else|endif|endc|rs|rsreset|rsset|so|opt|end|fail|xdef|xref|public|code|data|bss|code_c|data_c|bss_c)(\\.[bwlsdxpq])?\\b"
+    },
+    {
+      "match": "^\\s+([A-Za-z][\\w]*)(\\.[bwlsdxpq])?\\b",
+      "captures": {
+        "1": { "name": "keyword.other.mnemonic.m68k" },
+        "2": { "name": "storage.type.size.m68k" }
+      }
+    },
+    {
+      "name": "variable.language.register.m68k",
+      "match": "(?i)\\b(d[0-7]|a[0-7]|sp|pc|sr|ccr|usp|ssp|isp|msp|vbr|sfc|dfc|cacr|caar|fp[0-7]|fpcr|fpsr|fpiar)\\b"
+    },
+    { "name": "constant.numeric.hex.m68k", "match": "\\$[0-9A-Fa-f]+\\b" },
+    { "name": "constant.numeric.binary.m68k", "match": "%[01]+\\b" },
+    { "name": "constant.numeric.octal.m68k", "match": "@[0-7]+\\b" },
+    { "name": "constant.numeric.decimal.m68k", "match": "\\b[0-9]+\\b" },
+    { "name": "keyword.operator.immediate.m68k", "match": "#" }
+  ]
+}
