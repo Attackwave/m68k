@@ -667,6 +667,7 @@ fn is_directive(s: &str) -> bool {
             | "nolist"
             | "page"
             | "title"
+            | "noreturn"
             | "sopt"
             | "llen"
             | "plen"
