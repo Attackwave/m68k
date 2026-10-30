@@ -54,6 +54,7 @@ async fn main() {
         });
         backend
     })
+    .custom_method("m68k/cycleSum", Backend::cycle_sum)
     .finish();
 
     Server::new(stdin, stdout, socket).serve(service).await;
