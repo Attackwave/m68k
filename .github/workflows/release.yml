@@ -4,20 +4,80 @@ on:
   push:
     tags:
       - 'v*'
+    # A merged pull request titled `Release X.Y.Z` releases on its own; the
+    # tag is created with the release. Pushing the tag by hand still works.
+    branches:
+      - main
 
 permissions:
   contents: write
 
+# One run per released commit. A duplicate run for the same commit (the
+# same tag pushed twice, a second trigger for one push) is cancelled
+# instead of sitting in the environment's approval queue until GitHub
+# fails it after 30 days. Keyed on the commit, not the ref: a later push
+# to main must not cancel a release still waiting for approval.
+concurrency:
+  group: release-${{ github.sha }}
+  cancel-in-progress: true
+
 jobs:
+  version:
+    name: Determine version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      release: ${{ steps.pick.outputs.release }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Pick the version
+        id: pick
+        env:
+          # Through the environment, never interpolated into the script: a
+          # commit message is text, not shell.
+          HEAD_MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          set -eu
+          if [ "${GITHUB_REF_TYPE}" = tag ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            title=$(printf '%s\n' "$HEAD_MESSAGE" | head -n 1)
+            version=$(printf '%s\n' "$title" | sed -nE 's/^Release ([0-9]+\.[0-9]+\.[0-9]+)( \(#[0-9]+\))?$/\1/p')
+            if [ -z "$version" ]; then
+              echo "not a release commit: $title"
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if git ls-remote --exit-code --tags origin "refs/tags/v$version" > /dev/null; then
+              echo "v$version is already tagged, nothing to release"
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          fi
+          # The binaries report the workspace version; a release whose tag
+          # disagrees with it is stopped here, before anyone is asked to
+          # approve it.
+          manifest=$(sed -nE 's/^version = "([^"]+)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$manifest" != "$version" ]; then
+            echo "Cargo.toml says $manifest, release is $version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
   approve:
     name: Approve release
+    needs: version
+    if: needs.version.outputs.release == 'true'
     runs-on: ubuntu-latest
     environment: release
     steps:
-      - run: echo "Release approved for ${{ github.ref_name }}"
+      - run: echo "Release approved for v${{ needs.version.outputs.version }}"
 
   build:
-    needs: approve
+    needs: [version, approve]
     strategy:
       # A broken archive on one platform should not hide whether the others
       # built, so all three always run to completion.
@@ -67,13 +127,12 @@ jobs:
           fi
           "$bindir/m68k-disasm${{ matrix.suffix }}" smoke.bin | grep -qi 'moveq'
           "$bindir/m68k-floppy${{ matrix.suffix }}" --help > /dev/null
-          # A tag pushed without the version bump would ship binaries that
-          # report the previous version.
-          tag="${{ github.ref_name }}"
+          # The built binaries must report the version being released.
+          version="${{ needs.version.outputs.version }}"
           for tool in m68k-asm m68k-disasm m68k-floppy; do
             reported=$("$bindir/$tool${{ matrix.suffix }}" --version)
-            if [ "$reported" != "$tool ${tag#v}" ]; then
-              echo "$tool reports '$reported', tag is $tag" >&2
+            if [ "$reported" != "$tool $version" ]; then
+              echo "$tool reports '$reported', release is $version" >&2
               exit 1
             fi
           done
@@ -83,7 +142,7 @@ jobs:
         shell: bash
         run: |
           set -eu
-          staging="m68k-${{ github.ref_name }}-${{ matrix.target }}"
+          staging="m68k-v${{ needs.version.outputs.version }}-${{ matrix.target }}"
           mkdir -p "$staging"
           for bin in m68k-asm m68k-disasm m68k-floppy; do
             cp "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" "$staging/"
@@ -124,7 +183,7 @@ jobs:
     # complete set of assets or fails visibly — previously each platform
     # uploaded on its own, and a mid-matrix failure left a half-populated
     # release behind with no single place to see it.
-    needs: build
+    needs: [version, build]
     name: Publish release
     runs-on: ubuntu-latest
     timeout-minutes: 15
@@ -162,7 +221,11 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
-          name: ${{ github.ref_name }}
+          # Creates the tag on this commit when it does not exist yet (a
+          # release from main); a hand-pushed tag is reused as is.
+          tag_name: v${{ needs.version.outputs.version }}
+          target_commitish: ${{ github.sha }}
+          name: v${{ needs.version.outputs.version }}
           files: dist/*
           fail_on_unmatched_files: true
           generate_release_notes: true
