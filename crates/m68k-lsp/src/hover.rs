@@ -4,10 +4,10 @@ use tower_lsp::lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind, Posi
 
 use m68k_core::amiga_lvo::Library;
 
-use crate::analysis::cycles::instruction_timing;
 use crate::analysis::directives_docs::lookup_directive;
 use crate::analysis::op_docs::{FlagEffect, OpcodeDoc, lookup_opcode};
 use crate::document::{Document, WordKind};
+use m68k_core::cycles::instruction_timing;
 
 /// Format hover information for the token at the given cursor position.
 pub fn compute_hover(doc: &Document, pos: Position) -> Option<Hover> {

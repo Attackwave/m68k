@@ -535,7 +535,7 @@ mod tests {
     use super::*;
 
     fn t(line: &str) -> Timing {
-        let (_, mnemonic, size, operands) = m68k_core::tokens::split_line(line);
+        let (_, mnemonic, size, operands) = crate::tokens::split_line(line);
         instruction_timing(&mnemonic, &size, &operands)
             .unwrap_or_else(|| panic!("no timing: {line}"))
     }
@@ -666,7 +666,7 @@ mod tests {
 
     #[test]
     fn no_timing_for_unknown_forms() {
-        let (_, m, s, ops) = m68k_core::tokens::split_line(" move.l ([4,a0],d0*4),d1");
+        let (_, m, s, ops) = crate::tokens::split_line(" move.l ([4,a0],d0*4),d1");
         assert_eq!(instruction_timing(&m, &s, &ops), None);
         assert_eq!(instruction_timing("dc", "w", &["1".into()]), None);
     }
