@@ -1,0 +1,27 @@
+# Reference encodings, list "ea", assembled with -c 68020.
+# One instruction per line: <source> | <bytes as hex> or <source> | reject.
+# cpu 68020
+move.l d1,d0 | 2001
+move.l a1,d0 | 2009
+move.l (a1),d0 | 2011
+move.l (a1)+,d0 | 2019
+move.l -(a1),d0 | 2021
+move.l $7fff(a1),d0 | 20297fff
+move.l $-8000(a1),d0 | 20298000
+move.l $7f(a1,d2.w),d0 | 2031207f
+move.l $7f(a1,a2.l),d0 | 2031a87f
+move.l $7f(a1,d2.w*2),d0 | 2031227f
+move.l $7f(a1,d2.l*8),d0 | 20312e7f
+move.l $1234.w,d0 | 20381234
+move.l $12345678.l,d0 | 203912345678
+move.l $10(pc),d0 | 203a000e
+move.l $10(pc,d1.w),d0 | 203b100e
+move.l #$12345678,d0 | 203c12345678
+move.l d1,d0 | 2001
+move.l d1,(a0) | 2081
+move.l d1,(a0)+ | 20c1
+move.l d1,-(a0) | 2101
+move.l d1,$7fff(a0) | 21417fff
+move.l d1,$7f(a0,d2.w) | 2181207f
+move.l d1,$1234.w | 21c11234
+move.l d1,$12345678.l | 23c112345678
