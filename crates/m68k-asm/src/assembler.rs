@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use m68k_core::errors::{AsmError, ErrorCollector};
+use m68k_core::errors::{AsmError, Diagnostic, ErrorCollector};
 use m68k_core::operands::{MemoryIndirectOperand, Operand};
 use m68k_core::tokens::{is_local_label, split_line};
 
@@ -1924,13 +1924,10 @@ pub struct Assembler {
     /// while walking is enough to give each local label a unique name —
     /// see [`Assembler::qualify_label`].
     current_global_label: Option<String>,
-    /// Explicit `.S` branches found out of range during pass 2.
-    ///
-    /// Collected instead of returned at once, so one build reports every
-    /// such branch: a change that pushes code apart typically breaks
-    /// several of them together. See [`Assembler::pass2`].
-    short_branch_errors: Vec<AsmError>,
 }
+
+/// Errors pass 2 collects before giving up on the rest of the source.
+const MAX_PASS2_ERRORS: usize = 100;
 
 /// Tracks `OPT` directive flags (`OPT flag[n][+-]`, comma-separated,
 /// Devpac-style syntax — e.g. `OPT O+,W5-`). Flags are letter-coded,
@@ -2048,7 +2045,6 @@ impl Assembler {
             rs_counter: 0,
             opt: OptState::default(),
             current_global_label: None,
-            short_branch_errors: Vec::new(),
         }
     }
 
@@ -2748,7 +2744,22 @@ impl Assembler {
     }
 
     /// Run the two-pass assembly process.
+    ///
+    /// The returned error, when there is one, is also the last error in
+    /// [`Self::diagnostics`], which holds everything found: pass 2 keeps
+    /// going after an error on a line, so one run reports every line it
+    /// could not encode. Errors in include expansion, pass 1 and branch
+    /// relaxation end the run at once.
     pub fn assemble(&mut self, source: &str) -> Result<&[AssembledInstruction], AsmError> {
+        self.errors.clear();
+        let result = self.assemble_inner(source);
+        if let Err(e) = &result {
+            self.errors.push(e.clone().into());
+        }
+        result.map(|()| self.code.as_slice())
+    }
+
+    fn assemble_inner(&mut self, source: &str) -> Result<(), AsmError> {
         // INCLUDE is expanded first: an included file may define the
         // macros, constants and structures the rest of the source uses,
         // so it has to be in place before macro expansion and parsing.
@@ -2766,9 +2777,45 @@ impl Assembler {
         self.relax_branches(&parsed)?;
 
         // Pass 2: Encode instructions with resolved symbols
-        self.pass2(&parsed)?;
+        self.pass2(&parsed)
+    }
 
-        Ok(&self.code)
+    /// Everything the last [`Self::assemble`] reported, in source order,
+    /// each located in the file it was written in. The top-level source
+    /// is named by `errors.filename`; included files by their `INCLUDE`
+    /// name.
+    pub fn diagnostics(&self) -> Vec<Diagnostic> {
+        let mut all: Vec<&Diagnostic> = self
+            .errors
+            .errors
+            .iter()
+            .chain(&self.errors.warnings)
+            .collect();
+        // Lines of the preprocessed text are source order. A diagnostic
+        // that already names its file was raised while expanding
+        // includes, before any of the others.
+        all.sort_by_key(|d| (!d.filename.is_empty(), d.line_no.unwrap_or(0)));
+        all.into_iter()
+            .map(|d| self.locate_diagnostic(d.clone()))
+            .collect()
+    }
+
+    /// Resolve a diagnostic's line of the preprocessed text to the file
+    /// and line it was written in (see [`Self::diagnostics`]).
+    pub fn locate_diagnostic(&self, d: Diagnostic) -> Diagnostic {
+        let mut out = d;
+        if !out.filename.is_empty() {
+            return out;
+        }
+        out.filename = self.errors.filename.clone();
+        if let Some(origin) = out.line_no.and_then(|l| self.source_origin(l)) {
+            if let Some(file) = &origin.file {
+                out.filename = file.clone();
+            }
+            out.line_no = Some(origin.line);
+            out.macro_name = origin.macro_name.clone();
+        }
+        out
     }
 
     /// Test/diagnostic hook: run include + macro expansion only.
@@ -3843,27 +3890,13 @@ impl Assembler {
     // -----------------------------------------------------------------------
 
     /// Pass 2: Encode all instructions with resolved symbols.
-    /// Pass 2. Out-of-range `.S` branches do not abort it: each is
-    /// recorded and encoded as a 2-byte placeholder, the size pass 1
-    /// budgeted, so the layout stays intact and later branches are
-    /// checked against correct addresses. All but the last end up in
-    /// [`Self::errors`]; the last (or a later fatal error) is returned, so
-    /// the collected ones precede it in source order.
+    /// Pass 2. An error on a line does not end the pass: the line is
+    /// recorded and skipped, and the location counter continues at the
+    /// address pass 1 gave the next line, so every later symbol and
+    /// branch distance is still right and one run reports every line it
+    /// could not encode. All but the last error go to [`Self::errors`];
+    /// the last is returned.
     fn pass2(&mut self, lines: &[ParsedLine]) -> Result<(), AsmError> {
-        self.short_branch_errors.clear();
-        let result = self.pass2_lines(lines);
-        let mut deferred = std::mem::take(&mut self.short_branch_errors);
-        let result = match result {
-            Ok(()) => deferred.pop().map_or(Ok(()), Err),
-            Err(e) => Err(e),
-        };
-        for e in deferred {
-            self.errors.error(e.message, e.line_no);
-        }
-        result
-    }
-
-    fn pass2_lines(&mut self, lines: &[ParsedLine]) -> Result<(), AsmError> {
         self.pc = self.origin;
         self.sections.restart_pass();
         self.rs_counter = 0;
@@ -3875,76 +3908,99 @@ impl Assembler {
         self.current_global_label = None;
         self.symbols.set_local_scope(None);
 
-        for line in lines {
-            // Track the label scope before anything can `continue` past
-            // it: a local label referenced on this line must resolve
-            // against the global label above it, and the conditional
-            // branches below skip the rest of the loop body.
-            if let Some(ref label) = line.label {
-                self.track_label_scope(label);
-            }
-
-            // Handle IF/ELSE/ENDIF always (manage conditional stack)
-            if let LineType::Directive { name, args } = &line.line_type {
-                match name.as_str() {
-                    "ifc" | "ifnc" => {
-                        let arg = args.join(",");
-                        let result = self.eval_conditional_later(name, &arg, line.line_no)?;
-                        let active = self.is_conditional_active() && result;
-                        self.conditional_stack.push(active);
-                        continue;
-                    }
-                    "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef"
-                    | "ifndef" | "ifd" | "ifnd" => {
-                        let arg = args.first().map(|s| s.as_str()).unwrap_or("");
-                        let result = self.eval_conditional_later(name, arg, line.line_no)?;
-                        let active = self.is_conditional_active() && result;
-                        self.conditional_stack.push(active);
-                        continue;
-                    }
-                    "else" => {
-                        if let Some(top) = self.conditional_stack.last_mut() {
-                            *top = !*top;
-                        } else {
-                            return Err(AsmError::with_line("ELSE without IF", line.line_no));
-                        }
-                        continue;
-                    }
-                    "endif" | "endc" => {
-                        if self.conditional_stack.pop().is_none() {
-                            return Err(AsmError::with_line("ENDIF without IF", line.line_no));
-                        }
-                        continue;
-                    }
-                    _ => {}
+        let mut errors: Vec<AsmError> = Vec::new();
+        for (idx, line) in lines.iter().enumerate() {
+            if let Err(e) = self.pass2_line(line) {
+                errors.push(e);
+                if errors.len() >= MAX_PASS2_ERRORS {
+                    errors.push(AsmError::with_line(
+                        format!("too many errors ({MAX_PASS2_ERRORS}), giving up"),
+                        line.line_no,
+                    ));
+                    break;
+                }
+                if let Some(next) = lines.get(idx + 1) {
+                    self.pc = self.get_pc_for_line(Some(next.line_no))?;
                 }
             }
+        }
+        let last = errors.pop();
+        for e in errors {
+            self.errors.push(e.into());
+        }
+        last.map_or(Ok(()), Err)
+    }
 
-            // Skip lines inside inactive conditional blocks
-            if !self.is_conditional_active() {
-                continue;
+    /// Encode one line from the current state.
+    fn pass2_line(&mut self, line: &ParsedLine) -> Result<(), AsmError> {
+        // Track the label scope before anything can `continue` past
+        // it: a local label referenced on this line must resolve
+        // against the global label above it, and the conditional
+        // branches below skip the rest of the loop body.
+        if let Some(ref label) = line.label {
+            self.track_label_scope(label);
+        }
+
+        // Handle IF/ELSE/ENDIF always (manage conditional stack)
+        if let LineType::Directive { name, args } = &line.line_type {
+            match name.as_str() {
+                "ifc" | "ifnc" => {
+                    let arg = args.join(",");
+                    let result = self.eval_conditional_later(name, &arg, line.line_no)?;
+                    let active = self.is_conditional_active() && result;
+                    self.conditional_stack.push(active);
+                    return Ok(());
+                }
+                "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef" | "ifndef"
+                | "ifd" | "ifnd" => {
+                    let arg = args.first().map(|s| s.as_str()).unwrap_or("");
+                    let result = self.eval_conditional_later(name, arg, line.line_no)?;
+                    let active = self.is_conditional_active() && result;
+                    self.conditional_stack.push(active);
+                    return Ok(());
+                }
+                "else" => {
+                    if let Some(top) = self.conditional_stack.last_mut() {
+                        *top = !*top;
+                    } else {
+                        return Err(AsmError::with_line("ELSE without IF", line.line_no));
+                    }
+                    return Ok(());
+                }
+                "endif" | "endc" => {
+                    if self.conditional_stack.pop().is_none() {
+                        return Err(AsmError::with_line("ENDIF without IF", line.line_no));
+                    }
+                    return Ok(());
+                }
+                _ => {}
+            }
+        }
+
+        // Skip lines inside inactive conditional blocks
+        if !self.is_conditional_active() {
+            return Ok(());
+        }
+
+        // Handle label (already defined in pass 1, but update PC)
+        if let Some(ref label) = line.label {
+            let _ = self.symbols.resolve(label);
+        }
+
+        // Encode this line
+        match &line.line_type {
+            LineType::Empty | LineType::Label => {}
+
+            LineType::Directive { name, args } => {
+                self.encode_directive(name, args, line)?;
             }
 
-            // Handle label (already defined in pass 1, but update PC)
-            if let Some(ref label) = line.label {
-                let _ = self.symbols.resolve(label);
-            }
-
-            // Encode this line
-            match &line.line_type {
-                LineType::Empty | LineType::Label => {}
-
-                LineType::Directive { name, args } => {
-                    self.encode_directive(name, args, line)?;
-                }
-
-                LineType::Instruction {
-                    mnemonic,
-                    size,
-                    operand_texts,
-                } => {
-                    self.encode_instruction_line(mnemonic, size.as_deref(), operand_texts, line)?;
-                }
+            LineType::Instruction {
+                mnemonic,
+                size,
+                operand_texts,
+            } => {
+                self.encode_instruction_line(mnemonic, size.as_deref(), operand_texts, line)?;
             }
         }
 
@@ -4387,7 +4443,7 @@ impl Assembler {
             && !is_dbcc_mnemonic(mnemonic)
             && (!(-128..=127).contains(&disp) || disp == 0 || disp == -1)
         {
-            self.short_branch_errors.push(AsmError::with_line(
+            return Err(AsmError::with_line(
                 format!(
                     "{}.s target is out of range for a short branch \
                      (displacement {disp}, limit -128..127 excluding 0 and -1); \
@@ -4396,15 +4452,6 @@ impl Assembler {
                 ),
                 line.line_no,
             ));
-            self.push_instruction(AssembledInstruction {
-                pc,
-                words: vec![0x6000],
-                line_no: Some(line.line_no),
-                source: Some(line.raw.clone()),
-                byte_len: None,
-            });
-            self.pc += 2;
-            return Ok(());
         }
 
         let words = match mnemonic {
