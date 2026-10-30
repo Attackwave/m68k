@@ -274,6 +274,11 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+The disassembler's reach on a real Kickstart ROM (instructions found by a
+linear scan, by control-flow tracing from the reset vector, and with pointer
+table scanning) is guarded by an ignored test; run it with a ROM at hand:
+`M68K_ROM=tmp/<rom> cargo test -p m68k-disasm --test rom_reach -- --ignored --nocapture`.
+
 Golden-vector tests (`crates/m68k-asm/tests/golden_*.rs`) check encoder,
 decoder, float, expression, and token behavior against fixed reference
 output in `tests/golden/vectors.json`.
