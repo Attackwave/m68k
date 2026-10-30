@@ -73,6 +73,24 @@ struct Args {
     #[arg(long = "Werror")]
     werror: bool,
 
+    /// Check every routine's stack use: a return or a jump to another
+    /// routine with the stack pointer off its entry level, two paths
+    /// reaching a line with different stack heights, or a point from
+    /// which the stack height cannot be followed, is an error
+    #[arg(long)]
+    stack_check: bool,
+
+    /// Write a report of the maximum stack depth of every routine,
+    /// including everything it calls; recursion is marked unbounded and
+    /// an unknown callee makes the figure a lower bound
+    #[arg(long, value_name = "FILE")]
+    stack_report: Option<PathBuf>,
+
+    /// Warn about TST/CMP/BTST whose condition codes every following path
+    /// overwrites before any instruction reads them
+    #[arg(long)]
+    flag_check: bool,
+
     /// Write a make dependency file: the output depends on the source
     /// and every INCLUDE/INCBIN file, each also listed as an empty rule
     /// so a deleted file does not break the build (like `gcc -MD -MP`)
@@ -175,6 +193,48 @@ fn depfile_contents(target: &Path, source: Option<&Path>, deps: &[PathBuf]) -> S
     out
 }
 
+/// One line per routine: name, address, depth, balance, then notes.
+fn stack_report_text(asm: &Assembler) -> String {
+    let reports = asm.stack_analysis();
+    let width = reports
+        .iter()
+        .map(|r| r.name.len())
+        .max()
+        .unwrap_or(7)
+        .max(7);
+    let mut out = format!(
+        "{:<width$}  {:<8}  {:<16}  balance\n",
+        "routine", "address", "depth"
+    );
+    for r in &reports {
+        let balance = match r.balanced {
+            Some(true) => "ok",
+            Some(false) => "MISMATCH",
+            None => "n/a",
+        };
+        out.push_str(&format!(
+            "{:<width$}  ${:06X}  {:<16}  {balance}\n",
+            r.name,
+            r.pc,
+            r.depth.to_string()
+        ));
+        for (line, p) in &r.problems {
+            let diag =
+                asm.locate_diagnostic(m68k_core::errors::Diagnostic::error(p.clone(), Some(*line)));
+            let where_ = match diag.line_no {
+                Some(l) if !diag.filename.is_empty() => format!("{}:{l}", diag.filename),
+                Some(l) => format!("line {l}"),
+                None => String::new(),
+            };
+            out.push_str(&format!("{:width$}    {where_}: {p}\n", ""));
+        }
+        for n in &r.notes {
+            out.push_str(&format!("{:width$}    {n}\n", ""));
+        }
+    }
+    out
+}
+
 fn output_display(path: &Path) -> String {
     if is_dash(path) {
         "<stdout>".to_string()
@@ -229,6 +289,34 @@ fn run(args: Args) -> Result<(), String> {
     // in, in source order. The run fails on any error, or on a warning
     // with --Werror; nothing is written then.
     let result = asm.assemble_bytes(&source);
+    // The analyses read the encoded program, so they only make sense when
+    // it assembled; their findings join the other diagnostics.
+    if result.is_ok() {
+        // Written before any error exit: the report is how a reported
+        // problem is looked into.
+        if let Some(report_path) = &args.stack_report {
+            fs::write(report_path, stack_report_text(&asm)).map_err(|e| {
+                format!(
+                    "cannot write stack report '{}': {}",
+                    report_path.display(),
+                    e
+                )
+            })?;
+        }
+        if args.stack_check {
+            for report in asm.stack_analysis() {
+                for (line, problem) in report.problems {
+                    asm.errors
+                        .error(format!("{}: {problem}", report.name), Some(line));
+                }
+            }
+        }
+        if args.flag_check {
+            for (line, message) in asm.dead_flag_setters() {
+                asm.errors.warning(message, Some(line));
+            }
+        }
+    }
     for diag in asm.diagnostics() {
         eprintln!("{diag}");
     }

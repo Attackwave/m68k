@@ -46,6 +46,7 @@
 //!   reader; see that module's docs for details).
 
 pub mod amiga_hunk_writer;
+pub mod analysis;
 pub mod assembler;
 pub mod directives;
 pub mod ea_encode;

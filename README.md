@@ -120,6 +120,7 @@ m68k-asm hello.s -f hunk-exe -o hello         # Amiga Hunk executable (LoadSeg()
 - `--map <file>` — export a memory map (address ranges per instruction).
 - `-V`, `--version` — print the version (all three tools).
 - `--Werror` — treat warnings as errors: no output is written and the exit status is 1.
+- `--stack-check`, `--stack-report <file>`, `--flag-check` — static checks over the encoded program (see below).
 - `--depfile <file>` — write make dependencies: the output depends on the source and every `INCLUDE`/`INCBIN` file, each also listed as an empty rule (like `gcc -MD -MP`). Use with `-include` in a Makefile.
 - `-I`, `--include <dir>` — add a directory to the `INCLUDE` search path (repeatable). Needed for sources that include the Amiga system headers by their logical path, e.g. `include 'exec/types.i'`.
 - `--optimize` — enable size-changing optimizations (see below). Off by default.
@@ -128,6 +129,12 @@ m68k-asm hello.s -f hunk-exe -o hello         # Amiga Hunk executable (LoadSeg()
 #### Diagnostics
 
 Every error and warning is printed to stderr as `file:line: severity: message`, located in the file it was written in (an included file is named by its `INCLUDE` name, a line expanded from a macro carries `(in macro name)`). Pass 2 keeps going after an error, so one run reports every line it could not encode — the location counter continues at the address pass 1 gave the next line, so later branch distances and symbols stay right. Any error means no output is written and the exit status is 1; a summary line gives the counts.
+
+#### Stack analysis
+
+`--stack-check` and `--stack-report <file>` walk the encoded program routine by routine. A routine is a global label that is called, or that nothing refers to (a reset vector, an exception handler, a table entry); a label that is only ever branched to is a continuation of whoever branches there. Along every path the stack pointer offset from the routine's entry is followed through pushes and pops (`-(SP)`/`(SP)+`, `MOVEM`, `PEA`, `LINK`/`UNLK`, `ADDQ`/`SUBQ`/`LEA` on `SP`). `--stack-check` makes these errors: a return or a jump to another routine with the stack off its entry level, or with its height unknown. `--stack-report` writes one line per routine with its maximum stack depth including everything it calls (`>= n` when a callee could not be followed, `unbounded (a -> b -> a)` for recursion), its balance, and notes on where the arithmetic stopped: an indirect call or jump, `SP` loaded from somewhere (a context switch), two paths meeting at different heights. `RTE` and `RTR` are not balance-checked. Declare routines that never return with `NORETURN name[,name...]`, so a call to them ends the path (`BSR error_exit` as the last instruction before the next routine is assumed not to return even without it).
+
+`--flag-check` warns about a `TST`, `CMP` or `BTST` whose condition codes every following path overwrites before any instruction reads them. Calls, returns and indirect jumps count as reads, since the flags may be used there.
 
 #### Optimization
 
@@ -209,6 +216,7 @@ release builds.
 | `include "file"` | Include external source file |
 | `incbin "file"` | Include binary file |
 | `macro` / `endm` | Define macros with arguments |
+| `noreturn sym[,sym...]` | Declare routines that never return (stack analysis) |
 | `rept <count>` / `endm` | Repeat block |
 | `section <name>` | Define named sections |
 
