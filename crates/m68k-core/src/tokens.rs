@@ -611,7 +611,7 @@ fn takes_cache_scope_operand(word: &str) -> bool {
 /// Directives that stand alone (`NEAR`, `MACHINE 68020`, `INCDIR "x"`) are
 /// deliberately absent; `assembler::is_directive_name` recognises them once
 /// the line has been split, which is enough.
-fn is_directive(s: &str) -> bool {
+pub fn is_directive(s: &str) -> bool {
     matches!(
         s,
         "org"

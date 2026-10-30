@@ -191,6 +191,12 @@ fn depfile_contents(target: &Path, source: Option<&Path>, deps: &[PathBuf]) -> S
     out
 }
 
+/// A mnemonic that is an instruction, as opposed to data or a directive,
+/// so a missing timing is worth counting.
+fn is_timed_instruction(mnemonic: &str) -> bool {
+    !mnemonic.is_empty() && !m68k_core::tokens::is_directive(mnemonic)
+}
+
 /// One line per routine: name, address, depth, balance, then notes.
 fn stack_report_text(asm: &Assembler) -> String {
     let reports = asm.stack_analysis();
@@ -512,8 +518,15 @@ fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Re
     if let Some(listing_path) = &args.listing {
         let mut listing = String::new();
         listing.push_str(&format!("; Listing for {}\n\n", input_name));
-        listing.push_str(&format!("{:<8} {:<20} {}\n", "Address", "Bytes", "Source"));
-        listing.push_str(&format!("{:-<8} {:-<20} {:-<}\n", "", "", ""));
+        listing.push_str(&format!(
+            "{:<8} {:<20} {:<7} {}\n",
+            "Address", "Bytes", "Cycles", "Source"
+        ));
+        listing.push_str(&format!("{:-<8} {:-<20} {:-<7} {:-<}\n", "", "", "", ""));
+        // 68000 clock periods per instruction (M68000 user's manual,
+        // section 8), summed at the end. Lines without a 68000 timing
+        // (data, 68020+ forms) stay blank and are counted.
+        let (mut cyc_min, mut cyc_max, mut cyc_unknown) = (0u32, Some(0u32), 0u32);
         for instr in &asm.code {
             let bytes_str: Vec<String> = instr
                 .words
@@ -526,13 +539,33 @@ fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Re
                 })
                 .collect();
             let source = instr.source.as_deref().unwrap_or("").trim();
+            let (_, mnemonic, size, operands) = m68k_core::tokens::split_line(source);
+            let timing = m68k_core::cycles::instruction_timing(&mnemonic, &size, &operands);
+            let cycles = match &timing {
+                Some(t) => {
+                    cyc_min += t.min;
+                    cyc_max = cyc_max.zip(t.max).map(|(a, b)| a + b);
+                    t.label.clone()
+                }
+                None => {
+                    if is_timed_instruction(&mnemonic) {
+                        cyc_unknown += 1;
+                    }
+                    String::new()
+                }
+            };
             listing.push_str(&format!(
-                "${:06X}  {:<20} {}\n",
+                "${:06X}  {:<20} {:<7} {}\n",
                 instr.pc,
                 bytes_str.join(" "),
+                cycles,
                 source
             ));
         }
+        let max = cyc_max.map_or("no bound".to_string(), |m| m.to_string());
+        listing.push_str(&format!(
+            "\n; 68000 cycles: {cyc_min} min, {max} max, {cyc_unknown} instructions without timing\n"
+        ));
         fs::write(listing_path, &listing)
             .map_err(|e| format!("cannot write listing '{}': {}", listing_path.display(), e))?;
         eprintln!("Listing written -> {}", listing_path.display());
