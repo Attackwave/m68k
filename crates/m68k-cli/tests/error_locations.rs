@@ -35,7 +35,7 @@ fn error_after_rept_in_include_names_its_real_file_and_line() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(!result.status.success(), "out-of-range branch was accepted");
     assert!(
-        stderr.contains("two.s:5: bne.s target is out of range"),
+        stderr.contains("two.s:5: error: bne.s target is out of range"),
         "{stderr}"
     );
 
@@ -50,7 +50,7 @@ fn error_after_rept_in_include_names_its_real_file_and_line() {
     let stderr = String::from_utf8_lossy(&result.stderr);
     assert!(!result.status.success(), "undefined symbol was accepted");
     assert!(
-        stderr.contains("two.s:5: undefined symbol: nowhere"),
+        stderr.contains("two.s:5: error: undefined symbol: nowhere"),
         "{stderr}"
     );
 
