@@ -1795,6 +1795,7 @@ fn is_directive_name(name: &str) -> bool {
             | "nolist"
             | "page"
             | "title"
+            | "noreturn"
     )
 }
 
@@ -1916,6 +1917,10 @@ pub struct Assembler {
     /// Every file read through `INCLUDE` or `INCBIN`, once each, in the
     /// order first read, with the path as resolved (for a make depfile).
     pub dependencies: Vec<PathBuf>,
+    /// Every instruction pass 2 encoded, for [`Self::stack_analysis`].
+    instr_infos: Vec<crate::analysis::InstrInfo>,
+    /// Addresses `NORETURN` declared as never returning when called.
+    noreturn: std::collections::HashSet<u32>,
     /// Most recent global (non-local) label, used to scope local labels.
     ///
     /// A local label (`.loop`) belongs to the global label above it, so
@@ -2038,6 +2043,8 @@ impl Assembler {
             included_files: std::collections::HashSet::new(),
             include_paths_resolved: HashMap::new(),
             dependencies: Vec::new(),
+            instr_infos: Vec::new(),
+            noreturn: std::collections::HashSet::new(),
             conditional_stack: Vec::new(),
             macro_definitions: HashMap::new(),
             macro_unique_counter: 0,
@@ -3523,9 +3530,8 @@ impl Assembler {
             "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef" | "ifndef"
             | "ifc" | "ifnc" | "else" | "endif" | "endc" | "macro" | "endm" | "rept" | "irp"
             | "irpc" | "endr" | "xref" | "xdef" | "public" | "extern" | "opt" | "mexit"
-            | "exitm" | "print" | "printt" | "printv" | "list" | "nolist" | "page" | "title" => {
-                Ok(0)
-            }
+            | "exitm" | "print" | "printt" | "printv" | "list" | "nolist" | "page" | "title"
+            | "noreturn" => Ok(0),
             // Optimisation and code-placement hints. This assembler resolves
             // everything to absolute addresses and performs no branch
             // shortening beyond the relaxation pass, so there is nothing for
@@ -3901,6 +3907,8 @@ impl Assembler {
         self.sections.restart_pass();
         self.rs_counter = 0;
         self.code.clear();
+        self.instr_infos.clear();
+        self.noreturn.clear();
         self.conditional_stack.clear();
         // Local labels resolve against the enclosing global label, so the
         // scope has to be rebuilt from the start of the source, exactly as
@@ -4000,11 +4008,109 @@ impl Assembler {
                 size,
                 operand_texts,
             } => {
+                let before = self.code.len();
                 self.encode_instruction_line(mnemonic, size.as_deref(), operand_texts, line)?;
+                self.record_instruction(mnemonic, size.as_deref(), operand_texts, line, before);
             }
         }
 
         Ok(())
+    }
+
+    /// Keep what the analysis needs of the instruction just encoded:
+    /// its address and size as emitted, and its operands as parsed.
+    fn record_instruction(
+        &mut self,
+        mnemonic: &str,
+        size: Option<&str>,
+        operand_texts: &[String],
+        line: &ParsedLine,
+        code_len_before: usize,
+    ) {
+        if self.code.len() <= code_len_before {
+            return;
+        }
+        let last = &self.code[self.code.len() - 1];
+        let (pc, bytes) = (last.pc, last.size_bytes() as u32);
+        let operands: Vec<Operand> = operand_texts
+            .iter()
+            .filter_map(|t| {
+                let t = self.apply_register_aliases(t);
+                parse_operand_text(&t, &self.symbols, pc).ok()
+            })
+            .collect();
+        let target = if is_branch_mnemonic(mnemonic) {
+            let op = if is_dbcc_mnemonic(mnemonic) {
+                operands.get(1)
+            } else {
+                operands.first()
+            };
+            match op {
+                Some(Operand::Address(a) | Operand::Immediate(a) | Operand::Memory(a)) => {
+                    Some(*a as u32)
+                }
+                Some(Operand::AbsoluteShort(a) | Operand::AbsoluteLong(a)) => Some(*a as u32),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let op_size = match size.map(|s| s.to_ascii_lowercase()).as_deref() {
+            Some("b") | Some("s") => 1,
+            Some("w") => 2,
+            Some("l") => 4,
+            Some("x") | Some("d") | Some("p") => 12,
+            _ => 0,
+        };
+        let location = match self.source_origin(line.line_no) {
+            Some(o) => match o
+                .file
+                .as_deref()
+                .or(Some(&self.errors.filename))
+                .filter(|f| !f.is_empty())
+            {
+                Some(file) => format!("{file}:{}", o.line),
+                None => format!("line {}", o.line),
+            },
+            None => format!("line {}", line.line_no),
+        };
+        self.instr_infos.push(crate::analysis::InstrInfo {
+            pc,
+            size: bytes,
+            line_no: line.line_no,
+            location,
+            mnemonic: mnemonic.to_ascii_lowercase(),
+            op_size,
+            operands,
+            target,
+        });
+    }
+
+    /// Global labels at instruction addresses: the routine entries the
+    /// analysis works with.
+    fn routine_entries(&self) -> Vec<(String, u32)> {
+        let code_pcs: std::collections::HashSet<u32> =
+            self.instr_infos.iter().map(|i| i.pc).collect();
+        self.symbols
+            .iter()
+            .filter(|(name, e)| e.defined && !name.contains('.') && code_pcs.contains(&e.value))
+            .map(|(name, e)| (name.clone(), e.value))
+            .collect()
+    }
+
+    /// Stack balance and depth per routine over the last assembled
+    /// program. See [`crate::analysis`].
+    pub fn stack_analysis(&self) -> Vec<crate::analysis::RoutineReport> {
+        crate::analysis::stack_analysis(&self.instr_infos, &self.routine_entries(), &self.noreturn)
+    }
+
+    /// Flag-setting instructions whose result nothing reads.
+    pub fn dead_flag_setters(&self) -> Vec<crate::analysis::DeadFlagSetter> {
+        crate::analysis::dead_flag_setters(
+            &self.instr_infos,
+            &self.routine_entries(),
+            &self.noreturn,
+        )
     }
 
     /// Encode a single instruction line.
@@ -4715,6 +4821,17 @@ impl Assembler {
             | "irpc" | "endr" | "xref" | "xdef" | "public" | "extern" | "mexit" | "exitm"
             | "near" | "far" | "auto" | "inline" | "einline" | "machine" | "cpu" | "fpu"
             | "incdir" | "equr" | "reg" | "list" | "nolist" | "page" | "title" => Ok(()),
+            // `NORETURN sym[,sym]`: a call to any of these never comes
+            // back. Only the stack analysis reads it.
+            "noreturn" => {
+                for name in args.iter().filter(|a| !a.is_empty()) {
+                    let value = self.symbols.resolve(name).map_err(|e| {
+                        AsmError::with_line(format!("NORETURN: {}", e.message), line.line_no)
+                    })?;
+                    self.noreturn.insert(value);
+                }
+                Ok(())
+            }
             "opt" => {
                 for msg in self.opt.apply(args) {
                     self.errors.warning(msg, Some(line.line_no));
