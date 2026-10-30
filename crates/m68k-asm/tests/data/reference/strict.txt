@@ -1,0 +1,20 @@
+# Reference encodings, list "strict", assembled with -c 68000.
+# One instruction per line: <source> | <bytes as hex> or <source> | reject.
+# cpu 68000
+ori.b #1,a0 | reject
+move.b a0,d0 | reject
+move.b d0,a0 | reject
+addq.b #1,a0 | reject
+btst d0,#$12 | 013c0012
+lea d0,a0 | reject
+lea (a0)+,a1 | reject
+clr.b a0 | reject
+moveq #256,d0 | reject
+moveq #-129,d0 | reject
+trap #16 | reject
+bkpt #8 | reject
+movem.w d0,d1 | reject
+exg d0,#1 | reject
+asl.b #9,d0 | reject
+link a5,#$8000 | 4e558000
+chk.l d1,d2 | reject
