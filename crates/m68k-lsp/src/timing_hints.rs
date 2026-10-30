@@ -5,8 +5,8 @@ use tower_lsp::lsp_types::{
     InlayHint, InlayHintLabel, InlayHintTooltip, Position, Range, TextDocumentIdentifier,
 };
 
-use crate::analysis::cycles::instruction_timing;
 use crate::document::Document;
+use m68k_core::cycles::instruction_timing;
 
 /// Timing hints for the instructions on lines `range` covers.
 pub fn compute_inlay_hints(doc: &Document, range: Range) -> Vec<InlayHint> {
