@@ -28,6 +28,7 @@ pub mod amiga_custom;
 pub mod amiga_hunk;
 pub mod amiga_lvo;
 pub mod cpu_gate;
+pub mod cycles;
 pub mod ea_categories;
 pub mod errors;
 pub mod opcodes;
