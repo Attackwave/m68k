@@ -612,19 +612,6 @@ fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Re
         eprintln!("Memory map written -> {}", map_path.display());
     }
 
-    // Print symbol table to stderr (always)
-    if asm.symbols.iter().count() > 0 {
-        eprintln!("\nSymbols:");
-        let mut syms: Vec<_> = asm.symbols.iter().collect();
-        // Case-insensitive order, ties broken by the exact name: `err_exist`
-        // and `ERR_EXIST` otherwise came out in hash-map order, so the file
-        // differed from run to run.
-        syms.sort_by_cached_key(|(name, _)| (name.to_lowercase(), name.to_string()));
-        for (name, entry) in syms {
-            eprintln!("  {:<20} ${:08X}", name, entry.value);
-        }
-    }
-
     Ok(())
 }
 
