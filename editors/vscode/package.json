@@ -80,6 +80,16 @@
           "default": "",
           "description": "Main source file of the program, relative to the workspace folder. The language server assembles it and checks every file it INCLUDEs as part of it, so an included file does not report the symbols and macros of its includer as undefined. F5 builds and debugs it instead of the active file."
         },
+        "m68k.stackCheck": {
+          "type": "boolean",
+          "default": false,
+          "description": "Check every routine's stack use (m68k-asm --stack-check): a return or jump to another routine with the stack pointer off its entry level, or a line reached with different stack heights, is an error. Applies to diagnostics and build tasks."
+        },
+        "m68k.flagCheck": {
+          "type": "boolean",
+          "default": false,
+          "description": "Warn about TST/CMP/BTST whose condition codes every following path overwrites before anything reads them (m68k-asm --flag-check). Applies to diagnostics and build tasks."
+        },
         "m68k.emulator": {
           "type": "string",
           "default": "",
@@ -126,6 +136,10 @@
             "type": "boolean",
             "default": false,
             "description": "Add source line debug info (embeds absolute source paths). F5 debugging sets this itself."
+          },
+          "stackReport": {
+            "type": "string",
+            "description": "Write a report of the maximum stack depth of every routine to this file (--stack-report)."
           }
         }
       }
