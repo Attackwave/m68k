@@ -147,13 +147,20 @@ assembler produces *without* optimization:
 `--optimize` shortens both where the value fits — an absolute address
 that fits in 16 bits becomes absolute-short, and a branch in range
 becomes the 8-bit form. An explicit `.W`/`.L` or `.S`/`.B` suffix is
-always honoured and overrides both modes.
+always honoured and overrides both modes. It also relaxes a `JSR`/`JMP`
+to a label into `BSR`/`BRA` and an `LEA`/`PEA` of a label into the
+`(d16,PC)` form when the label is within 16-bit reach, which saves two
+bytes and two to four cycles each; a target named by an `EQU` (which may
+be hardware) or a program with more than one section is left alone,
+since a PC-relative reference needs a fixed distance.
 
 ```asm
     MOVE.W  $1234,D0        ; default: 3039 00001234   --optimize: 3038 1234
     MOVE.W  $1234.W,D0      ; always:  3038 1234
     BRA     loop            ; default: 6000 fffc       --optimize: 60fc
     BRA.S   loop            ; always:  60fc
+    JSR     sub             ; default: 4eb9 00001000   --optimize: 6100 0ffa
+    LEA     table,A0        ; default: 41f9 00001200   --optimize: 41fa 11f8
 ```
 
 #### Syntax notes
