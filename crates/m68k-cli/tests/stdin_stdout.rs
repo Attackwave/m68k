@@ -202,3 +202,20 @@ fn symbol_table_is_deterministic() {
     assert!(first.starts_with("ERR_0 "), "{first}");
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// The listing times an instruction without operands: `rts` is not a label.
+#[test]
+fn listing_counts_cycles_of_bare_instructions() {
+    let dir = std::env::temp_dir().join(format!("m68k-listing-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let listing = dir.join("out.lst");
+    let (ok, _, stderr) = run(
+        asm(),
+        &["-o", "-", "-l", listing.to_str().unwrap(), "-"],
+        b"\tnop\n\trts\n",
+    );
+    assert!(ok, "{stderr}");
+    let text = std::fs::read_to_string(&listing).unwrap();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(text.contains("; 68000 cycles: 20 min, 20 max"), "{text}");
+}
