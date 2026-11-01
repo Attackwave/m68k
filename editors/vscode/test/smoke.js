@@ -91,17 +91,21 @@ send({ id: 1, method: 'initialize', params: { processId: null, rootUri: null, ca
 
 // Main-file mode: an included file opened on its own is checked as part of
 // the program, so a symbol from the includer is known and only the file's
-// own fault is reported, on its own line, from the unsaved text.
+// own fault is reported, on its own line, from the unsaved text. Once the
+// fault is edited away, the flag check runs over the whole program and
+// warns about the TST whose flags the MOVEQ overwrites.
 fs.writeFileSync(path.join(dir, 'main.s'), 'SIZE equ 4\n  include "inc.s"\n  rts\n');
 fs.writeFileSync(path.join(dir, 'inc.s'), '  moveq #SIZE,d0\n');
-const unit = spawn(bin('m68k-lsp'), ['--main', path.join(dir, 'main.s')]);
+const unit = spawn(bin('m68k-lsp'), ['--main', path.join(dir, 'main.s'), '--flag-check']);
 const sendUnit = (msg) => {
   const body = JSON.stringify({ jsonrpc: '2.0', ...msg });
   unit.stdin.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
 };
-const incUri = 'file://' + path.join(dir, 'inc.s');
+// A file URI is not 'file://' + path: a Windows path has a drive letter and backslashes.
+const incUri = require('url').pathToFileURL(path.join(dir, 'inc.s')).href;
 let unitBuf = Buffer.alloc(0);
 const unitTimer = setTimeout(() => { unit.kill(); assert.fail('m68k-lsp --main did not publish diagnostics'); }, 5000);
+let unitStep = 0;
 unit.stdout.on('data', (chunk) => {
   unitBuf = Buffer.concat([unitBuf, chunk]);
   for (;;) {
@@ -118,12 +122,23 @@ unit.stdout.on('data', (chunk) => {
         params: { textDocument: { uri: incUri, languageId: 'm68k', version: 1, text: '  moveq #SIZE,d0\n  bogus d0\n' } },
       });
     }
-    if (msg.method === 'textDocument/publishDiagnostics' && msg.params.uri === incUri) {
+    if (msg.method === 'textDocument/publishDiagnostics' && msg.params.uri === incUri && unitStep === 0) {
       assert.deepStrictEqual(msg.params.diagnostics.map((d) => d.range.start.line), [1]);
       assert.match(msg.params.diagnostics[0].message, /BOGUS/);
+      unitStep = 1;
+      sendUnit({
+        method: 'textDocument/didChange',
+        params: {
+          textDocument: { uri: incUri, version: 2 },
+          contentChanges: [{ text: '  tst.w d0\n  moveq #SIZE,d0\n' }],
+        },
+      });
+    } else if (msg.method === 'textDocument/publishDiagnostics' && msg.params.uri === incUri && unitStep === 1) {
+      assert.deepStrictEqual(msg.params.diagnostics.map((d) => [d.range.start.line, d.severity]), [[0, 2]]);
+      assert.match(msg.params.diagnostics[0].message, /TST/);
       clearTimeout(unitTimer);
       unit.kill();
-      console.log('ok (main file)');
+      console.log('ok (main file, flag check)');
       return;
     }
   }

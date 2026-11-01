@@ -28,6 +28,16 @@ struct Cli {
     #[arg(long, value_name = "FILE")]
     main: Option<PathBuf>,
 
+    /// Report a routine returning or jumping on with the stack pointer off
+    /// its entry level, or a line reached with different stack heights
+    #[arg(long)]
+    stack_check: bool,
+
+    /// Warn about TST/CMP/BTST whose condition codes every following path
+    /// overwrites before any instruction reads them
+    #[arg(long)]
+    flag_check: bool,
+
     /// Communicate via stdio (default mode for LSP clients)
     #[arg(long, default_value = "true")]
     stdio: bool,
@@ -60,6 +70,8 @@ async fn main() {
             cpu: min_cpu,
             include_paths: args.include_paths.clone(),
             main_file: args.main.clone(),
+            stack_check: args.stack_check,
+            flag_check: args.flag_check,
         };
         let config_slot = backend.config.clone();
         let workspace = backend.workspace.clone();

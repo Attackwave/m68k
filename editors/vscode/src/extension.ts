@@ -15,6 +15,14 @@ function tool(context: vscode.ExtensionContext, name: string): string {
   return exe;
 }
 
+/// Program analyses switched on in the settings, as m68k-asm/m68k-lsp flags.
+function analysisFlags(cfg: vscode.WorkspaceConfiguration): string[] {
+  const flags = [];
+  if (cfg.get<boolean>('stackCheck')) flags.push('--stack-check');
+  if (cfg.get<boolean>('flagCheck')) flags.push('--flag-check');
+  return flags;
+}
+
 /// `m68k.mainFile` as an absolute path, or undefined when not set.
 function mainFile(): string | undefined {
   const name = vscode.workspace.getConfiguration('m68k').get<string>('mainFile');
@@ -25,7 +33,7 @@ function mainFile(): string | undefined {
 async function startClient(context: vscode.ExtensionContext) {
   const cfg = vscode.workspace.getConfiguration('m68k');
   const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
-  const args = ['--cpu', cfg.get<string>('cpu', '68000')];
+  const args = ['--cpu', cfg.get<string>('cpu', '68000'), ...analysisFlags(cfg)];
   for (const dir of cfg.get<string[]>('includePaths', [])) args.push('-I', path.resolve(root, dir));
   const main = mainFile();
   if (main) args.push('--main', main);
@@ -40,9 +48,10 @@ async function startClient(context: vscode.ExtensionContext) {
 function buildTask(context: vscode.ExtensionContext, def: vscode.TaskDefinition, scope: vscode.WorkspaceFolder) {
   const cfg = vscode.workspace.getConfiguration('m68k', scope);
   const format = def.format ?? 'hunk-exe';
-  const args = [def.file, '-f', format, '-c', cfg.get<string>('cpu', '68000')];
+  const args = [def.file, '-f', format, '-c', cfg.get<string>('cpu', '68000'), ...analysisFlags(cfg)];
   // Line info embeds absolute source paths, so only debug builds carry it.
   if (def.linedebug && format === 'hunk-exe') args.push('--linedebug');
+  if (def.stackReport) args.push('--stack-report', def.stackReport);
   for (const dir of cfg.get<string[]>('includePaths', [])) args.push('-I', dir);
   if (def.output) args.push('-o', def.output);
 
@@ -194,7 +203,8 @@ export async function activate(context: vscode.ExtensionContext) {
       await startClient(context);
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (['m68k.cpu', 'm68k.toolsPath', 'm68k.includePaths', 'm68k.mainFile'].some((k) => e.affectsConfiguration(k))) {
+      const keys = ['m68k.cpu', 'm68k.toolsPath', 'm68k.includePaths', 'm68k.mainFile', 'm68k.stackCheck', 'm68k.flagCheck'];
+      if (keys.some((k) => e.affectsConfiguration(k))) {
         vscode.commands.executeCommand('m68k.restartServer');
       }
     })
