@@ -46,7 +46,8 @@ pub enum Depth {
     Exact(u32),
     /// A lower bound: some callee or path could not be followed.
     AtLeast(u32),
-    /// The routine is on a cycle of the call graph.
+    /// The routine is on a cycle of the call graph that no `RECURSES`
+    /// declaration bounds.
     Unbounded(String),
 }
 
@@ -513,11 +514,14 @@ fn analyze_routine(prog: &Program, entry: u32) -> Local {
 
 /// Stack balance and depth for every routine. `routines` are the global
 /// labels at code addresses; which of them are routine entries is decided
-/// by how they are reached (see [`Program`]).
+/// by how they are reached (see [`Program`]). `recursion` gives, per
+/// entry, how many times a routine may be re-entered while active: its
+/// cycles are unrolled that often instead of marked unbounded.
 pub fn stack_analysis(
     instrs: &[InstrInfo],
     routines: &[(String, u32)],
     noreturn: &HashSet<u32>,
+    recursion: &HashMap<u32, u32>,
 ) -> Vec<RoutineReport> {
     let prog = Program::new(instrs, routines, noreturn);
     let locals: HashMap<u32, Local> = prog
@@ -526,11 +530,11 @@ pub fn stack_analysis(
         .map(|(entry, _)| (*entry, analyze_routine(&prog, *entry)))
         .collect();
 
-    let mut memo: HashMap<u32, Depth> = HashMap::new();
+    let mut memo = DepthMemo::new();
     let mut reports = Vec::new();
     for (entry, name) in &prog.routines {
         let mut stack = Vec::new();
-        let depth = total_depth(&prog, &locals, *entry, &mut stack, &mut memo);
+        let depth = total_depth(&prog, &locals, recursion, *entry, &mut stack, &mut memo);
         let l = &locals[entry];
         reports.push(RoutineReport {
             name: name.clone(),
@@ -544,23 +548,55 @@ pub fn stack_analysis(
     reports
 }
 
+/// Depth per routine entry and [`context`].
+type DepthMemo = HashMap<(u32, Vec<(u32, u32)>), Depth>;
+
+/// Declared routines on the stack with how often each is: a depth found
+/// below them depends on it, so it is the memo's key with the entry.
+fn context(stack: &[u32], recursion: &HashMap<u32, u32>) -> Vec<(u32, u32)> {
+    let mut ctx: Vec<(u32, u32)> = recursion
+        .keys()
+        .filter_map(|r| {
+            let n = stack.iter().filter(|e| *e == r).count() as u32;
+            (n > 0).then_some((*r, n))
+        })
+        .collect();
+    ctx.sort_unstable();
+    ctx
+}
+
 fn total_depth(
     prog: &Program,
     locals: &HashMap<u32, Local>,
+    recursion: &HashMap<u32, u32>,
     entry: u32,
     stack: &mut Vec<u32>,
-    memo: &mut HashMap<u32, Depth>,
+    memo: &mut DepthMemo,
 ) -> Depth {
-    if let Some(d) = memo.get(&entry) {
+    let key = (entry, context(stack, recursion));
+    if let Some(d) = memo.get(&key) {
         return d.clone();
     }
-    if let Some(pos) = stack.iter().position(|e| *e == entry) {
-        let names: Vec<&str> = stack[pos..]
-            .iter()
-            .chain(std::iter::once(&entry))
-            .map(|e| prog.name_of(*e))
-            .collect();
-        return Depth::Unbounded(names.join(" -> "));
+    if let Some(last) = stack.iter().rposition(|e| *e == entry) {
+        let lap = &stack[last..];
+        let active = stack.iter().filter(|e| **e == entry).count() as u32;
+        match recursion.get(&entry) {
+            // Declared to re-enter at most `n` times: the walk unrolls
+            // the cycle until the declaration says this call is not made.
+            Some(n) if active > *n => return Depth::Exact(0),
+            Some(_) => {}
+            // Undeclared, but the lap since the last visit went through a
+            // declared routine, whose bound ends the unrolling: go on.
+            None if lap.iter().any(|e| recursion.contains_key(e)) => {}
+            None => {
+                let names: Vec<&str> = lap
+                    .iter()
+                    .chain(std::iter::once(&entry))
+                    .map(|e| prog.name_of(*e))
+                    .collect();
+                return Depth::Unbounded(names.join(" -> "));
+            }
+        }
     }
     let l = &locals[&entry];
     stack.push(entry);
@@ -570,7 +606,7 @@ fn total_depth(
     for (callee, offset, tail) in &l.calls {
         let own = offset.unsigned_abs() + if *tail { 0 } else { 4 };
         match callee.filter(|c| prog.entries.contains(c)) {
-            Some(c) => match total_depth(prog, locals, c, stack, memo) {
+            Some(c) => match total_depth(prog, locals, recursion, c, stack, memo) {
                 Depth::Exact(d) => max = max.max(own + d),
                 Depth::AtLeast(d) => {
                     max = max.max(own + d);
@@ -594,11 +630,11 @@ fn total_depth(
         None if exact => Depth::Exact(max),
         None => Depth::AtLeast(max),
     };
-    // A routine on a cycle gets a different answer depending on where
-    // the walk entered the cycle, so only acyclic results are kept.
-    if !matches!(depth, Depth::Unbounded(_)) {
-        memo.insert(entry, depth.clone());
-    }
+    // An unbounded result is kept too: a repeat without a declared
+    // routine in the lap is a real cycle whichever way the walk came,
+    // only the cycle it names depends on that. Without the memo every
+    // caller of a cycle walks it again.
+    memo.insert(key, depth.clone());
     depth
 }
 
@@ -802,6 +838,21 @@ mod tests {
         assert_eq!(report(&r, "leaf").depth, Depth::Exact(32));
         assert!(matches!(report(&r, "rec").depth, Depth::Unbounded(ref c) if c == "rec -> rec"));
         assert!(matches!(report(&r, "main").depth, Depth::Unbounded(ref c) if c == "rec -> rec"));
+    }
+
+    /// `RECURSES rec,1`: `rec` may be active twice. Each level pushes D1
+    /// and a return address for the call to the next (the innermost one's
+    /// call is the one the declaration rules out, but its return address
+    /// is still charged, an upper bound); the undeclared cycle through
+    /// `other` stays unbounded.
+    #[test]
+    fn declared_recursion_has_a_depth() {
+        let (r, _) = analyze(
+            "\tRECURSES rec,1\nmain:\tbsr rec\n\trts\nrec:\tmove.l d1,-(sp)\n\tbsr rec\n\tmove.l (sp)+,d1\n\trts\nother:\tbsr other\n\trts\n",
+        );
+        assert_eq!(report(&r, "rec").depth, Depth::Exact(16));
+        assert_eq!(report(&r, "main").depth, Depth::Exact(20));
+        assert!(matches!(report(&r, "other").depth, Depth::Unbounded(_)));
     }
 
     #[test]

@@ -81,8 +81,9 @@ struct Args {
     stack_check: bool,
 
     /// Write a report of the maximum stack depth of every routine,
-    /// including everything it calls; recursion is marked unbounded and
-    /// an unknown callee makes the figure a lower bound
+    /// including everything it calls; recursion is marked unbounded unless
+    /// RECURSES declares its depth, and an unknown callee makes the figure
+    /// a lower bound
     #[arg(long, value_name = "FILE")]
     stack_report: Option<PathBuf>,
 

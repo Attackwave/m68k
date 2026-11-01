@@ -1796,6 +1796,7 @@ fn is_directive_name(name: &str) -> bool {
             | "page"
             | "title"
             | "noreturn"
+            | "recurses"
     )
 }
 
@@ -1924,6 +1925,9 @@ pub struct Assembler {
     instr_infos: Vec<crate::analysis::InstrInfo>,
     /// Addresses `NORETURN` declared as never returning when called.
     noreturn: std::collections::HashSet<u32>,
+    /// Routines `RECURSES` declared to re-enter themselves at most this
+    /// many times, by entry address.
+    recursion: std::collections::HashMap<u32, u32>,
     /// Most recent global (non-local) label, used to scope local labels.
     ///
     /// A local label (`.loop`) belongs to the global label above it, so
@@ -2049,6 +2053,7 @@ impl Assembler {
             dependencies: Vec::new(),
             instr_infos: Vec::new(),
             noreturn: std::collections::HashSet::new(),
+            recursion: std::collections::HashMap::new(),
             conditional_stack: Vec::new(),
             macro_definitions: HashMap::new(),
             macro_unique_counter: 0,
@@ -3544,7 +3549,7 @@ impl Assembler {
             | "ifc" | "ifnc" | "else" | "endif" | "endc" | "macro" | "endm" | "rept" | "irp"
             | "irpc" | "endr" | "xref" | "xdef" | "public" | "extern" | "opt" | "mexit"
             | "exitm" | "print" | "printt" | "printv" | "list" | "nolist" | "page" | "title"
-            | "noreturn" => Ok(0),
+            | "noreturn" | "recurses" => Ok(0),
             // Optimisation and code-placement hints. This assembler resolves
             // everything to absolute addresses and performs no branch
             // shortening beyond the relaxation pass, so there is nothing for
@@ -3922,6 +3927,7 @@ impl Assembler {
         self.code.clear();
         self.instr_infos.clear();
         self.noreturn.clear();
+        self.recursion.clear();
         self.conditional_stack.clear();
         // Local labels resolve against the enclosing global label, so the
         // scope has to be rebuilt from the start of the source, exactly as
@@ -4114,7 +4120,12 @@ impl Assembler {
     /// Stack balance and depth per routine over the last assembled
     /// program. See [`crate::analysis`].
     pub fn stack_analysis(&self) -> Vec<crate::analysis::RoutineReport> {
-        crate::analysis::stack_analysis(&self.instr_infos, &self.routine_entries(), &self.noreturn)
+        crate::analysis::stack_analysis(
+            &self.instr_infos,
+            &self.routine_entries(),
+            &self.noreturn,
+            &self.recursion,
+        )
     }
 
     /// Flag-setting instructions whose result nothing reads.
@@ -4843,6 +4854,31 @@ impl Assembler {
                     })?;
                     self.noreturn.insert(value);
                 }
+                Ok(())
+            }
+            // `RECURSES sym,n`: the routine is re-entered at most `n` times
+            // while already active, so its recursion has a depth. Only the
+            // stack analysis reads it.
+            "recurses" => {
+                let [name, depth] = args else {
+                    return Err(AsmError::with_line(
+                        "RECURSES: expected `routine,depth`",
+                        line.line_no,
+                    ));
+                };
+                let entry = self.symbols.resolve(name).map_err(|e| {
+                    AsmError::with_line(format!("RECURSES: {}", e.message), line.line_no)
+                })?;
+                let depth = evaluate_expr_str(depth, &self.symbols, self.pc).map_err(|e| {
+                    AsmError::with_line(format!("RECURSES: {}", e.message), line.line_no)
+                })?;
+                let depth = u32::try_from(depth).map_err(|_| {
+                    AsmError::with_line(
+                        format!("RECURSES: depth {depth} is not a count"),
+                        line.line_no,
+                    )
+                })?;
+                self.recursion.insert(entry, depth);
                 Ok(())
             }
             "opt" => {
