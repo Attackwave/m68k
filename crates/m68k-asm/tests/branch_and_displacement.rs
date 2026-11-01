@@ -339,10 +339,11 @@ v:  DC.L 0
     let (bytes, _) = assemble_with_symbols(source, true)
         .expect("an address outside short range must keep the long form, not fail");
 
-    // clr.l, lea and move.l each in their long-absolute encoding.
+    // clr.l and move.l in their long-absolute encoding; lea of a label
+    // in reach takes the PC-relative form instead.
     assert_eq!(&bytes[0..2], &[0x42, 0xB9], "clr.l must stay long");
-    assert_eq!(&bytes[6..8], &[0x41, 0xF9], "lea must stay long");
-    assert_eq!(&bytes[12..14], &[0x20, 0x39], "move.l must stay long");
+    assert_eq!(&bytes[6..8], &[0x41, 0xFA], "lea takes (d16,PC)");
+    assert_eq!(&bytes[10..12], &[0x20, 0x39], "move.l must stay long");
 }
 
 /// The whole range, in one place: what shortens and what does not.
@@ -605,4 +606,135 @@ fn a_missing_include_at_the_top_level_has_no_file_of_its_own() {
 
     assert_eq!(err.file, None, "top level: the caller knows the name");
     assert_eq!(err.line_no, Some(4));
+}
+
+/// `--optimize` relaxes a jump to a label into a branch and an LEA/PEA of
+/// a label into the PC-relative form; the symbol table follows the
+/// shrunk layout. An EQU is not a label and keeps the absolute form, as
+/// does a target out of 16-bit reach.
+#[test]
+fn jumps_and_lea_to_labels_relax_to_pc_relative_when_optimizing() {
+    let source = "\
+HW      equ     $dff000
+start:  jsr     near
+        jmp     near
+        lea     near,a0
+        pea     near
+        jsr     HW
+        lea     HW,a1
+        jsr     far
+        lea     far,a2
+        jsr     (a0)
+near:   rts
+        dcb.b   40000,0
+far:    rts
+end:
+";
+    let (plain, symbols) = assemble_with_symbols(source, false).expect("must assemble");
+    assert_eq!(
+        &plain[0..2],
+        &[0x4E, 0xB9],
+        "JSR stays absolute without --optimize"
+    );
+    let base = symbol(&symbols, "start").expect("start");
+    assert_eq!(symbol(&symbols, "near"), Some(base + 6 * 8 + 2));
+
+    let (bytes, symbols) = assemble_with_symbols(source, true).expect("must assemble");
+    // near is 2 + 2 + 4 + 4 + 6 + 6 + 6 + 6 + 2 bytes past start
+    let near = (symbol(&symbols, "near").expect("near") - base) as usize;
+    assert_eq!(near, 38, "{symbols:?}");
+    let w = |i: usize| u16::from_be_bytes([bytes[i], bytes[i + 1]]);
+    assert_eq!(
+        w(0),
+        0x6100 | ((near - 2) as u16 & 0xFF),
+        "jsr near -> BSR.S"
+    );
+    assert_eq!(
+        w(2),
+        0x6000 | ((near - 4) as u16 & 0xFF),
+        "jmp near -> BRA.S"
+    );
+    assert_eq!(
+        [w(4), w(6)],
+        [0x41FA, (near - 6) as u16],
+        "lea near,a0 -> (d16,PC)"
+    );
+    assert_eq!(
+        [w(8), w(10)],
+        [0x487A, (near - 10) as u16],
+        "pea near -> (d16,PC)"
+    );
+    assert_eq!(
+        [w(12), w(14), w(16)],
+        [0x4EB9, 0x00DF, 0xF000],
+        "jsr EQU stays absolute"
+    );
+    assert_eq!(w(18), 0x43F9, "lea EQU,a1 stays absolute");
+    assert_eq!(w(24), 0x4EB9, "jsr far stays absolute");
+    assert_eq!(w(30), 0x45F9, "lea far,a2 stays absolute");
+    assert_eq!(w(36), 0x4E90, "jsr (a0) is untouched");
+    assert_eq!(
+        symbol(&symbols, "end"),
+        Some(base + bytes.len() as u32),
+        "symbols follow the image"
+    );
+}
+
+/// A program with more than one section keeps every absolute form: the
+/// distance between sections is not fixed. Both sections of this image
+/// share an origin, so only the symbols say what was encoded.
+#[test]
+fn two_sections_keep_absolute_jumps_when_optimizing() {
+    let source = "\
+        section text
+start:  jsr     sub
+        lea     sub,a0
+sub:    rts
+        section data
+tab:    dc.w    1
+";
+    let (_, symbols) = assemble_with_symbols(source, true).expect("must assemble");
+    let at = |name: &str| symbol(&symbols, name).expect(name);
+    assert_eq!(at("sub") - at("start"), 6 + 6, "{symbols:?}");
+}
+
+/// A branch to the instruction right after it has displacement 2 in the
+/// word form and 0 once shortened, which the short form cannot encode:
+/// `--optimize` must keep the word form rather than fail.
+#[test]
+fn branch_to_the_next_instruction_keeps_the_word_form_when_optimizing() {
+    let source = "start:  bra     next\nnext:   nop\n        jsr     next\n";
+    let (bytes, _) = assemble_with_symbols(source, true).expect("must assemble");
+    assert_eq!(&bytes[0..4], &[0x60, 0x00, 0x00, 0x02], "{bytes:02X?}");
+    // The JSR backwards is short: the target does not move with it.
+    assert_eq!(&bytes[6..8], &[0x61, 0xFC], "{bytes:02X?}");
+}
+
+/// During relaxation a label further down still holds the previous
+/// round's address. Once the layout moved by more than a brief index
+/// displacement can span, the trial encoding of `.tab(PC,D0.W)` failed
+/// and its size estimate fell to a placeholder, which pass 2 then
+/// exceeded: every label after it was off. The layout has to settle
+/// before pass 2 runs.
+#[test]
+fn layout_settles_when_estimates_depend_on_moved_labels() {
+    let mut source = String::from("start:\n");
+    for _ in 0..80 {
+        source.push_str("        jsr     sub\n");
+    }
+    source.push_str(
+        "f:      move.b  .tab(pc,d0.w),(a1)+\n        rts\n.tab:   dc.b    0,1,2,3\nsub:    rts\nend:\n",
+    );
+    let (bytes, symbols) = assemble_with_symbols(&source, true).expect("must assemble");
+    let at = |name: &str| symbol(&symbols, name).expect(name);
+    let start = at("start");
+    assert_eq!(
+        at("end"),
+        start + bytes.len() as u32,
+        "symbols follow the image: {symbols:?}"
+    );
+    // move.b (d8,PC,D0.W): opword, then the brief extension with d8 = 4
+    // (the rts between the move and the table).
+    let f = (at("f") - start) as usize;
+    assert_eq!(&bytes[f..f + 4], &[0x12, 0xFB, 0x00, 0x04], "{bytes:02X?}");
 }

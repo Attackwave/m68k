@@ -3146,8 +3146,11 @@ impl Assembler {
                 // is one byte off.
                 let pad = if self.pc.is_multiple_of(2) { 0 } else { 1 };
 
-                // For branch instructions, record them for relaxation
-                let is_branch = is_branch_mnemonic(mnemonic);
+                // For branch instructions, record them for relaxation;
+                // with optimization on, a jump or LEA/PEA to a plain
+                // symbol joins them (see `relaxes_to_pc_relative`).
+                let is_branch = is_branch_mnemonic(mnemonic)
+                    || self.relaxes_to_pc_relative(mnemonic, operand_texts);
                 if is_branch {
                     // Estimate with word-sized branch (conservative)
                     let estimated_size = estimate_branch_size(mnemonic);
@@ -3660,14 +3663,22 @@ impl Assembler {
     fn relax_branches(&mut self, lines: &[ParsedLine]) -> Result<(), AsmError> {
         let mut changed = true;
         let mut iterations = 0;
-        const MAX_ITERATIONS: usize = 10;
+        const MAX_ITERATIONS: usize = 64;
 
         while changed && iterations < MAX_ITERATIONS {
             changed = false;
             iterations += 1;
 
-            // Recalculate PCs with current branch sizes
+            // Recalculate PCs with current branch sizes. A size estimate
+            // reads the symbol table, where a label further down still
+            // holds the previous round's address; it settles only once a
+            // round leaves every address where it was, so the loop runs
+            // until the layout is a fixed point, not just the hints.
+            let before = std::mem::take(&mut self.line_pcs);
             self.recalculate_pcs(lines);
+            if self.line_pcs != before {
+                changed = true;
+            }
 
             // Check each branch (use index to avoid borrow conflicts)
             for i in 0..self.branches.len() {
@@ -3694,8 +3705,12 @@ impl Assembler {
                     .map(|v| v as u32);
 
                 if let Some(target) = target_addr {
-                    let new_size =
-                        self.determine_branch_size(&mnemonic, branch_pc, target, size_hint);
+                    let label = self.pc_relative_target(target_text.as_deref().unwrap_or(""));
+                    let new_size = if is_pc_relaxable(&mnemonic) && !label {
+                        BranchSize::Long
+                    } else {
+                        self.determine_branch_size(&mnemonic, branch_pc, target, size_hint, label)
+                    };
 
                     if new_size != self.branches[i].size_hint {
                         self.branches[i].size_hint = new_size;
@@ -3705,9 +3720,13 @@ impl Assembler {
             }
         }
 
-        if iterations >= MAX_ITERATIONS {
-            self.errors
-                .warning("branch relaxation did not converge", None);
+        if changed {
+            // A layout that never settled leaves pass 2 encoding against
+            // addresses pass 1 did not budget for: a wrong image with a
+            // wrong symbol table, which no warning makes acceptable.
+            return Err(AsmError::new(format!(
+                "branch relaxation did not converge in {MAX_ITERATIONS} iterations"
+            )));
         }
 
         Ok(())
@@ -3818,7 +3837,7 @@ impl Assembler {
     /// Estimate line size considering current branch relaxation state.
     fn estimate_line_size_with_branches(&mut self, line: &ParsedLine) -> Result<u32, AsmError> {
         if let LineType::Instruction { mnemonic, .. } = &line.line_type
-            && is_branch_mnemonic(mnemonic)
+            && (is_branch_mnemonic(mnemonic) || is_pc_relaxable(mnemonic))
             && let Some(branch) = self
                 .branches
                 .iter()
@@ -3857,6 +3876,7 @@ impl Assembler {
         branch_pc: u32,
         target: u32,
         hint: BranchSize,
+        target_is_label: bool,
     ) -> BranchSize {
         // DBcc always uses word displacement. `mnemonic` here is
         // lowercase (as produced by the parser), matching is_dbcc_mnemonic.
@@ -3877,17 +3897,42 @@ impl Assembler {
         // those displacements (see encode_bra/encode_bsr/enc_bcc) — the
         // size estimate must agree.
         let disp = target as i32 - branch_pc as i32 - 2;
+        // The displacement is measured with the instruction at its
+        // current size. Shrinking it moves a label further down closer by
+        // the bytes it loses (a numeric target stays put), so a form is
+        // judged by the displacement it will have once chosen: `BRA next`
+        // over nothing is 2 bytes to the next word-form instruction and 0
+        // to the next short-form one, which the short form cannot encode.
+        let now = branch_size_bytes(mnemonic, &BranchSize::Any) as i32;
+        let after = |form: BranchSize| -> i32 {
+            let shrink = now - branch_size_bytes(mnemonic, &form) as i32;
+            if target_is_label && target > branch_pc {
+                disp - shrink
+            } else {
+                disp
+            }
+        };
+        let fits_short = |d: i32| (-128..=127).contains(&d) && d != 0 && d != -1;
+
+        if is_pc_relaxable(mnemonic) {
+            // JSR/JMP become BSR/BRA, LEA/PEA take (d16,PC), whose
+            // extension word also sits at pc + 2. Out of reach, the
+            // absolute long form stays, on every CPU.
+            return if matches!(mnemonic, "jsr" | "jmp") && fits_short(after(BranchSize::Short)) {
+                BranchSize::Short
+            } else if (-32768..=32767).contains(&after(BranchSize::Word)) {
+                BranchSize::Word
+            } else {
+                BranchSize::Long
+            };
+        }
 
         // Shrinking a branch to its 8-bit form is an optimization, so it
         // only happens when optimization is on — without it, Motorola-
         // syntax assemblers emit the word form for an unsuffixed branch
         // (`BRA label` -> 6000 fffc, not 60fc). An explicit `.S`/`.B`
         // suffix arrives here as a Short hint and is honoured either way.
-        if self.symbols.optimize_absolute()
-            && (-128..=127).contains(&disp)
-            && disp != 0
-            && disp != -1
-        {
+        if self.symbols.optimize_absolute() && fits_short(after(BranchSize::Short)) {
             BranchSize::Short
         } else if (-32768..=32767).contains(&disp) {
             BranchSize::Word
@@ -4249,6 +4294,16 @@ impl Assembler {
         let src = operand_texts.first().and_then(|t| parse_operand(t));
         let dst = operand_texts.get(1).and_then(|t| parse_operand(t));
 
+        if is_pc_relaxable(mnemonic)
+            && let Some(hint) = self
+                .branches
+                .iter()
+                .find(|b| b.line_no == Some(line.line_no))
+                .map(|b| b.size_hint)
+        {
+            return self.encode_pc_relaxed(mnemonic, &src, &dst, hint, line);
+        }
+
         // For branch instructions, the target operand is the first (and only) operand
         // but the encoder expects it as dst
         if is_branch_mnemonic(mnemonic) {
@@ -4523,6 +4578,119 @@ impl Assembler {
             byte_len: None,
         });
 
+        self.pc += (word_count * 2) as u32;
+        Ok(())
+    }
+
+    /// Whether `--optimize` may relax this instruction to a PC-relative
+    /// form (see [`is_pc_relaxable`]). Only a target written as a plain
+    /// symbol qualifies; whether that symbol is a label of this one
+    /// section is settled during relaxation, once every label is defined
+    /// ([`Self::pc_relative_target`]).
+    fn relaxes_to_pc_relative(&self, mnemonic: &str, operand_texts: &[String]) -> bool {
+        if !self.symbols.optimize_absolute() || !is_pc_relaxable(mnemonic) {
+            return false;
+        }
+        let operands = if mnemonic == "lea" { 2 } else { 1 };
+        if operand_texts.len() != operands {
+            return false;
+        }
+        let target = self.apply_register_aliases(&operand_texts[0]);
+        let plain_symbol = target
+            .starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '.')
+            && target
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.');
+        plain_symbol
+            && parse_register(&target).is_none()
+            && (mnemonic != "lea"
+                || matches!(
+                    parse_register(&self.apply_register_aliases(&operand_texts[1])),
+                    Some(Operand::AddrReg(_))
+                ))
+    }
+
+    /// A PC-relative reference holds only when the target keeps its
+    /// distance from the instruction: a label (not an EQU, which may name
+    /// hardware) of a program that is one section.
+    fn pc_relative_target(&self, name: &str) -> bool {
+        self.sections.iter_sections().count() <= 1
+            && self
+                .symbols
+                .get(name.trim())
+                .is_some_and(|e| e.defined && e.section.is_some())
+    }
+
+    /// Encode a JSR/JMP/LEA/PEA that joined the relaxation: as BSR/BRA or
+    /// `(d16,PC)` in the size relaxation settled on, or in its absolute
+    /// long form (`Long`) when the target is out of reach or no label.
+    fn encode_pc_relaxed(
+        &mut self,
+        mnemonic: &str,
+        src: &Option<Operand>,
+        dst: &Option<Operand>,
+        hint: BranchSize,
+        line: &ParsedLine,
+    ) -> Result<(), AsmError> {
+        let pc = self.pc;
+        let target = match src {
+            Some(Operand::Address(a) | Operand::Immediate(a) | Operand::Memory(a)) => *a as u32,
+            Some(Operand::AbsoluteShort(a) | Operand::AbsoluteLong(a)) => *a as u32,
+            _ => {
+                return Err(AsmError::with_line(
+                    format!("{mnemonic} requires a label or address target"),
+                    line.line_no,
+                ));
+            }
+        };
+        let areg = match (mnemonic, dst) {
+            ("lea", Some(Operand::AddrReg(n))) => u16::from(*n) << 9,
+            ("lea", _) => {
+                return Err(AsmError::with_line(
+                    "LEA requires an address register destination",
+                    line.line_no,
+                ));
+            }
+            _ => 0,
+        };
+        let disp = target as i32 - pc as i32 - 2;
+        let absolute = |op: u16| vec![op, (target >> 16) as u16, target as u16];
+        let at_line = |e: AsmError| AsmError::with_line(e.message, line.line_no);
+        let words = if matches!(hint, BranchSize::Long | BranchSize::Any) {
+            match mnemonic {
+                "jsr" => absolute(0x4EB9),
+                "jmp" => absolute(0x4EF9),
+                "lea" => absolute(0x41F9 | areg),
+                _ => absolute(0x4879),
+            }
+        } else {
+            match mnemonic {
+                "jsr" => self.encode_bsr(disp, hint).map_err(at_line)?,
+                "jmp" => self.encode_bra(disp, hint).map_err(at_line)?,
+                _ => {
+                    if !(-32768..=32767).contains(&disp) {
+                        return Err(AsmError::with_line(
+                            format!("{mnemonic}: PC-relative displacement out of range"),
+                            line.line_no,
+                        ));
+                    }
+                    let op = if mnemonic == "lea" {
+                        0x41FA | areg
+                    } else {
+                        0x487A
+                    };
+                    vec![op, (disp & 0xFFFF) as u16]
+                }
+            }
+        };
+        let word_count = words.len();
+        self.push_instruction(AssembledInstruction {
+            pc,
+            words,
+            line_no: Some(line.line_no),
+            source: Some(line.raw.clone()),
+            byte_len: None,
+        });
         self.pc += (word_count * 2) as u32;
         Ok(())
     }
@@ -5266,6 +5434,12 @@ impl Assembler {
 // ---------------------------------------------------------------------------
 
 /// Check if a mnemonic is a branch instruction.
+/// Instructions `--optimize` may relax to a PC-relative form: JSR/JMP to
+/// BSR/BRA, LEA/PEA to `(d16,PC)`.
+fn is_pc_relaxable(mnemonic: &str) -> bool {
+    matches!(mnemonic, "jsr" | "jmp" | "lea" | "pea")
+}
+
 fn is_branch_mnemonic(mnemonic: &str) -> bool {
     matches!(
         mnemonic,
@@ -5611,6 +5785,11 @@ fn packed_decimal_words(text: &str, line_no: usize) -> Result<Vec<u16>, AsmError
 
 /// Estimate branch instruction size in bytes (for pass 1).
 fn estimate_branch_size(mnemonic: &str) -> u32 {
+    if is_pc_relaxable(mnemonic) {
+        // The absolute long form it is written in; relaxation only
+        // shrinks it, so no other size decision is invalidated.
+        return 6;
+    }
     if mnemonic.starts_with("db") {
         // DBcc is always 4 bytes (opword + word disp)
         4
@@ -5624,6 +5803,13 @@ fn estimate_branch_size(mnemonic: &str) -> u32 {
 fn branch_size_bytes(mnemonic: &str, hint: &BranchSize) -> u32 {
     if mnemonic.starts_with("db") {
         return 4; // DBcc always 4 bytes
+    }
+    if is_pc_relaxable(mnemonic) {
+        return match hint {
+            BranchSize::Short => 2,
+            BranchSize::Word => 4,
+            BranchSize::Long | BranchSize::Any => 6,
+        };
     }
 
     match hint {

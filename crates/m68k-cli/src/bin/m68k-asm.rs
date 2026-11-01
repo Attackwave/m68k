@@ -40,10 +40,12 @@ struct Args {
     #[arg(short = 'I', long = "include", value_name = "DIR")]
     include_paths: Vec<PathBuf>,
 
-    /// Enable size-changing optimizations: encode an absolute address
-    /// that fits in 16 bits as absolute-short. Off by default, so output
-    /// matches assemblers running without optimization; an explicit `.W`
-    /// suffix always yields the short form regardless.
+    /// Enable size-changing optimizations: an absolute address that fits
+    /// in 16 bits becomes absolute-short, an unsuffixed branch in range
+    /// the 8-bit form, a JSR/JMP to a label in reach BSR/BRA, an LEA/PEA
+    /// of such a label the (d16,PC) form. Off by default, so output
+    /// matches assemblers running without optimization; an explicit size
+    /// suffix always wins
     #[arg(long)]
     optimize: bool,
 
@@ -196,6 +198,36 @@ fn depfile_contents(target: &Path, source: Option<&Path>, deps: &[PathBuf]) -> S
 
 /// A mnemonic that is an instruction, as opposed to data or a directive,
 /// so a missing timing is worth counting.
+/// The instruction as encoded, where `--optimize` relaxed it: BSR/BRA
+/// for a JSR/JMP, `(d16,PC)` for an LEA/PEA of an absolute address.
+fn relaxed_form(
+    words: &[u16],
+    mnemonic: String,
+    size: String,
+    mut operands: Vec<String>,
+) -> (String, String, Vec<String>) {
+    let Some(&op) = words.first() else {
+        return (mnemonic, size, operands);
+    };
+    match mnemonic.to_ascii_lowercase().as_str() {
+        "jsr" if op & 0xFF00 == 0x6100 => ("bsr".into(), branch_form(op), operands),
+        "jmp" if op & 0xFF00 == 0x6000 => ("bra".into(), branch_form(op), operands),
+        "lea" | "pea" if op & 0x3F == 0x3A && !operands.is_empty() => {
+            operands[0] = "(0,pc)".into();
+            (mnemonic, size, operands)
+        }
+        _ => (mnemonic, size, operands),
+    }
+}
+
+fn branch_form(op: u16) -> String {
+    if op & 0xFF == 0 {
+        "w".into()
+    } else {
+        "s".into()
+    }
+}
+
 fn is_timed_instruction(mnemonic: &str) -> bool {
     !mnemonic.is_empty() && !m68k_core::tokens::is_directive(mnemonic)
 }
@@ -545,6 +577,10 @@ fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Re
             // moved to column 0 would read as a label and lose its cycles.
             let source = instr.source.as_deref().unwrap_or("").trim_end();
             let (_, mnemonic, size, operands) = m68k_core::tokens::split_line(source);
+            // `--optimize` may have relaxed a JSR/JMP to BSR/BRA and an
+            // LEA/PEA to the PC-relative form: the opword says which was
+            // emitted, and the timing follows the opword, not the text.
+            let (mnemonic, size, operands) = relaxed_form(&instr.words, mnemonic, size, operands);
             let timing = m68k_core::cycles::instruction_timing(&mnemonic, &size, &operands);
             let cycles = match &timing {
                 Some(t) => {
