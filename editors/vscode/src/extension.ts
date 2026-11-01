@@ -15,9 +15,21 @@ function tool(context: vscode.ExtensionContext, name: string): string {
   return exe;
 }
 
+/// `m68k.mainFile` as an absolute path, or undefined when not set.
+function mainFile(): string | undefined {
+  const name = vscode.workspace.getConfiguration('m68k').get<string>('mainFile');
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+  return name && root ? path.resolve(root, name) : undefined;
+}
+
 async function startClient(context: vscode.ExtensionContext) {
-  const cpu = vscode.workspace.getConfiguration('m68k').get<string>('cpu', '68000');
-  const serverOptions: ServerOptions = { command: tool(context, 'm68k-lsp'), args: ['--cpu', cpu] };
+  const cfg = vscode.workspace.getConfiguration('m68k');
+  const root = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? '';
+  const args = ['--cpu', cfg.get<string>('cpu', '68000')];
+  for (const dir of cfg.get<string[]>('includePaths', [])) args.push('-I', path.resolve(root, dir));
+  const main = mainFile();
+  if (main) args.push('--main', main);
+  const serverOptions: ServerOptions = { command: tool(context, 'm68k-lsp'), args };
   const clientOptions: LanguageClientOptions = {
     documentSelector: [{ scheme: 'file', language: 'm68k' }],
   };
@@ -71,8 +83,11 @@ function debugConfigurations(context: vscode.ExtensionContext): vscode.DebugConf
         }
         config = { type: 'm68k', request: 'launch', name: 'Debug in UAE', stopOnEntry: true };
       }
-      if (!config.program && doc?.languageId === 'm68k') {
-        config.program = doc.uri.fsPath.replace(/\.[^./\\]+$/, '');
+      // The program is the main file when one is set; the active file is
+      // then usually one of its includes.
+      const source = mainFile() ?? (doc?.languageId === 'm68k' ? doc.uri.fsPath : undefined);
+      if (!config.program && source) {
+        config.program = source.replace(/\.[^./\\]+$/, '');
       }
       const cfg = vscode.workspace.getConfiguration('m68k');
       config.emulator ??= cfg.get<string>('emulator') || undefined;
@@ -89,10 +104,10 @@ function debugConfigurations(context: vscode.ExtensionContext): vscode.DebugConf
         if (pick !== 'Attach') return undefined;
       }
 
-      const scope = doc && vscode.workspace.getWorkspaceFolder(doc.uri);
-      if (config.build !== false && doc?.languageId === 'm68k' && scope) {
-        await doc.save();
-        const file = path.relative(scope.uri.fsPath, doc.uri.fsPath);
+      const scope = source && vscode.workspace.getWorkspaceFolder(vscode.Uri.file(source));
+      if (config.build !== false && source && scope) {
+        await vscode.workspace.saveAll(false);
+        const file = path.relative(scope.uri.fsPath, source);
         const output = path.relative(scope.uri.fsPath, config.program);
         const code = await runTask(buildTask(context, { type: 'm68k', file, output, linedebug: true }, scope));
         if (code !== 0) return undefined; // errors are in the Problems panel
@@ -179,7 +194,7 @@ export async function activate(context: vscode.ExtensionContext) {
       await startClient(context);
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration('m68k.cpu') || e.affectsConfiguration('m68k.toolsPath')) {
+      if (['m68k.cpu', 'm68k.toolsPath', 'm68k.includePaths', 'm68k.mainFile'].some((k) => e.affectsConfiguration(k))) {
         vscode.commands.executeCommand('m68k.restartServer');
       }
     })

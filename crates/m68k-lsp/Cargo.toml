@@ -16,7 +16,7 @@ path = "src/main.rs"
 m68k-core = { path = "../m68k-core" }
 m68k-asm = { path = "../m68k-asm" }
 tower-lsp = "0.20.0"
-tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "io-std"] }
+tokio = { version = "1.38", features = ["rt-multi-thread", "macros", "io-std", "time"] }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

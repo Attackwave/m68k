@@ -88,3 +88,44 @@ lsp.stdout.on('data', (chunk) => {
   }
 });
 send({ id: 1, method: 'initialize', params: { processId: null, rootUri: null, capabilities: {} } });
+
+// Main-file mode: an included file opened on its own is checked as part of
+// the program, so a symbol from the includer is known and only the file's
+// own fault is reported, on its own line, from the unsaved text.
+fs.writeFileSync(path.join(dir, 'main.s'), 'SIZE equ 4\n  include "inc.s"\n  rts\n');
+fs.writeFileSync(path.join(dir, 'inc.s'), '  moveq #SIZE,d0\n');
+const unit = spawn(bin('m68k-lsp'), ['--main', path.join(dir, 'main.s')]);
+const sendUnit = (msg) => {
+  const body = JSON.stringify({ jsonrpc: '2.0', ...msg });
+  unit.stdin.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
+};
+const incUri = 'file://' + path.join(dir, 'inc.s');
+let unitBuf = Buffer.alloc(0);
+const unitTimer = setTimeout(() => { unit.kill(); assert.fail('m68k-lsp --main did not publish diagnostics'); }, 5000);
+unit.stdout.on('data', (chunk) => {
+  unitBuf = Buffer.concat([unitBuf, chunk]);
+  for (;;) {
+    const sep = unitBuf.indexOf('\r\n\r\n');
+    if (sep < 0) return;
+    const len = +/Content-Length: (\d+)/.exec(unitBuf.subarray(0, sep).toString())[1];
+    if (unitBuf.length < sep + 4 + len) return;
+    const msg = JSON.parse(unitBuf.subarray(sep + 4, sep + 4 + len).toString('utf8'));
+    unitBuf = unitBuf.subarray(sep + 4 + len);
+    if (msg.id === 1) {
+      sendUnit({ method: 'initialized', params: {} });
+      sendUnit({
+        method: 'textDocument/didOpen',
+        params: { textDocument: { uri: incUri, languageId: 'm68k', version: 1, text: '  moveq #SIZE,d0\n  bogus d0\n' } },
+      });
+    }
+    if (msg.method === 'textDocument/publishDiagnostics' && msg.params.uri === incUri) {
+      assert.deepStrictEqual(msg.params.diagnostics.map((d) => d.range.start.line), [1]);
+      assert.match(msg.params.diagnostics[0].message, /BOGUS/);
+      clearTimeout(unitTimer);
+      unit.kill();
+      console.log('ok (main file)');
+      return;
+    }
+  }
+});
+sendUnit({ id: 1, method: 'initialize', params: { processId: null, rootUri: null, capabilities: {} } });

@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::RwLock;
 
 use tower_lsp::jsonrpc::Result;
@@ -10,7 +11,7 @@ use tower_lsp::{Client, LanguageServer};
 
 use crate::completion::compute_completion;
 use crate::definition::compute_definition;
-use crate::diagnostics::{LinterConfig, compute_diagnostics};
+use crate::diagnostics::{LinterConfig, compute_diagnostics, compute_unit_diagnostics};
 use crate::document::Document;
 use crate::formatting::compute_formatting;
 use crate::hover::compute_hover;
@@ -29,6 +30,9 @@ pub struct Backend {
     pub documents: Arc<RwLock<HashMap<Url, Document>>>,
     pub workspace: Arc<RwLock<WorkspaceIndex>>,
     pub config: Arc<RwLock<LinterConfig>>,
+    /// Counts validation requests, so a run started before the next
+    /// edit publishes nothing stale.
+    generation: Arc<AtomicU64>,
 }
 
 impl Backend {
@@ -38,6 +42,7 @@ impl Backend {
             documents: Arc::new(RwLock::new(HashMap::new())),
             workspace: Arc::new(RwLock::new(WorkspaceIndex::new())),
             config: Arc::new(RwLock::new(LinterConfig::default())),
+            generation: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -59,13 +64,39 @@ impl Backend {
     }
 
     async fn validate_document(&self, uri: &Url) {
+        let config = self.config.read().await.clone();
+        let Some(main) = config.main_file.clone() else {
+            let docs = self.documents.read().await;
+            if let Some(doc) = docs.get(uri) {
+                let diags = compute_diagnostics(doc, &config);
+                self.client
+                    .publish_diagnostics(uri.clone(), diags, Some(doc.version))
+                    .await;
+            }
+            return;
+        };
+        // One assembly of the main program covers every open document, so
+        // all of them are republished. A large program takes seconds:
+        // wait for the typing to pause, and keep the executor free.
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
+        let docs = self.documents.read().await.clone();
+        let Ok(results) =
+            tokio::task::spawn_blocking(move || compute_unit_diagnostics(&main, &docs, &config))
+                .await
+        else {
+            return;
+        };
+        if self.generation.load(Ordering::SeqCst) != generation {
+            return;
+        }
         let docs = self.documents.read().await;
-        if let Some(doc) = docs.get(uri) {
-            let config = *self.config.read().await;
-            let diags = compute_diagnostics(doc, &config);
-            self.client
-                .publish_diagnostics(uri.clone(), diags, Some(doc.version))
-                .await;
+        for (uri, diags) in results {
+            let version = docs.get(&uri).map(|d| d.version);
+            self.client.publish_diagnostics(uri, diags, version).await;
         }
     }
 }

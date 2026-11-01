@@ -1,6 +1,7 @@
 //! Language Server binary entry point for m68k-lsp.
 
 use clap::Parser;
+use std::path::PathBuf;
 use tower_lsp::{LspService, Server};
 
 use m68k_core::cpu_gate::validate_cpu_name;
@@ -17,6 +18,15 @@ struct Cli {
     /// Target CPU model (68000, 68010, 68020, 68030, 68040, 68060)
     #[arg(short, long, default_value = "68000")]
     cpu: String,
+
+    /// Add a directory to the INCLUDE search path (repeatable)
+    #[arg(short = 'I', long = "include", value_name = "DIR")]
+    include_paths: Vec<PathBuf>,
+
+    /// Program to assemble for diagnostics: a file it includes is checked
+    /// as part of it instead of on its own
+    #[arg(long, value_name = "FILE")]
+    main: Option<PathBuf>,
 
     /// Communicate via stdio (default mode for LSP clients)
     #[arg(long, default_value = "true")]
@@ -46,11 +56,19 @@ async fn main() {
 
     let (service, socket) = LspService::build(|client| {
         let backend = Backend::new(client);
-        // Set initial configured CPU
-        let config_clone = backend.config.clone();
+        let config = LinterConfig {
+            cpu: min_cpu,
+            include_paths: args.include_paths.clone(),
+            main_file: args.main.clone(),
+        };
+        let config_slot = backend.config.clone();
+        let workspace = backend.workspace.clone();
         tokio::spawn(async move {
-            let mut cfg = config_clone.write().await;
-            *cfg = LinterConfig { cpu: min_cpu };
+            let mut ws = workspace.write().await;
+            for dir in &config.include_paths {
+                ws.add_include_dir(dir.clone());
+            }
+            *config_slot.write().await = config;
         });
         backend
     })

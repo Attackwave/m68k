@@ -1914,6 +1914,9 @@ pub struct Assembler {
     /// Debug info needs a path a debugger can open; diagnostics keep the
     /// short name.
     pub include_paths_resolved: HashMap<String, PathBuf>,
+    /// Text to use instead of the file on disk, by absolute path: an
+    /// editor's unsaved buffers, so diagnostics follow what is typed.
+    pub file_overlays: HashMap<PathBuf, String>,
     /// Every file read through `INCLUDE` or `INCBIN`, once each, in the
     /// order first read, with the path as resolved (for a make depfile).
     pub dependencies: Vec<PathBuf>,
@@ -2042,6 +2045,7 @@ impl Assembler {
             register_aliases: HashMap::new(),
             included_files: std::collections::HashSet::new(),
             include_paths_resolved: HashMap::new(),
+            file_overlays: HashMap::new(),
             dependencies: Vec::new(),
             instr_infos: Vec::new(),
             noreturn: std::collections::HashSet::new(),
@@ -2217,6 +2221,13 @@ impl Assembler {
 
     pub fn set_source_root(&mut self, path: PathBuf) {
         self.source_root = path;
+    }
+
+    /// Use `text` for `path` when an `INCLUDE` names it, instead of
+    /// reading the file.
+    pub fn set_file_text(&mut self, path: PathBuf, text: String) {
+        let path = std::path::absolute(&path).unwrap_or(path);
+        self.file_overlays.insert(path, text);
     }
 
     /// Set the CPU target.
@@ -2940,16 +2951,18 @@ impl Assembler {
             // Not the canonical path: on Windows that carries a `\\?\`
             // prefix no editor uses, so a debugger could not match it.
             let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
+            let content = match self.file_overlays.get(&absolute) {
+                Some(text) => text.clone(),
+                None => std::fs::read_to_string(&path).map_err(|e| {
+                    here(
+                        format!("cannot read include '{}': {}", path.display(), e),
+                        &current_file,
+                        idx + 1,
+                    )
+                })?,
+            };
             self.include_paths_resolved
                 .insert(filename.clone(), absolute);
-
-            let content = std::fs::read_to_string(&path).map_err(|e| {
-                here(
-                    format!("cannot read include '{}': {}", path.display(), e),
-                    &current_file,
-                    idx + 1,
-                )
-            })?;
 
             // Resolve nested includes relative to the including file's own
             // directory, the way C-style include search works — the Amiga

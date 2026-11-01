@@ -75,6 +75,11 @@
           "default": [],
           "description": "Additional INCLUDE directories passed to m68k-asm (-I), e.g. the Amiga NDK includes."
         },
+        "m68k.mainFile": {
+          "type": "string",
+          "default": "",
+          "description": "Main source file of the program, relative to the workspace folder. The language server assembles it and checks every file it INCLUDEs as part of it, so an included file does not report the symbols and macros of its includer as undefined. F5 builds and debugs it instead of the active file."
+        },
         "m68k.emulator": {
           "type": "string",
           "default": "",

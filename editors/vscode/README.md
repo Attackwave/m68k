@@ -9,8 +9,13 @@ debug adapter ship with the extension; nothing else needs to be on `PATH`.
 - **Language server**: diagnostics while typing, hover documentation,
   completion, go to definition, find references, rename, document symbols,
   formatting, signature help and semantic highlighting. `INCLUDE` files are
-  resolved from the workspace root and its `include/` and `includes/`
-  directories.
+  resolved from the workspace root, its `include/` and `includes/`
+  directories and `m68k.includePaths`.
+- **One program, many files**: set `m68k.mainFile` for a program that is
+  assembled as one unit from `INCLUDE`s. The server assembles that file and
+  reports each included file's own errors on its own lines, with the
+  symbols and macros of the whole program in scope; unsaved edits count.
+  Without it, every file is checked on its own.
 - **Cycle counts**: exact 68000 timing at the end of every instruction line,
   from the official execution time tables with the effective address of
   each operand, shown as `(12 cyc)`. Instructions that depend on runtime
@@ -70,7 +75,8 @@ running on port 2345.
 | Setting | Default | Purpose |
 |---|---|---|
 | `m68k.cpu` | `68000` | Target CPU for diagnostics and builds |
-| `m68k.includePaths` | `[]` | Extra `INCLUDE` directories (`-I`) |
+| `m68k.includePaths` | `[]` | Extra `INCLUDE` directories (`-I`), relative to the workspace folder |
+| `m68k.mainFile` | | Main source of a program built from `INCLUDE`s; checked as one unit, built and debugged by F5 |
 | `m68k.toolsPath` | | Use tools from this directory instead of the bundled ones |
 | `m68k.emulator` | | Emulator binary for debugging |
 | `m68k.emulatorArgs` | `[]` | Extra emulator arguments |
