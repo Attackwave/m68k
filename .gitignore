@@ -12,3 +12,14 @@ spot/
 PLAN.md
 target/
 tmp/
+.mcp.json
+.codex/config.toml
+.gemini/settings.json
+.qwen/settings.json
+.vscode/mcp.json
+opencode.json
+.glasir-graph
+.glasir-layout-*
+.glasir-tokens
+.glasir-audit.jsonl
+.agents/mcp_config.json

@@ -101,7 +101,8 @@ const sendUnit = (msg) => {
   const body = JSON.stringify({ jsonrpc: '2.0', ...msg });
   unit.stdin.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`);
 };
-const incUri = 'file://' + path.join(dir, 'inc.s');
+// A file URI is not 'file://' + path: a Windows path has a drive letter and backslashes.
+const incUri = require('url').pathToFileURL(path.join(dir, 'inc.s')).href;
 let unitBuf = Buffer.alloc(0);
 const unitTimer = setTimeout(() => { unit.kill(); assert.fail('m68k-lsp --main did not publish diagnostics'); }, 5000);
 let unitStep = 0;
