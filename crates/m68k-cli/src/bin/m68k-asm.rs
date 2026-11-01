@@ -540,7 +540,9 @@ fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Re
                     ]
                 })
                 .collect();
-            let source = instr.source.as_deref().unwrap_or("").trim();
+            // Only the trailing whitespace goes: an instruction without operands
+            // moved to column 0 would read as a label and lose its cycles.
+            let source = instr.source.as_deref().unwrap_or("").trim_end();
             let (_, mnemonic, size, operands) = m68k_core::tokens::split_line(source);
             let timing = m68k_core::cycles::instruction_timing(&mnemonic, &size, &operands);
             let cycles = match &timing {
