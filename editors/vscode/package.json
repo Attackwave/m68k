@@ -2,7 +2,7 @@
   "name": "m68k",
   "displayName": "m68k Assembly",
   "description": "Motorola 68000 / Amiga assembly: language server, build tasks and diagnostics",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "publisher": "attackwave",
   "license": "MIT",
   "repository": {
