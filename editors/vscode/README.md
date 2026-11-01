@@ -33,6 +33,13 @@ debug adapter ship with the extension; nothing else needs to be on `PATH`.
 - **Build tasks**: `m68k-asm` as a task (hunk executable by default), with
   errors and warnings in the Problems panel, including errors raised inside
   macro expansions.
+- **Program analyses** (off by default): `m68k.stackCheck` reports a
+  routine that returns or jumps on with the stack pointer off its entry
+  level, or a line reached with different stack heights; `m68k.flagCheck`
+  warns about a `TST`/`CMP`/`BTST` whose condition codes every following
+  path overwrites before anything reads them. Both show up as you type and
+  in build tasks. A task with `"stackReport": "stack.txt"` also writes the
+  maximum stack depth of every routine, callees included.
 - **Debugging** (F5): builds the active file with line debug info, starts
   the emulator, boots straight into the program and stops at breakpoints.
   - Breakpoints in source and in the disassembly view
@@ -77,6 +84,8 @@ running on port 2345.
 | `m68k.cpu` | `68000` | Target CPU for diagnostics and builds |
 | `m68k.includePaths` | `[]` | Extra `INCLUDE` directories (`-I`), relative to the workspace folder |
 | `m68k.mainFile` | | Main source of a program built from `INCLUDE`s; checked as one unit, built and debugged by F5 |
+| `m68k.stackCheck` | `false` | Stack balance and reachability errors (`--stack-check`) |
+| `m68k.flagCheck` | `false` | Warnings about condition codes nothing reads (`--flag-check`) |
 | `m68k.toolsPath` | | Use tools from this directory instead of the bundled ones |
 | `m68k.emulator` | | Emulator binary for debugging |
 | `m68k.emulatorArgs` | `[]` | Extra emulator arguments |

@@ -22,6 +22,12 @@ pub struct LinterConfig {
     /// reports the symbols and macros an included file takes from its
     /// includer as undefined.
     pub main_file: Option<PathBuf>,
+    /// Report stack problems of every routine (the assembler's
+    /// `--stack-check`) as errors.
+    pub stack_check: bool,
+    /// Report TST/CMP/BTST whose condition codes nothing reads (the
+    /// assembler's `--flag-check`) as warnings.
+    pub flag_check: bool,
 }
 
 impl Default for LinterConfig {
@@ -30,6 +36,8 @@ impl Default for LinterConfig {
             cpu: MinCpu::Mc68000,
             include_paths: Vec::new(),
             main_file: None,
+            stack_check: false,
+            flag_check: false,
         }
     }
 }
@@ -50,7 +58,8 @@ pub fn compute_diagnostics(doc: &Document, config: &LinterConfig) -> Vec<Diagnos
     {
         asm.set_source_root(dir.to_path_buf());
     }
-    let _ = asm.assemble(&doc.text);
+    let assembled = asm.assemble(&doc.text).is_ok();
+    analyze(&mut asm, assembled, config);
 
     for diag in asm.diagnostics() {
         // The top-level source has no file name here (none was given to
@@ -99,7 +108,8 @@ pub fn compute_unit_diagnostics(
         .cloned()
         .or_else(|| std::fs::read_to_string(&main).ok())
         .unwrap_or_default();
-    let _ = asm.assemble(&main_text);
+    let assembled = asm.assemble(&main_text).is_ok();
+    analyze(&mut asm, assembled, config);
 
     // Diagnostics name the file as the INCLUDE wrote it; the assembler
     // kept where that resolved to.
@@ -128,6 +138,28 @@ pub fn compute_unit_diagnostics(
             (uri.clone(), diagnostics)
         })
         .collect()
+}
+
+/// Run the enabled program analyses and file their findings with the
+/// assembler's diagnostics. They read the encoded program, so an assembly
+/// that failed has nothing for them to look at.
+fn analyze(asm: &mut Assembler, assembled: bool, config: &LinterConfig) {
+    if !assembled {
+        return;
+    }
+    if config.stack_check {
+        for report in asm.stack_analysis() {
+            for (line, problem) in report.problems {
+                asm.errors
+                    .error(format!("{}: {problem}", report.name), Some(line));
+            }
+        }
+    }
+    if config.flag_check {
+        for (line, message) in asm.dead_flag_setters() {
+            asm.errors.warning(message, Some(line));
+        }
+    }
 }
 
 fn new_assembler(config: &LinterConfig) -> Assembler {
@@ -279,6 +311,38 @@ mod tests {
         assert!(diags[0].message.contains("BOGUS"), "{}", diags[0].message);
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The analyses are off by default and, switched on, file their
+    /// findings on the line of the instruction they are about.
+    #[test]
+    fn analyses_report_on_the_offending_line() {
+        let uri = Url::parse("file:///test.s").unwrap();
+        let src = "f:\n    tst.w d0\n    moveq #0,d0\n    move.l d1,-(sp)\n    rts\n";
+        let doc = Document::new(uri, 1, src.to_string());
+        assert!(compute_diagnostics(&doc, &LinterConfig::default()).is_empty());
+
+        let config = LinterConfig {
+            stack_check: true,
+            flag_check: true,
+            ..LinterConfig::default()
+        };
+        let mut diags = compute_diagnostics(&doc, &config);
+        diags.sort_by_key(|d| d.range.start.line);
+        let found: Vec<(u32, DiagnosticSeverity)> = diags
+            .iter()
+            .map(|d| (d.range.start.line, d.severity.unwrap()))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                (1, DiagnosticSeverity::WARNING),
+                (4, DiagnosticSeverity::ERROR)
+            ],
+            "{diags:?}"
+        );
+        assert!(diags[0].message.contains("TST"), "{}", diags[0].message);
+        assert!(diags[1].message.starts_with("f: "), "{}", diags[1].message);
     }
 
     #[test]
