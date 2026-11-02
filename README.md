@@ -32,6 +32,7 @@ m68k-disasm <binary-file> [options]
 - `-a`, `--address`: Set the origin base execution address (e.g. `0x1000`, `$1000`, or `4096`). Default is `0`.
 - `-r`, `--raw`: Include raw instruction hexadecimal bytes in the output.
 - `-c`, `--cpu`: Target CPU limit for decoding (`68000`, `68010`, `68020`, `68030`, `68040`, `68060`). Default is `68000`.
+- `--system <megadrive|neogeo|atarist>`: name the machine's hardware registers, system variables and OS entry points, and apply its cartridge layout (see below).
 
 The disassembly is always written to standard output; the address column is
 always included. Redirect or pipe stdout to capture it:
@@ -49,6 +50,28 @@ needed — `--address` becomes the load base instead, defaulting to `0`),
 and any `HUNK_SYMBOL` names recovered from the file are shown in place of
 auto-generated `label<N>` names at branch/jump targets and other
 referenced addresses.
+
+### System knowledge
+
+`--system` tells the disassembler which machine the image is for. The
+names come from the same include files the assembler ships in `include/`,
+so `move.w d0,$c00004` reads `move.w d0,VDP_CTRL` on the Mega Drive and
+`jsr $c00444` reads `jsr SYSTEM_INT1` on the Neo Geo. Only equates whose
+values lie in the machine's address ranges are used; register numbers and
+bit masks are left alone.
+
+For a Mega Drive or Neo Geo cartridge image at address 0 the 64 exception
+vectors are emitted as `dc.l` pointers, every vector into the image is an
+entry point for control-flow tracing, and the header at `$100` is data
+with its fields labelled (on the Neo Geo the four `JMP` entries in the
+header are entry points as well). For the Atari ST, `trap #1`, `#13` and
+`#14` are annotated with the GEMDOS, BIOS or XBIOS function named by the
+word pushed just before them.
+
+```bash
+m68k-disasm --system megadrive game.bin
+m68k-disasm --system atarist -a $20000 program.bin
+```
 
 ### Atari ST programs
 
