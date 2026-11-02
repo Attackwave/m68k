@@ -82,14 +82,6 @@ Mediach         EQU     $09
 Drvmap          EQU     $0A
 Kbshift         EQU     $0B
 
-; Device numbers for Bconstat/Bconin/Bconout/Bcostat.
-DEV_PRT         EQU     0
-DEV_AUX         EQU     1
-DEV_CON         EQU     2
-DEV_MIDI        EQU     3
-DEV_IKBD        EQU     4
-DEV_RAW         EQU     5
-
 ; --- XBIOS, trap #14 -------------------------------------------------------
 
 Initmous        EQU     $00
@@ -136,6 +128,15 @@ DMAwrite        EQU     $2B
 Bconmap         EQU     $2C
 NVMaccess       EQU     $2E
 Blitmode        EQU     $40
+
+; --- Device numbers for Bconstat/Bconin/Bconout/Bcostat -------------------
+
+DEV_PRT         EQU     0
+DEV_AUX         EQU     1
+DEV_CON         EQU     2
+DEV_MIDI        EQU     3
+DEV_IKBD        EQU     4
+DEV_RAW         EQU     5
 
 ; --- Macros ----------------------------------------------------------------
 

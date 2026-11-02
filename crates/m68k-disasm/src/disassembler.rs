@@ -219,6 +219,10 @@ pub struct Disassembler {
     /// Library whose vector offsets name `jsr -$xx(a6)` calls, when the
     /// caller knows which base the program keeps in `a6`.
     lvo_library: Option<Library>,
+    /// Names for `trap #n` calls by `(n, function number)`, the function
+    /// number being the word pushed just before the trap. Supplied by a
+    /// caller that knows the operating system (`--system atarist`).
+    trap_names: HashMap<(u8, u16), String>,
     /// Program counter values observed during a real execution, supplied
     /// by [`Disassembler::add_pc_trace`]. Each is an instruction start
     /// that actually ran, so unlike anything derived from the bytes it
@@ -243,6 +247,7 @@ impl Disassembler {
             data_ranges: Vec::new(),
             entry_points: Vec::new(),
             lvo_library: None,
+            trap_names: HashMap::new(),
             pc_trace: HashSet::new(),
             traced: HashSet::new(),
         }
@@ -318,6 +323,51 @@ impl Disassembler {
     /// listing.
     pub fn set_lvo_library(&mut self, library: Library) {
         self.lvo_library = Some(library);
+    }
+
+    /// Name `trap #n` calls: `((n, function), name)` for every function an
+    /// operating system dispatches through trap `n` by a word on the stack,
+    /// the way TOS does (`move.w #9,-(sp); trap #1` is GEMDOS `Cconws`).
+    pub fn add_trap_names<I: IntoIterator<Item = ((u8, u16), String)>>(&mut self, names: I) {
+        self.trap_names.extend(names);
+    }
+
+    /// The function a `trap #n` calls, if the instruction before it pushed
+    /// the function number as a word and the caller named that pair.
+    fn trap_comment(
+        &self,
+        inst: &crate::decoder::DecodedInstruction,
+        pushed: Option<u16>,
+    ) -> Option<String> {
+        if mnemonic_stem(&inst.mnemonic) != "trap" {
+            return None;
+        }
+        let EAOperand::Immediate(vector, _) = inst.operands.first()?.ea.as_ref()? else {
+            return None;
+        };
+        self.trap_names
+            .get(&(u8::try_from(*vector).ok()?, pushed?))
+            .cloned()
+    }
+
+    /// The word an instruction pushes onto the stack, when it is a
+    /// constant: `move.w #n,-(sp)` or `clr.w -(sp)`.
+    fn word_pushed(inst: &crate::decoder::DecodedInstruction) -> Option<u16> {
+        let pushes_word = |at: usize| {
+            inst.mnemonic.ends_with(".w")
+                && matches!(
+                    inst.operands.get(at).and_then(|o| o.ea.as_ref()),
+                    Some(EAOperand::PreDec(7))
+                )
+        };
+        match mnemonic_stem(&inst.mnemonic) {
+            "move" if pushes_word(1) => match inst.operands.first()?.ea.as_ref()? {
+                EAOperand::Immediate(value, _) => u16::try_from(*value).ok(),
+                _ => None,
+            },
+            "clr" if pushes_word(0) => Some(0),
+            _ => None,
+        }
     }
 
     /// The routine an instruction calls, if it is a library call and the
@@ -861,6 +911,8 @@ impl Disassembler {
         // Reset at each label, since a jump into that address arrives with
         // whatever the caller had, not with what the preceding line left.
         let mut current_library: Option<Library> = None;
+        // The word the previous instruction pushed, for naming a trap.
+        let mut pushed_word: Option<u16> = None;
 
         while stream.remaining() >= 2 {
             let inst_pc = stream.current_pc();
@@ -885,10 +937,13 @@ impl Disassembler {
                     if self.labels.contains_key(&inst_pc) {
                         current_library = None;
                     }
-                    let comment = self.lvo_comment(&inst, current_library);
+                    let comment = self
+                        .lvo_comment(&inst, current_library)
+                        .or_else(|| self.trap_comment(&inst, pushed_word));
                     if let Some(loaded) = Self::library_loaded_into_a6(&inst) {
                         current_library = loaded;
                     }
+                    pushed_word = Self::word_pushed(&inst);
                     lines.push(DisassembledLine {
                         address: inst_pc,
                         raw_bytes: inst.raw_bytes.clone(),
@@ -1567,6 +1622,40 @@ mod tests {
 
         assert_eq!(disasm.labels().get(&0x1004), Some(&"label0".to_string()));
         assert_eq!(lines[1].label, Some("label0".to_string()));
+    }
+
+    /// A trap is named by the function word pushed right before it; a
+    /// trap after anything else, or with a number nobody named, stays bare.
+    #[test]
+    fn trap_calls_are_named_by_the_word_pushed_before_them() {
+        let bytes = vec![
+            0x3F, 0x3C, 0x00, 0x09, // move.w #9,-(sp)
+            0x4E, 0x41, // trap #1          -> Cconws
+            0x42, 0x67, // clr.w -(sp)
+            0x4E, 0x41, // trap #1          -> Pterm0
+            0x3F, 0x3C, 0x00, 0x09, // move.w #9,-(sp)
+            0x4E, 0x4E, // trap #14         (no XBIOS 9 named)
+            0x4E, 0x71, // nop
+            0x4E, 0x41, // trap #1          (nothing pushed)
+        ];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        disasm.add_trap_names([
+            ((1, 9), "Cconws".to_string()),
+            ((1, 0), "Pterm0".to_string()),
+        ]);
+        let lines = disasm.disassemble();
+        let comment = |addr: u32| {
+            lines
+                .iter()
+                .find(|l| l.address == addr)
+                .unwrap()
+                .comment
+                .clone()
+        };
+        assert_eq!(comment(0x1004).as_deref(), Some("Cconws"));
+        assert_eq!(comment(0x1008).as_deref(), Some("Pterm0"));
+        assert_eq!(comment(0x100E), None);
+        assert_eq!(comment(0x1012), None);
     }
 
     /// `movea.l $4.w,a6` is ExecBase by definition, so the calls that

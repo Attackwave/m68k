@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process;
 
 use clap::Parser;
+use m68k_cli::system::System;
 use m68k_core::amiga_hunk::{SectionKind, read_hunk_executable};
 use m68k_core::amiga_lvo::Library;
 use m68k_disasm::disassembler::{Disassembler, parse_pc_trace};
@@ -70,6 +71,14 @@ struct Args {
     /// be decided from the instruction.
     #[arg(long = "lvo", value_name = "LIBRARY")]
     lvo: Option<String>,
+
+    /// Name the hardware registers, system variables and OS entry points
+    /// of this machine (from the equates in `include/`), and for a
+    /// cartridge image at address 0 treat the vector table as pointers,
+    /// its targets as entry points and the header as data. `atarist` also
+    /// names GEMDOS, BIOS and XBIOS trap calls
+    #[arg(long, value_name = "SYSTEM", value_enum)]
+    system: Option<System>,
 }
 
 fn parse_address(s: &str) -> Result<u32, String> {
@@ -160,8 +169,19 @@ fn run(args: Args) -> Result<(), String> {
     };
 
     let image_len = image.len();
+    let system = args
+        .system
+        .map(|system| system.facts(base_addr, &image))
+        .transpose()?;
     let mut disasm = Disassembler::new(image, base_addr);
     disasm.add_known_labels(known_labels);
+    if let Some(facts) = system {
+        disasm.add_known_labels(facts.labels);
+        disasm.add_pointer_sites(facts.pointer_sites);
+        disasm.add_data_ranges(facts.data_ranges);
+        disasm.add_entry_points(facts.entry_points);
+        disasm.add_trap_names(facts.trap_names);
+    }
     if let Some(info) = hunk_info {
         disasm.add_pointer_sites(info.relocs);
         disasm.add_data_ranges(info.data_ranges);
