@@ -167,6 +167,8 @@ jobs:
           # of bare executables says nothing about its own terms. No `|| true`
           # here: if either file goes missing the release should fail loudly.
           cp README.md LICENSE "$staging/"
+          # The system includes and the examples that use them.
+          cp -r include examples "$staging/"
 
           # Strip on the platforms where it is reliable. Windows MSVC keeps
           # its debug info in a separate .pdb that is not shipped, so there

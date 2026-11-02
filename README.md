@@ -213,6 +213,26 @@ sets the hunk's memory requirement, so bitplanes and samples land in chip RAM.
 for debuggers; they embed absolute source paths, so leave the option off for
 release builds.
 
+### System includes
+
+`include/` holds hardware maps and OS interfaces for the systems the
+assembler is used for, and `examples/` a minimal program for each. Both
+ship with the release archives; pass the include directory with `-I`:
+
+| Directory | Contents |
+|---|---|
+| `megadrive/hardware.i` | Sega Mega Drive / Genesis: memory map, cartridge header offsets, VDP registers and access codes, Z80 bus, YM2612, I/O ports, TMSS; `VDP_SETREG`/`VDP_SETADDR` macros |
+| `neogeo/hardware.i` | SNK Neo Geo: memory map, cartridge header, system and LSPC registers, VRAM layout, BIOS calls and BIOS RAM, controller bits |
+| `atarist/hardware.i` | Atari ST/STE: shifter, DMA, YM2149, STE sound, blitter, MFP, ACIAs, system variables |
+| `atarist/tos.i` | GEMDOS, BIOS and XBIOS function numbers; `GEMDOS`/`BIOS`/`XBIOS` macros |
+
+```bash
+m68k-asm -I include -f binary --pad pow2 --checksum megadrive -o hello.bin examples/megadrive/hello.s
+```
+
+The Amiga system headers are not included; Commodore's own `Include`
+directory is used with `-I` as before.
+
 ### Supported Directives
 
 | Directive | Description |

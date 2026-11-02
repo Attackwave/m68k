@@ -802,3 +802,20 @@ c:      rts
         "the JSR after the table still relaxes: {bytes:02X?}"
     );
 }
+
+/// `REPT` closed only at `ENDR`; with `ENDM` it swallowed the rest of the
+/// file and repeated it, which doubled every label after the block.
+#[test]
+fn rept_closes_at_endm_as_well_as_endr() {
+    for end in ["endr", "endm"] {
+        let source = format!(
+            "        rept    2\n        nop\n        {end}\n        rts\nlate    equ     1\n"
+        );
+        let bytes = assemble(&source).expect(end);
+        assert_eq!(
+            bytes,
+            [0x4E, 0x71, 0x4E, 0x71, 0x4E, 0x75],
+            "{end}: {bytes:02X?}"
+        );
+    }
+}
