@@ -219,3 +219,36 @@ fn listing_counts_cycles_of_bare_instructions() {
     std::fs::remove_dir_all(&dir).unwrap();
     assert!(text.contains("; 68000 cycles: 20 min, 20 max"), "{text}");
 }
+
+#[test]
+fn pad_and_megadrive_checksum_finish_a_rom_image() {
+    // A vector table and header of zeros, then two words of code.
+    let source = "\tdcb.b\t$200,0\n\tmove.w\t#1,d0\n\trts\n";
+    let (ok, rom, stderr) = run(
+        asm(),
+        &["-o", "-", "--pad", "pow2", "--checksum", "megadrive", "-"],
+        source.as_bytes(),
+    );
+    assert!(ok, "{stderr}");
+    assert_eq!(rom.len(), 0x400, "padded to the next power of two");
+    assert!(rom[0x206..].iter().all(|&b| b == 0xFF), "filled with $FF");
+    // 303C + 0001 + 4E75 + 0xFD words of FFFF (each -1) mod 65536.
+    let expected = 0x303Cu16
+        .wrapping_add(0x0001)
+        .wrapping_add(0x4E75)
+        .wrapping_sub(0xFD);
+    assert_eq!(&rom[0x18E..0x190], &expected.to_be_bytes(), "{stderr}");
+
+    let (ok, _, stderr) = run(
+        asm(),
+        &["-o", "-", "--pad", "$10", "--fill", "0", "-"],
+        SOURCE.as_bytes(),
+    );
+    assert!(ok, "{stderr}");
+    let (ok, _, stderr) = run(
+        asm(),
+        &["-o", "-", "-f", "srecord", "--pad", "$10", "-"],
+        SOURCE.as_bytes(),
+    );
+    assert!(!ok && stderr.contains("binary output only"), "{stderr}");
+}
