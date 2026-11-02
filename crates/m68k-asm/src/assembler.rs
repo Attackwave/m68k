@@ -3026,6 +3026,7 @@ impl Assembler {
         // came out one whole struct further along.
         self.rs_counter = 0;
         self.line_pcs.clear();
+        self.branches.clear();
         self.conditional_stack.clear();
         self.current_global_label = None;
         self.symbols.set_local_scope(None);
@@ -3689,6 +3690,8 @@ impl Assembler {
         let mut changed = true;
         let mut iterations = 0;
         const MAX_ITERATIONS: usize = 64;
+        // `branch_for_line` and `get_pc_for_line` search by line.
+        debug_assert!(self.branches.is_sorted_by_key(|b| b.line_no));
 
         while changed && iterations < MAX_ITERATIONS {
             changed = false;
@@ -3863,26 +3866,38 @@ impl Assembler {
     fn estimate_line_size_with_branches(&mut self, line: &ParsedLine) -> Result<u32, AsmError> {
         if let LineType::Instruction { mnemonic, .. } = &line.line_type
             && (is_branch_mnemonic(mnemonic) || is_pc_relaxable(mnemonic))
-            && let Some(branch) = self
-                .branches
-                .iter()
-                .find(|b| b.line_no == Some(line.line_no))
+            && let Some(branch) = self.branch_for_line(line.line_no)
         {
             return Ok(branch_size_bytes(&branch.mnemonic, &branch.size_hint));
         }
         self.estimate_line_size(line)
     }
 
+    /// The branch recorded for a line, if the line holds one.
+    ///
+    /// Pass 1 records branches in source order, so the list is sorted by
+    /// line and a binary search finds the entry. The linear scan this
+    /// replaces ran once per line of every relaxation round, which made
+    /// each round quadratic in the number of branches.
+    fn branch_for_line(&self, line_no: usize) -> Option<&BranchInfo> {
+        self.branches
+            .binary_search_by_key(&Some(line_no), |b| b.line_no)
+            .ok()
+            .map(|i| &self.branches[i])
+    }
+
     /// Get the PC value for a given line number.
+    ///
+    /// `line_pcs` is filled in source order, so it is sorted by line.
     fn get_pc_for_line(&self, line_no: Option<usize>) -> Result<u32, AsmError> {
-        if let Some(ln) = line_no {
-            for (line, pc) in &self.line_pcs {
-                if *line == ln {
-                    return Ok(*pc);
-                }
-            }
-        }
-        Ok(self.origin)
+        Ok(line_no
+            .and_then(|ln| {
+                self.line_pcs
+                    .binary_search_by_key(&ln, |(l, _)| *l)
+                    .ok()
+                    .map(|i| self.line_pcs[i].1)
+            })
+            .unwrap_or(self.origin))
     }
 
     /// Determine the optimal branch size for a given displacement.
@@ -4320,11 +4335,7 @@ impl Assembler {
         let dst = operand_texts.get(1).and_then(|t| parse_operand(t));
 
         if is_pc_relaxable(mnemonic)
-            && let Some(hint) = self
-                .branches
-                .iter()
-                .find(|b| b.line_no == Some(line.line_no))
-                .map(|b| b.size_hint)
+            && let Some(hint) = self.branch_for_line(line.line_no).map(|b| b.size_hint)
         {
             return self.encode_pc_relaxed(mnemonic, &src, &dst, hint, line);
         }
@@ -4754,9 +4765,7 @@ impl Assembler {
 
         // Apply size hint from relaxation
         let size_hint = self
-            .branches
-            .iter()
-            .find(|b| b.line_no == Some(line.line_no))
+            .branch_for_line(line.line_no)
             .map(|b| b.size_hint)
             .unwrap_or(BranchSize::Any);
 
