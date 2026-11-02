@@ -587,16 +587,28 @@ fn parse_operand_text(
     };
     if matches!(suffix_upper, Some(b'W') | Some(b'L')) {
         let force_long = suffix_upper == Some(b'L');
-        let base = text[..text.len() - 2].trim();
-        if let Ok(value) = evaluate_expr_str(base, symbols, current_pc)
-            && !text.contains('(')
-            && !text.contains(')')
-        {
-            return if force_long {
-                Ok(Operand::AbsoluteLong(value as i32))
-            } else {
-                Ok(Operand::AbsoluteShort(value as i32))
+        let mut base = text[..text.len() - 2].trim();
+        // Motorola writes the absolute modes as `(xxx).W` and `(xxx).L`.
+        if let Some(inner) = base.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
+            base = inner.trim();
+        }
+        if !base.contains(['(', ')', ',']) && parse_register(base).is_none() {
+            // A forward reference takes the size its suffix names now and
+            // its value in pass 2. Falling through to "cannot parse
+            // operand" made pass 1 size `JMP later.L` as 2 bytes, so a
+            // conditional over a span containing it saw two values.
+            let value = match evaluate_expr_str(base, symbols, current_pc) {
+                Ok(value) => Some(value),
+                Err(_) if is_identifier(base) => Some(0),
+                Err(_) => None,
             };
+            if let Some(value) = value {
+                return if force_long {
+                    Ok(Operand::AbsoluteLong(value as i32))
+                } else {
+                    Ok(Operand::AbsoluteShort(value as i32))
+                };
+            }
         }
     }
 
@@ -1559,6 +1571,13 @@ fn undefined_symbol_in_operand(text: &str, symbols: &SymbolTable, pc: u32) -> Op
                 let end = run_end(i + 1);
                 let token = &text[i..end];
                 i = end;
+                // `(xxx).l`: a size suffix after a closing paren is no name.
+                if matches!(
+                    token.to_ascii_lowercase().as_str(),
+                    ".b" | ".w" | ".l" | ".s"
+                ) {
+                    continue;
+                }
                 // `label.w`, `d0.l`: the size suffix is not part of the name.
                 let name = match token.rsplit_once('.') {
                     Some((base, sfx))
@@ -1928,6 +1947,9 @@ pub struct Assembler {
     /// Routines `RECURSES` declared to re-enter themselves at most this
     /// many times, by entry address.
     recursion: std::collections::HashMap<u32, u32>,
+    /// Lines holding a `JMP` next to another `JMP`: the entries of a
+    /// table with a fixed stride, which `--optimize` must not shorten.
+    jump_table_lines: std::collections::HashSet<usize>,
     /// Most recent global (non-local) label, used to scope local labels.
     ///
     /// A local label (`.loop`) belongs to the global label above it, so
@@ -2054,6 +2076,7 @@ impl Assembler {
             instr_infos: Vec::new(),
             noreturn: std::collections::HashSet::new(),
             recursion: std::collections::HashMap::new(),
+            jump_table_lines: std::collections::HashSet::new(),
             conditional_stack: Vec::new(),
             macro_definitions: HashMap::new(),
             macro_unique_counter: 0,
@@ -2793,6 +2816,8 @@ impl Assembler {
         let expanded = self.macro_preprocess(&included);
         let parsed = parse_source(&expanded);
 
+        self.jump_table_lines = jump_table_lines(&parsed);
+
         // Pass 1: Build symbol table, calculate sizes
         self.pass1(&parsed)?;
 
@@ -3150,7 +3175,7 @@ impl Assembler {
                 // with optimization on, a jump or LEA/PEA to a plain
                 // symbol joins them (see `relaxes_to_pc_relative`).
                 let is_branch = is_branch_mnemonic(mnemonic)
-                    || self.relaxes_to_pc_relative(mnemonic, operand_texts);
+                    || self.relaxes_to_pc_relative(line.line_no, mnemonic, operand_texts);
                 if is_branch {
                     // Estimate with word-sized branch (conservative)
                     let estimated_size = estimate_branch_size(mnemonic);
@@ -4587,8 +4612,16 @@ impl Assembler {
     /// symbol qualifies; whether that symbol is a label of this one
     /// section is settled during relaxation, once every label is defined
     /// ([`Self::pc_relative_target`]).
-    fn relaxes_to_pc_relative(&self, mnemonic: &str, operand_texts: &[String]) -> bool {
-        if !self.symbols.optimize_absolute() || !is_pc_relaxable(mnemonic) {
+    fn relaxes_to_pc_relative(
+        &self,
+        line_no: usize,
+        mnemonic: &str,
+        operand_texts: &[String],
+    ) -> bool {
+        if !self.symbols.optimize_absolute()
+            || !is_pc_relaxable(mnemonic)
+            || self.jump_table_lines.contains(&line_no)
+        {
             return false;
         }
         let operands = if mnemonic == "lea" { 2 } else { 1 };
@@ -5436,6 +5469,32 @@ impl Assembler {
 /// Check if a mnemonic is a branch instruction.
 /// Instructions `--optimize` may relax to a PC-relative form: JSR/JMP to
 /// BSR/BRA, LEA/PEA to `(d16,PC)`.
+/// The lines of every `JMP` whose neighbouring line (blank and comment
+/// lines aside) is another `JMP`. Code never runs one unconditional jump
+/// into the next, so such a run is a jump table whose entries are
+/// reached by a fixed stride (`JSR 2*6(A6)`); shortening one entry to
+/// `BRA.W` would move every entry after it. An entry written `JMP.L`
+/// never joins the relaxation anyway.
+fn jump_table_lines(lines: &[ParsedLine]) -> std::collections::HashSet<usize> {
+    let jumps: Vec<(usize, bool)> = lines
+        .iter()
+        .filter(|l| !matches!(l.line_type, LineType::Empty))
+        .map(|l| {
+            let jmp = matches!(&l.line_type,
+                LineType::Instruction { mnemonic, .. } if mnemonic.eq_ignore_ascii_case("jmp"));
+            (l.line_no, jmp)
+        })
+        .collect();
+    jumps
+        .iter()
+        .enumerate()
+        .filter(|(i, (_, jmp))| {
+            *jmp && (*i > 0 && jumps[i - 1].1 || jumps.get(i + 1).is_some_and(|n| n.1))
+        })
+        .map(|(_, (line_no, _))| *line_no)
+        .collect()
+}
+
 fn is_pc_relaxable(mnemonic: &str) -> bool {
     matches!(mnemonic, "jsr" | "jmp" | "lea" | "pea")
 }

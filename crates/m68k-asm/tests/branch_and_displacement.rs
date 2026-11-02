@@ -738,3 +738,67 @@ fn layout_settles_when_estimates_depend_on_moved_labels() {
     let f = (at("f") - start) as usize;
     assert_eq!(&bytes[f..f + 4], &[0x12, 0xFB, 0x00, 0x04], "{bytes:02X?}");
 }
+
+/// A forward reference with a size suffix (`JMP later.L`) fell through
+/// to "cannot parse operand" in pass 1, which the size estimate took as
+/// 2 bytes; a conditional over a span containing it then saw one value
+/// in pass 1 and another in pass 2.
+#[test]
+fn suffixed_forward_reference_has_its_size_in_pass_1() {
+    let source = "\
+t:      dc.l    0
+        jmp     a.l
+t_end:
+        ifne    t_end-t-10
+        fail    \"span\"
+        endc
+a:      rts
+";
+    let bytes = assemble(source).expect("the span is 10 bytes in both passes");
+    assert_eq!(
+        &bytes[4..10],
+        &[0x4E, 0xF9, 0x00, 0x00, 0x80, 0x0A],
+        "{bytes:02X?}"
+    );
+    let err = assemble("        jmp     nothere.l\n").expect_err("must still fail");
+    assert!(
+        err.contains("undefined symbol") && err.contains("nothere"),
+        "{err}"
+    );
+}
+
+/// The absolute modes in Motorola's own notation, `(xxx).W`/`(xxx).L`.
+#[test]
+fn parenthesised_absolute_with_size_suffix() {
+    let bytes = assemble("        jmp     (a).l\n        jmp     ($1000).w\na:      rts\n")
+        .expect("must assemble");
+    assert_eq!(
+        &bytes[0..6],
+        &[0x4E, 0xF9, 0x00, 0x00, 0x80, 0x0A],
+        "{bytes:02X?}"
+    );
+    assert_eq!(&bytes[6..10], &[0x4E, 0xF8, 0x10, 0x00], "{bytes:02X?}");
+}
+
+/// A run of `JMP`s is a jump table whose entries are reached by a fixed
+/// stride; shortening one to `BRA.W` under `--optimize` moved every entry
+/// after it.
+#[test]
+fn consecutive_jumps_keep_their_stride_when_optimizing() {
+    let source = "\
+tab:    jmp     a
+        jmp     b
+        jmp     c
+        jsr     a
+a:      rts
+b:      rts
+c:      rts
+";
+    let (bytes, symbols) = assemble_with_symbols(source, true).expect("must assemble");
+    let at = |name: &str| symbol(&symbols, name).expect(name);
+    assert_eq!(at("a") - at("tab"), 3 * 6 + 4, "{symbols:?}");
+    assert_eq!(
+        bytes[18], 0x61,
+        "the JSR after the table still relaxes: {bytes:02X?}"
+    );
+}
