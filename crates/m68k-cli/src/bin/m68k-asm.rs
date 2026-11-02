@@ -8,7 +8,8 @@ use m68k_asm::amiga_hunk_writer::{LineOf, generate_relocatable_hunk_exe};
 use m68k_asm::assembler::Assembler;
 use m68k_asm::ieee695::generate_ieee695_sections;
 use m68k_asm::output::{
-    OutputFormat, generate_binary_from, generate_elf_sections, generate_intel_hex, generate_srecord,
+    OutputFormat, apply_megadrive_checksum, generate_binary_from, generate_elf_sections,
+    generate_intel_hex, generate_srecord, next_power_of_two, pad_image,
 };
 
 #[derive(Parser, Debug)]
@@ -99,6 +100,52 @@ struct Args {
     /// so a deleted file does not break the build (like `gcc -MD -MP`)
     #[arg(long, value_name = "FILE")]
     depfile: Option<PathBuf>,
+
+    /// Pad a binary image to this size (hex with `$`/`0x` or decimal), or
+    /// to the next power of two with `pow2`, the way a cartridge or EPROM
+    /// image fills its chip. Binary output only
+    #[arg(long, value_name = "SIZE|pow2")]
+    pad: Option<String>,
+
+    /// The byte `--pad` fills with (default `$FF`, the state of an erased
+    /// EPROM)
+    #[arg(long, value_name = "BYTE", default_value = "$FF")]
+    fill: String,
+
+    /// Write a cartridge checksum into the binary image after padding:
+    /// `megadrive` sums the words from offset $200 to the end into the
+    /// header word at $18E, which the console verifies at start-up
+    #[arg(long, value_name = "SYSTEM", value_enum)]
+    checksum: Option<ChecksumArg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum ChecksumArg {
+    Megadrive,
+}
+
+/// Pads a binary image and writes its cartridge checksum as `--pad`,
+/// `--fill` and `--checksum` ask. Padding comes first so the checksum
+/// covers the filler the console will read as well.
+fn finish_rom_image(bytes: &mut Vec<u8>, args: &Args) -> Result<(), String> {
+    if let Some(size) = &args.pad {
+        let fill = parse_origin(&args.fill)
+            .ok()
+            .and_then(|v| u8::try_from(v).ok())
+            .ok_or_else(|| format!("--fill: expected a byte value, got '{}'", args.fill))?;
+        let size = if size.eq_ignore_ascii_case("pow2") {
+            next_power_of_two(bytes.len())
+        } else {
+            parse_origin(size).map_err(|e| format!("--pad: {e}"))? as usize
+        };
+        pad_image(bytes, size, fill);
+    }
+    match args.checksum {
+        Some(ChecksumArg::Megadrive) => {
+            apply_megadrive_checksum(bytes).map_err(|e| format!("--checksum megadrive: {e}"))
+        }
+        None => Ok(()),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -423,6 +470,10 @@ fn run(args: Args) -> Result<(), String> {
         .map_err(|e| format!("cannot write depfile '{}': {}", dep_path.display(), e))?;
     }
 
+    if (args.pad.is_some() || args.checksum.is_some()) && args.format != OutputFormatArg::Binary {
+        return Err("--pad and --checksum apply to binary output only (-f binary)".into());
+    }
+
     // Generate output
     let output_data = match args.format {
         OutputFormatArg::Binary => {
@@ -437,7 +488,7 @@ fn run(args: Args) -> Result<(), String> {
             // Pass the final PC so a trailing DS/DCB reservation (which
             // emits no instruction) still sizes the image.
             match generate_binary_from(&asm.code, Some(asm.end_pc()), Some(asm.origin())) {
-                Some((bytes, _base_addr)) => {
+                Some((mut bytes, _base_addr)) => {
                     if bytes.len() > MAX_BINARY_SIZE {
                         return Err(format!(
                             "binary output would be {} bytes (limit {} bytes) \
@@ -446,6 +497,7 @@ fn run(args: Args) -> Result<(), String> {
                             MAX_BINARY_SIZE
                         ));
                     }
+                    finish_rom_image(&mut bytes, &args)?;
                     bytes
                 }
                 None => return Err("no code generated".to_string()),

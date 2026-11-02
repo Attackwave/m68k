@@ -952,6 +952,59 @@ fn generate_elf_from_parts(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Extends `image` to `size` bytes with `fill`, the way a cartridge or
+/// EPROM image is padded to the capacity of its chip. An image already
+/// that long or longer is left alone.
+pub fn pad_image(image: &mut Vec<u8>, size: usize, fill: u8) {
+    if image.len() < size {
+        image.resize(size, fill);
+    }
+}
+
+/// The smallest power of two that holds `len` bytes. Cartridge mappers
+/// and boot ROMs decode power-of-two sizes.
+pub fn next_power_of_two(len: usize) -> usize {
+    len.max(1).next_power_of_two()
+}
+
+/// Offset of the checksum word in a Mega Drive cartridge header.
+pub const MEGADRIVE_CHECKSUM_OFFSET: usize = 0x18E;
+/// First byte the Mega Drive checksum covers: everything after the
+/// vector table and header.
+pub const MEGADRIVE_CHECKSUM_START: usize = 0x200;
+
+/// The Mega Drive cartridge checksum: the sum of every big-endian word
+/// from offset `0x200` to the end of the ROM, modulo 65536. The console
+/// verifies it against the header word at `0x18E` before running a
+/// cartridge; a mismatch leaves a red screen on most regional variants.
+pub fn megadrive_checksum(rom: &[u8]) -> u16 {
+    rom.get(MEGADRIVE_CHECKSUM_START..)
+        .unwrap_or_default()
+        .chunks(2)
+        .map(|w| u16::from_be_bytes([w[0], *w.get(1).unwrap_or(&0)]))
+        .fold(0u16, u16::wrapping_add)
+}
+
+/// Writes the Mega Drive checksum into the header of `rom`, which must
+/// be at least as long as the header and have an even length (the
+/// console sums words; an odd byte would be summed differently by
+/// different tools).
+pub fn apply_megadrive_checksum(rom: &mut [u8]) -> Result<(), String> {
+    if rom.len() < MEGADRIVE_CHECKSUM_START {
+        return Err(format!(
+            "a Mega Drive ROM needs at least {MEGADRIVE_CHECKSUM_START:#x} bytes for the vector table and header, this one has {:#x}",
+            rom.len()
+        ));
+    }
+    if !rom.len().is_multiple_of(2) {
+        return Err("a Mega Drive ROM must have an even length; pad it".into());
+    }
+    let sum = megadrive_checksum(rom);
+    rom[MEGADRIVE_CHECKSUM_OFFSET..MEGADRIVE_CHECKSUM_OFFSET + 2]
+        .copy_from_slice(&sum.to_be_bytes());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1268,5 +1321,37 @@ mod tests {
             assert_eq!(section_for("START"), ".text");
             assert_eq!(section_for("COUNT"), ".data");
         }
+    }
+}
+
+#[cfg(test)]
+mod rom_tests {
+    use super::*;
+
+    #[test]
+    fn padding_extends_but_never_shrinks() {
+        let mut image = vec![1, 2, 3];
+        pad_image(&mut image, 6, 0xFF);
+        assert_eq!(image, [1, 2, 3, 0xFF, 0xFF, 0xFF]);
+        pad_image(&mut image, 2, 0xFF);
+        assert_eq!(image.len(), 6);
+        assert_eq!(next_power_of_two(0), 1);
+        assert_eq!(next_power_of_two(0x8_0001), 0x10_0000);
+        assert_eq!(next_power_of_two(0x8_0000), 0x8_0000);
+    }
+
+    #[test]
+    fn megadrive_checksum_sums_words_after_the_header() {
+        let mut rom = vec![0u8; 0x204];
+        rom[0x200..0x204].copy_from_slice(&[0x12, 0x34, 0xFF, 0xFF]);
+        assert_eq!(megadrive_checksum(&rom), 0x1234u16.wrapping_add(0xFFFF));
+        apply_megadrive_checksum(&mut rom).unwrap();
+        assert_eq!(&rom[0x18E..0x190], &[0x12, 0x33]);
+        // The header word itself is outside the sum, so applying it again
+        // changes nothing.
+        apply_megadrive_checksum(&mut rom).unwrap();
+        assert_eq!(&rom[0x18E..0x190], &[0x12, 0x33]);
+        assert!(apply_megadrive_checksum(&mut vec![0u8; 0x100]).is_err());
+        assert!(apply_megadrive_checksum(&mut vec![0u8; 0x201]).is_err());
     }
 }
