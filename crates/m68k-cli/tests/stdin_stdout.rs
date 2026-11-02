@@ -245,6 +245,14 @@ fn pad_and_megadrive_checksum_finish_a_rom_image() {
         SOURCE.as_bytes(),
     );
     assert!(ok, "{stderr}");
+    let (ok, rom, stderr) = run(asm(), &["-o", "-", "--pad", "1K", "-"], SOURCE.as_bytes());
+    assert!(ok, "{stderr}");
+    assert_eq!(rom.len(), 1024, "a K unit means KiB");
+    let (ok, _, stderr) = run(asm(), &["-o", "-", "--pad", "1G", "-"], SOURCE.as_bytes());
+    assert!(
+        !ok && stderr.contains("--pad: invalid number '1G'"),
+        "{stderr}"
+    );
     let (ok, _, stderr) = run(
         asm(),
         &["-o", "-", "-f", "srecord", "--pad", "$10", "-"],

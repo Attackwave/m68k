@@ -103,8 +103,8 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     depfile: Option<PathBuf>,
 
-    /// Pad a binary image to this size (hex with `$`/`0x` or decimal), or
-    /// to the next power of two with `pow2`, the way a cartridge or EPROM
+    /// Pad a binary image to this size (hex with `$`/`0x` or decimal, with
+    /// an optional `K` or `M` unit), or to the next power of two with `pow2`, the way a cartridge or EPROM
     /// image fills its chip. Binary output only
     #[arg(long, value_name = "SIZE|pow2")]
     pad: Option<String>,
@@ -131,14 +131,14 @@ enum ChecksumArg {
 /// covers the filler the console will read as well.
 fn finish_rom_image(bytes: &mut Vec<u8>, args: &Args) -> Result<(), String> {
     if let Some(size) = &args.pad {
-        let fill = parse_origin(&args.fill)
+        let fill = parse_number(&args.fill)
             .ok()
             .and_then(|v| u8::try_from(v).ok())
             .ok_or_else(|| format!("--fill: expected a byte value, got '{}'", args.fill))?;
         let size = if size.eq_ignore_ascii_case("pow2") {
             next_power_of_two(bytes.len())
         } else {
-            parse_origin(size).map_err(|e| format!("--pad: {e}"))? as usize
+            parse_number(size).map_err(|e| format!("--pad: {e}"))? as usize
         };
         pad_image(bytes, size, fill);
     }
@@ -177,16 +177,27 @@ impl From<OutputFormatArg> for OutputFormat {
     }
 }
 
-fn parse_origin(s: &str) -> Result<u32, String> {
+/// Parses a number as `--origin`, `--pad` and `--fill` take it: hex with
+/// `$` or `0x`, otherwise decimal, with an optional `K` or `M` unit
+/// (`512K`, `$80000`, `4M`).
+fn parse_number(s: &str) -> Result<u32, String> {
     let s = s.trim();
-    if let Some(hex) = s.strip_prefix('$') {
-        u32::from_str_radix(hex, 16).map_err(|e| format!("invalid hex origin: {}", e))
-    } else if let Some(hex) = s.strip_prefix("0x") {
-        u32::from_str_radix(hex, 16).map_err(|e| format!("invalid hex origin: {}", e))
+    let (digits, unit) = match s.char_indices().last() {
+        Some((i, 'k' | 'K')) => (&s[..i], 1024),
+        Some((i, 'm' | 'M')) => (&s[..i], 1024 * 1024),
+        _ => (s, 1),
+    };
+    let value = if let Some(hex) = digits.strip_prefix('$') {
+        u32::from_str_radix(hex, 16)
+    } else if let Some(hex) = digits.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16)
     } else {
-        s.parse::<u32>()
-            .map_err(|e| format!("invalid origin: {}", e))
+        digits.parse::<u32>()
     }
+    .map_err(|e| format!("invalid number '{}': {}", s, e))?;
+    value
+        .checked_mul(unit)
+        .ok_or_else(|| format!("invalid number '{}': does not fit in 32 bits", s))
 }
 
 /// `-` means stdin/stdout, as documented in the README. Everything else is a
@@ -334,7 +345,7 @@ fn output_display(path: &Path) -> String {
 
 fn run(args: Args) -> Result<(), String> {
     m68k_core::cpu_gate::validate_cpu_name(&args.cpu)?;
-    let origin = parse_origin(&args.origin)?;
+    let origin = parse_number(&args.origin).map_err(|e| format!("--origin: {e}"))?;
     let reading_stdin = is_dash(&args.input);
     let input_name = if reading_stdin {
         "<stdin>".to_string()

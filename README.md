@@ -133,7 +133,7 @@ m68k-asm hello.s -f prg -o hello.prg          # Atari ST / TOS program
 - `--depfile <file>` — write make dependencies: the output depends on the source and every `INCLUDE`/`INCBIN` file, each also listed as an empty rule (like `gcc -MD -MP`). Use with `-include` in a Makefile.
 - `-I`, `--include <dir>` — add a directory to the `INCLUDE` search path (repeatable). Needed for sources that include the Amiga system headers by their logical path, e.g. `include 'exec/types.i'`.
 - `--optimize` — enable size-changing optimizations (see below). Off by default.
-- `--pad <size|pow2>`, `--fill <byte>` — pad a binary image to a fixed size or the next power of two, the way a cartridge or EPROM image fills its chip; the filler is `$FF` unless `--fill` says otherwise.
+- `--pad <size|pow2>`, `--fill <byte>` — pad a binary image to a fixed size (`$80000`, `512K`, `4M`) or the next power of two, the way a cartridge or EPROM image fills its chip; the filler is `$FF` unless `--fill` says otherwise.
 - `--checksum megadrive` — write the Mega Drive cartridge checksum (the word sum from `$200` to the end) into the header word at `$18E`, after padding.
 - `--linedebug` — add source line debug info to a `hunk-exe` (see below).
 
