@@ -252,3 +252,30 @@ fn pad_and_megadrive_checksum_finish_a_rom_image() {
     );
     assert!(!ok && stderr.contains("binary output only"), "{stderr}");
 }
+
+#[test]
+fn disasm_exits_cleanly_when_the_reader_closes_the_pipe() {
+    // `m68k-disasm image | head` closes stdout long before the listing
+    // ends. The tool used to panic on the resulting EPIPE (exit 101).
+    let mut child = Command::new(disasm())
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn binary");
+    child
+        .stdin
+        .take()
+        .expect("stdin was piped")
+        .write_all(&[0u8; 1 << 17])
+        .expect("failed to write stdin");
+    drop(child.stdout.take());
+    let out = child.wait_with_output().expect("failed to wait for binary");
+    assert!(
+        out.status.success(),
+        "exit {:?}, stderr: {}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
