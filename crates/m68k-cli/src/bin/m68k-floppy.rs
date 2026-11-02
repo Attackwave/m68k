@@ -5,8 +5,9 @@ use std::path::PathBuf;
 use std::process;
 
 use clap::{Parser, ValueEnum};
-use m68k_floppy::amigados::AmigaFs;
+use m68k_floppy::amigados::{AmigaFs, DirEntry};
 use m68k_floppy::factory::{Backend, open_floppy_image};
+use m68k_floppy::fat12::Fat12;
 use m68k_floppy::floppy_base::FloppyImageReader;
 
 /// Directory nesting depth for `--list-all`/`--extract-all`. Deep enough
@@ -20,6 +21,8 @@ enum BackendArg {
     Adf,
     Native,
     Uae,
+    St,
+    Msa,
 }
 
 impl From<BackendArg> for Backend {
@@ -29,13 +32,68 @@ impl From<BackendArg> for Backend {
             BackendArg::Adf => Backend::Adf,
             BackendArg::Native => Backend::Native,
             BackendArg::Uae => Backend::Uae,
+            BackendArg::St => Backend::St,
+            BackendArg::Msa => Backend::Msa,
         }
+    }
+}
+
+/// The filesystem on an image, decided by its boot sector: AmigaDOS
+/// announces itself with `DOS`, anything else is tried as FAT12.
+enum Mounted<'a> {
+    Amiga(AmigaFs<'a>),
+    Fat(Fat12<'a>),
+}
+
+impl<'a> Mounted<'a> {
+    fn mount(reader: &'a mut dyn FloppyImageReader, tracks: u32) -> Result<Self, String> {
+        let boot = reader
+            .read_sector(0, 0, 0)
+            .map_err(|e| format!("cannot read boot sector: {}", e))?;
+        if boot.starts_with(b"DOS") {
+            AmigaFs::mount(reader, tracks).map(Mounted::Amiga)
+        } else {
+            Fat12::mount(reader).map(Mounted::Fat)
+        }
+        .map_err(|e| format!("cannot mount filesystem: {}", e))
+    }
+
+    fn list_dir_at_path(&mut self, path: &str) -> Result<Vec<DirEntry>, String> {
+        match self {
+            Mounted::Amiga(fs) => fs.list_dir_at_path(path),
+            Mounted::Fat(fs) => fs.list_dir_at_path(path),
+        }
+        .map_err(|e| format!("cannot list directory: {}", e))
+    }
+
+    fn walk(&mut self, path: &str) -> Result<Vec<(String, DirEntry)>, String> {
+        match self {
+            Mounted::Amiga(fs) => fs.walk(path, MAX_WALK_DEPTH),
+            Mounted::Fat(fs) => fs.walk(path, MAX_WALK_DEPTH),
+        }
+        .map_err(|e| format!("cannot walk filesystem: {}", e))
+    }
+
+    fn read_file_at_path(&mut self, path: &str) -> Result<Vec<u8>, String> {
+        match self {
+            Mounted::Amiga(fs) => fs.read_file_at_path(path),
+            Mounted::Fat(fs) => fs.read_file_at_path(path),
+        }
+        .map_err(|e| format!("cannot extract '{}': {}", path, e))
+    }
+
+    fn read_file(&mut self, entry: &DirEntry) -> Result<Vec<u8>, String> {
+        match self {
+            Mounted::Amiga(fs) => fs.read_file(entry.block),
+            Mounted::Fat(fs) => fs.read_file(entry),
+        }
+        .map_err(|e| e.to_string())
     }
 }
 
 #[derive(Parser, Debug)]
 #[command(name = "m68k-floppy", version)]
-#[command(about = "Inspect Amiga floppy disk images and extract data", long_about = None)]
+#[command(about = "Inspect Amiga and Atari ST floppy disk images and extract data", long_about = None)]
 struct Args {
     /// Path to the disk image (.adf or .ipf)
     image: PathBuf,
@@ -270,11 +328,8 @@ fn run(args: Args) -> Result<(), String> {
             .write_all(&data)
             .map_err(|e| e.to_string())?;
     } else if let Some(path) = &args.list {
-        let mut fs = AmigaFs::mount(&mut reader, args.tracks)
-            .map_err(|e| format!("cannot mount filesystem: {}", e))?;
-        let entries = fs
-            .list_dir_at_path(path)
-            .map_err(|e| format!("cannot list directory: {}", e))?;
+        let mut fs = Mounted::mount(&mut reader, args.tracks)?;
+        let entries = fs.list_dir_at_path(path)?;
         for entry in entries {
             if entry.is_dir {
                 println!("{:>10}  {}/", "<DIR>", entry.name);
@@ -283,11 +338,8 @@ fn run(args: Args) -> Result<(), String> {
             }
         }
     } else if let Some(path) = &args.list_all {
-        let mut fs = AmigaFs::mount(&mut reader, args.tracks)
-            .map_err(|e| format!("cannot mount filesystem: {}", e))?;
-        let entries = fs
-            .walk(path, MAX_WALK_DEPTH)
-            .map_err(|e| format!("cannot walk filesystem: {}", e))?;
+        let mut fs = Mounted::mount(&mut reader, args.tracks)?;
+        let entries = fs.walk(path)?;
         for (full_path, entry) in entries {
             if entry.is_dir {
                 println!("{:>10}  {}/", "<DIR>", full_path);
@@ -296,11 +348,8 @@ fn run(args: Args) -> Result<(), String> {
             }
         }
     } else if let Some(name) = &args.extract {
-        let mut fs = AmigaFs::mount(&mut reader, args.tracks)
-            .map_err(|e| format!("cannot mount filesystem: {}", e))?;
-        let data = fs
-            .read_file_at_path(name)
-            .map_err(|e| format!("cannot extract '{}': {}", name, e))?;
+        let mut fs = Mounted::mount(&mut reader, args.tracks)?;
+        let data = fs.read_file_at_path(name)?;
         match &args.output {
             Some(path) => {
                 std::fs::write(path, &data).map_err(|e| format!("cannot write output: {}", e))?;
@@ -312,11 +361,8 @@ fn run(args: Args) -> Result<(), String> {
             }
         }
     } else if let Some(dest) = &args.extract_all {
-        let mut fs = AmigaFs::mount(&mut reader, args.tracks)
-            .map_err(|e| format!("cannot mount filesystem: {}", e))?;
-        let entries = fs
-            .walk("", MAX_WALK_DEPTH)
-            .map_err(|e| format!("cannot walk filesystem: {}", e))?;
+        let mut fs = Mounted::mount(&mut reader, args.tracks)?;
+        let entries = fs.walk("")?;
         let mut files = 0usize;
         let mut dirs = 0usize;
         for (full_path, entry) in entries {
@@ -341,7 +387,7 @@ fn run(args: Args) -> Result<(), String> {
                         .map_err(|e| format!("cannot create '{}': {}", parent.display(), e))?;
                 }
                 let data = fs
-                    .read_file(entry.block)
+                    .read_file(&entry)
                     .map_err(|e| format!("cannot read '{}': {}", full_path, e))?;
                 std::fs::write(&target, &data)
                     .map_err(|e| format!("cannot write '{}': {}", target.display(), e))?;

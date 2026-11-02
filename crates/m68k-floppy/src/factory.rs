@@ -5,6 +5,7 @@ use std::path::Path;
 use crate::adf::AdfBackend;
 use crate::floppy_base::{FloppyError, FloppyImageReader};
 use crate::ipf::NativeIpfBackend;
+use crate::st::StBackend;
 use crate::uae::UaeExtendedBackend;
 
 /// A floppy image reader, dynamically dispatched over the backend the
@@ -14,6 +15,8 @@ pub enum FloppyImage {
     Adf(AdfBackend),
     Uae(UaeExtendedBackend),
     NativeIpf(NativeIpfBackend),
+    /// An Atari ST sector image, from an `.ST` dump or an `.MSA` archive.
+    St(StBackend),
 }
 
 impl FloppyImageReader for FloppyImage {
@@ -22,6 +25,7 @@ impl FloppyImageReader for FloppyImage {
             FloppyImage::Adf(b) => b.read_sector(track, side, sector),
             FloppyImage::Uae(b) => b.read_sector(track, side, sector),
             FloppyImage::NativeIpf(b) => b.read_sector(track, side, sector),
+            FloppyImage::St(b) => b.read_sector(track, side, sector),
         }
     }
 }
@@ -32,6 +36,7 @@ pub enum BackendKind {
     Adf,
     Uae,
     NativeIpf,
+    St,
 }
 
 impl FloppyImage {
@@ -40,6 +45,7 @@ impl FloppyImage {
             FloppyImage::Adf(_) => BackendKind::Adf,
             FloppyImage::Uae(_) => BackendKind::Uae,
             FloppyImage::NativeIpf(_) => BackendKind::NativeIpf,
+            FloppyImage::St(_) => BackendKind::St,
         }
     }
 }
@@ -55,6 +61,10 @@ pub enum Backend {
     Adf,
     Native,
     Uae,
+    /// Raw Atari ST sector dump.
+    St,
+    /// Atari ST Magic Shadow Archiver file.
+    Msa,
 }
 
 /// Open a floppy disk image and return an appropriate reader.
@@ -79,6 +89,8 @@ pub fn open_floppy_image(
     {
         Some("adf") => open_adf(path),
         Some("ipf") => open_ipf(path),
+        Some("st") => StBackend::open(path).map(FloppyImage::St),
+        Some("msa") => StBackend::open_msa(path).map(FloppyImage::St),
         Some(ext) => Err(FloppyError::new(format!(
             "Unsupported file extension: .{}",
             ext
@@ -107,6 +119,8 @@ fn build_backend(name: Backend, path: &Path) -> Result<FloppyImage, FloppyError>
         Backend::Adf => AdfBackend::open(path).map(FloppyImage::Adf),
         Backend::Native => NativeIpfBackend::open(path).map(FloppyImage::NativeIpf),
         Backend::Uae => UaeExtendedBackend::open(path).map(FloppyImage::Uae),
+        Backend::St => StBackend::open(path).map(FloppyImage::St),
+        Backend::Msa => StBackend::open_msa(path).map(FloppyImage::St),
         Backend::Auto => unreachable!("Auto is handled by open_floppy_image directly"),
     }
 }

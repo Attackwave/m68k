@@ -261,7 +261,7 @@ directory is used with `-I` as before.
 
 ## Floppy Disk Support
 
-Read Amiga floppy disk images (ADF, IPF, UAE extended ADF) and disassemble directly:
+Read Amiga floppy disk images (ADF, IPF, UAE extended ADF) and Atari ST images (ST, MSA), and disassemble directly:
 
 ```bash
 m68k-disasm --bootblock --org 0xF80000 roms/game.adf
@@ -277,6 +277,22 @@ m68k-floppy --bootblock roms/game.adf > bootblock.bin
 | Extended ADF | `adf` | Larger images with more sectors per track |
 | UAE-0/1ADF | `uae` | Raw MFM bitstream per track (copy-protected disks) |
 | IPF | `native` | Clean-room IPF parser with MFM bitstream decoding |
+| Atari ST `.st` | `st` | Raw sector dump; geometry from the boot sector, else from the size |
+| Atari ST `.msa` | `msa` | Magic Shadow Archiver, decompressed on reading |
+
+### FAT12 filesystem (Atari ST)
+
+`--list`, `--list-all`, `--extract` and `--extract-all` work on FAT12 disks
+as well, which is what the boot sector of an Atari ST (or PC) floppy
+describes; the filesystem is chosen by the boot sector, so a FAT-formatted
+`.adf` is read the same way. Paths may use `/` or `\` and are matched
+without regard to case. FAT12 support is read-only; the writing options
+below apply to AmigaDOS images only.
+
+```bash
+m68k-floppy game.st --list-all
+m68k-floppy game.msa --extract AUTO/BOOT.PRG -o boot.prg
+```
 
 ### AmigaDOS filesystem (OFS/FFS)
 
