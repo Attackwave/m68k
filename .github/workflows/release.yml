@@ -80,20 +80,36 @@ jobs:
     needs: [version, approve]
     strategy:
       # A broken archive on one platform should not hide whether the others
-      # built, so all three always run to completion.
+      # built, so every platform always runs to completion.
       fail-fast: false
       matrix:
+        # `name` is the platform as it appears in the archive's file name.
+        # Every target is built on a runner of its own architecture, so
+        # the smoke test below runs the binaries it ships. Linux links
+        # against musl: a static binary runs on any distribution, where a
+        # glibc one fails on anything older than the runner's.
         include:
-          - target: x86_64-unknown-linux-gnu
+          - target: x86_64-unknown-linux-musl
             os: ubuntu-latest
+            name: linux-x86_64
+            suffix: ''
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-24.04-arm
+            name: linux-arm64
             suffix: ''
           - target: x86_64-pc-windows-msvc
             os: windows-latest
+            name: windows-x86_64
             suffix: '.exe'
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: macos-arm64
+            suffix: ''
           - target: x86_64-apple-darwin
             os: macos-latest
+            name: macos-x86_64
             suffix: ''
-    name: Build (${{ matrix.target }})
+    name: Build (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
@@ -142,7 +158,7 @@ jobs:
         shell: bash
         run: |
           set -eu
-          staging="m68k-v${{ needs.version.outputs.version }}-${{ matrix.target }}"
+          staging="m68k-${{ needs.version.outputs.version }}-${{ matrix.name }}"
           mkdir -p "$staging"
           for bin in m68k-asm m68k-disasm m68k-floppy; do
             cp "target/${{ matrix.target }}/release/${bin}${{ matrix.suffix }}" "$staging/"
@@ -173,7 +189,7 @@ jobs:
       - name: Upload build artifact
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: archive-${{ matrix.target }}
+          name: archive-${{ matrix.name }}
           path: ${{ env.ASSET }}
           if-no-files-found: error
           retention-days: 1
