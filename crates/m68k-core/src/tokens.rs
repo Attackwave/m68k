@@ -372,8 +372,12 @@ pub fn split_line(line: &str) -> (Option<String>, String, String, Vec<String>) {
         && !takes_cache_scope_operand(parts[0])
         // A size suffix is part of the instruction token, not of a label.
         // Otherwise `BPL.S fail` looks like label `BPL.S` followed by the
-        // FAIL directive, while `BPL fail` parses correctly.
+        // FAIL directive, while `BPL fail` parses correctly. The same
+        // holds for a sized directive: `DC.L error` is data naming a
+        // label, not label `DC.L` followed by the ERROR directive.
         && !is_mnemonic(parts[0].split('.').next().unwrap_or(parts[0]))
+        && !(parts[0].contains('.')
+            && is_directive(&parts[0].split('.').next().unwrap_or("").to_lowercase()))
     {
         let rest = parts[1].trim();
         let rest_parts: Vec<&str> = rest.splitn(2, char::is_whitespace).collect();
@@ -708,6 +712,7 @@ mod tests {
             ("BNE.S FAIL", "bne", "s", "FAIL"),
             ("BRA.S fail", "bra", "s", "fail"),
             ("BRA.W end", "bra", "w", "end"),
+            ("DC.L error", "dc", "l", "error"),
         ] {
             let (label, mnemonic, size, operands) = split_line(instruction);
             assert_eq!(label, None, "{instruction}");

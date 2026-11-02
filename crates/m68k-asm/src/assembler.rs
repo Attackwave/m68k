@@ -2559,18 +2559,21 @@ impl Assembler {
                     }
                 };
 
-                // Collect body until matching ENDR (with nesting)
+                // Collect body until the matching ENDR, or ENDM, which
+                // Devpac-style sources close a REPT with as well. A
+                // MACRO definition inside the body nests like a REPT,
+                // since its own ENDM must not end the block.
                 i += 1;
                 let mut body = Vec::new();
                 let mut depth = 1;
                 while i < lines.len() && depth > 0 {
                     let (_, mne, _, _) = split_line(lines[i]);
-                    if mne == "endr" {
+                    if mne == "endr" || mne == "endm" {
                         depth -= 1;
                         if depth == 0 {
                             break;
                         }
-                    } else if mne == "rept" || mne == "irp" || mne == "irpc" {
+                    } else if mne == "rept" || mne == "irp" || mne == "irpc" || mne == "macro" {
                         depth += 1;
                     }
                     body.push((lines[i].to_string(), i));
@@ -2608,12 +2611,12 @@ impl Assembler {
                 let mut depth = 1;
                 while i < lines.len() && depth > 0 {
                     let (_, mne, _, _) = split_line(lines[i]);
-                    if mne == "endr" {
+                    if mne == "endr" || mne == "endm" {
                         depth -= 1;
                         if depth == 0 {
                             break;
                         }
-                    } else if mne == "rept" || mne == "irp" || mne == "irpc" {
+                    } else if mne == "rept" || mne == "irp" || mne == "irpc" || mne == "macro" {
                         depth += 1;
                     }
                     body.push((lines[i].to_string(), i));
@@ -2652,12 +2655,12 @@ impl Assembler {
                 let mut depth = 1;
                 while i < lines.len() && depth > 0 {
                     let (_, mne, _, _) = split_line(lines[i]);
-                    if mne == "endr" {
+                    if mne == "endr" || mne == "endm" {
                         depth -= 1;
                         if depth == 0 {
                             break;
                         }
-                    } else if mne == "rept" || mne == "irp" || mne == "irpc" {
+                    } else if mne == "rept" || mne == "irp" || mne == "irpc" || mne == "macro" {
                         depth += 1;
                     }
                     body.push((lines[i].to_string(), i));
