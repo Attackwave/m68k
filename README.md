@@ -50,6 +50,14 @@ and any `HUNK_SYMBOL` names recovered from the file are shown in place of
 auto-generated `label<N>` names at branch/jump targets and other
 referenced addresses.
 
+### Atari ST programs
+
+A TOS program (`.PRG`, `.TOS`, `.TTP`, `.ACC`; magic `$601A` with a
+consistent header) is loaded the same way: text and data are placed back
+to back at `--address`, the relocation table is applied, every relocated
+longword is emitted as a `dc.l` pointer, the data segment as data, and
+disassembly follows control flow from the start of the text segment.
+
 ### Symbol File Format
 
 The custom symbol file should map absolute addresses to symbol names, one per line. Blank lines and lines starting with `#` or `;` are ignored.
@@ -106,6 +114,7 @@ m68k-asm hello.s -f intel-hex -o hello.hex    # Intel Hex
 m68k-asm hello.s -f elf -o hello.o            # ELF32 (EM_68K, ET_REL)
 m68k-asm hello.s -f ieee695 -o hello.ieee     # IEEE-695
 m68k-asm hello.s -f hunk-exe -o hello         # Amiga Hunk executable (LoadSeg()-able)
+m68k-asm hello.s -f prg -o hello.prg          # Atari ST / TOS program
 ```
 
 ### Options
@@ -114,7 +123,7 @@ m68k-asm hello.s -f hunk-exe -o hello         # Amiga Hunk executable (LoadSeg()
 - `-o`, `--output`: Path to the output file. Use `-` to write to standard output (works for every format, including the binary ones). Defaults to the input name with a format-specific extension.
 - `-c`, `--cpu`: Target CPU model (`68000`, `68010`, `68020`, `68030`, `68040`, `68060`). Default is `68000`.
 - `--origin <addr>` — default origin if the source has no `ORG` (hex with `$` or `0x` prefix, or decimal).
-- `-f`, `--format`: Output format (`binary`, `srecord`, `intel-hex`, `elf`, `ieee695`, `hunk-exe`). Default is `binary`.
+- `-f`, `--format`: Output format (`binary`, `srecord`, `intel-hex`, `elf`, `ieee695`, `hunk-exe`, `prg`). Default is `binary`.
 - `-l`/`--listing <file>` — write an address/bytes/cycles/source listing. The cycles column gives 68000 clock periods per instruction (`10/8` for a branch taken/not taken, `38-70` for a data-dependent range); the footer sums them.
 - `--sym <file>` — export the resolved symbol table.
 - `--map <file>` — export a memory map (address ranges per instruction).
@@ -213,6 +222,13 @@ sets the hunk's memory requirement, so bitplanes and samples land in chip RAM.
 for debuggers; they embed absolute source paths, so leave the option off for
 release builds.
 
+`prg` output is an Atari ST / TOS program (`.PRG`, `.TOS`, `.TTP`, `.ACC`
+are the same format): the `text`, `data` and `bss` sections laid out back
+to back, as GEMDOS loads them, followed by a relocation table so the
+program can be loaded at any address. The same rule as for `hunk-exe`
+applies: only full 32-bit address fields can be relocated. Named sections
+are not allowed, and no symbol table is written.
+
 ### System includes
 
 `include/` holds hardware maps and OS interfaces for the systems the
@@ -228,6 +244,7 @@ ship with the release archives; pass the include directory with `-I`:
 
 ```bash
 m68k-asm -I include -f binary --pad pow2 --checksum megadrive -o hello.bin examples/megadrive/hello.s
+m68k-asm -I include -f prg -o hello.prg examples/atarist/hello.s
 ```
 
 The Amiga system headers are not included; Commodore's own `Include`

@@ -48,6 +48,7 @@
 pub mod amiga_hunk_writer;
 pub mod analysis;
 pub mod assembler;
+pub mod atari_prg_writer;
 pub mod directives;
 pub mod ea_encode;
 pub mod enc_bitfield;

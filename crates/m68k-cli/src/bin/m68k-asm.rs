@@ -6,6 +6,8 @@ use std::process;
 use clap::{Parser, ValueEnum};
 use m68k_asm::amiga_hunk_writer::{LineOf, generate_relocatable_hunk_exe};
 use m68k_asm::assembler::Assembler;
+use m68k_asm::atari_prg_writer::generate_prg;
+use m68k_asm::directives::SectionKind;
 use m68k_asm::ieee695::generate_ieee695_sections;
 use m68k_asm::output::{
     OutputFormat, apply_megadrive_checksum, generate_binary_from, generate_elf_sections,
@@ -156,6 +158,7 @@ enum OutputFormatArg {
     Elf,
     Ieee695,
     HunkExe,
+    Prg,
 }
 
 impl From<OutputFormatArg> for OutputFormat {
@@ -166,10 +169,10 @@ impl From<OutputFormatArg> for OutputFormat {
             OutputFormatArg::IntelHex => OutputFormat::IntelHex,
             OutputFormatArg::Elf => OutputFormat::Elf,
             OutputFormatArg::Ieee695 => OutputFormat::Ieee695,
-            // HunkExe has no OutputFormat counterpart — it's written directly
-            // via amiga_hunk_writer::generate_hunk_exe, bypassing OutputFormat
+            // HunkExe and Prg have no OutputFormat counterpart — they are
+            // written directly by their own writers, bypassing OutputFormat
             // entirely (same as Elf/Ieee695 already do in `run()`'s match).
-            OutputFormatArg::HunkExe => OutputFormat::Elf,
+            OutputFormatArg::HunkExe | OutputFormatArg::Prg => OutputFormat::Elf,
         }
     }
 }
@@ -451,6 +454,9 @@ fn run(args: Args) -> Result<(), String> {
                 OutputFormatArg::HunkExe => {
                     p.set_extension("");
                 }
+                OutputFormatArg::Prg => {
+                    p.set_extension("prg");
+                }
             }
             p
         }
@@ -475,6 +481,22 @@ fn run(args: Args) -> Result<(), String> {
     }
 
     // Generate output
+    // The relocatable formats assemble the source again with sections
+    // moved to find which longwords are addresses.
+    let reassemble = |origin: u32, overrides: &[(SectionKind, u32)]| {
+        let mut moved = new_assembler(origin);
+        for (kind, at) in overrides {
+            moved.sections.set_origin_override(kind.clone(), *at);
+        }
+        moved.assemble(&source)?;
+        Ok(moved)
+    };
+    let locate = |e: m68k_core::errors::AsmError| {
+        let mut asm_err = m68k_core::errors::Diagnostic::from(e);
+        asm_err.filename = String::new();
+        asm.locate_diagnostic(asm_err).to_string()
+    };
+
     let output_data = match args.format {
         OutputFormatArg::Binary => {
             // Previously concatenated `instr.words` directly, ignoring
@@ -562,24 +584,23 @@ fn run(args: Args) -> Result<(), String> {
                 Some((path.to_string_lossy().into_owned(), origin.line as u32))
             };
             let line_of: Option<LineOf> = args.linedebug.then_some(&line_of as LineOf);
-            let hunk = generate_relocatable_hunk_exe(&asm, line_of, |origin, overrides| {
-                let mut moved = new_assembler(origin);
-                for (kind, at) in overrides {
-                    moved.sections.set_origin_override(kind.clone(), *at);
-                }
-                moved.assemble(&source)?;
-                Ok(moved)
-            })
-            .map_err(|e| {
-                let mut asm_err = m68k_core::errors::Diagnostic::from(e);
-                asm_err.filename = String::new();
-                asm.locate_diagnostic(asm_err).to_string()
-            })?;
+            let hunk = generate_relocatable_hunk_exe(&asm, line_of, reassemble).map_err(locate)?;
             write_output(&output_path, &hunk)?;
             eprintln!(
                 "Assembled {} instructions, {} bytes -> {}",
                 asm.code.len(),
                 hunk.len(),
+                output_display(&output_path)
+            );
+            return write_auxiliary_outputs(&asm, &args, &input_name);
+        }
+        OutputFormatArg::Prg => {
+            let prg = generate_prg(&asm, reassemble).map_err(locate)?;
+            write_output(&output_path, &prg)?;
+            eprintln!(
+                "Assembled {} instructions, {} bytes -> {}",
+                asm.code.len(),
+                prg.len(),
                 output_display(&output_path)
             );
             return write_auxiliary_outputs(&asm, &args, &input_name);

@@ -279,3 +279,21 @@ fn disasm_exits_cleanly_when_the_reader_closes_the_pipe() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn prg_output_is_loaded_by_the_disassembler() {
+    let src = "\tlea\tmsg,a0\n\trts\n\tsection data\nmsg:\tdc.b\t'Hello',0\n";
+    let (ok, prg, stderr) = run(asm(), &["-o", "-", "-f", "prg", "-"], src.as_bytes());
+    assert!(ok, "{stderr}");
+    assert_eq!(&prg[..2], &[0x60, 0x1A]);
+    // text: lea (6) + rts (2); data: 'Hello',0.
+    assert_eq!(&prg[2..6], &8u32.to_be_bytes());
+    assert_eq!(&prg[6..10], &6u32.to_be_bytes());
+
+    let (ok, out, stderr) = run(disasm(), &["-a", "$20000", "-"], &prg);
+    assert!(ok, "{stderr}");
+    let text = String::from_utf8_lossy(&out);
+    assert!(text.contains("00020000:  lea     $00020008, a0"), "{text}");
+    // The data segment is data by the header's account, not `pea (a1)`.
+    assert!(text.contains("00020008:  dc.w     $4865"), "{text}");
+}
