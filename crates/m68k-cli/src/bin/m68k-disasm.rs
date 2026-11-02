@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process;
 
@@ -212,37 +212,45 @@ fn run(args: Args) -> Result<(), String> {
     }
     disasm.set_cpu(&args.cpu);
 
-    for line in disasm.disassemble() {
-        if line.is_error {
-            eprintln!("{}", line.text);
-            continue;
+    let mut out = std::io::stdout().lock();
+    let written = (|| -> std::io::Result<()> {
+        for line in disasm.disassemble() {
+            if line.is_error {
+                eprintln!("{}", line.text);
+                continue;
+            }
+            // Emit the label definition on its own line, ahead of the
+            // instruction it marks. Without it the output referenced labels
+            // that were never defined anywhere, so it could not be fed back
+            // into the assembler.
+            if let Some(label) = &line.label {
+                writeln!(out, "{}:", label)?;
+            }
+            if args.raw {
+                let hex: String = line
+                    .raw_bytes
+                    .iter()
+                    .map(|b| format!(" {:02x}", b))
+                    .collect();
+                write!(out, "{:08x}:{}  ", line.address, hex)?;
+            } else {
+                write!(out, "{:08x}:  ", line.address)?;
+            }
+            match &line.comment {
+                // Rendered as a trailing comment so the instruction text stays
+                // exactly what the assembler accepts.
+                Some(note) => writeln!(out, "{:<40} ; {}", line.text, note)?,
+                None => writeln!(out, "{}", line.text)?,
+            }
         }
-        // Emit the label definition on its own line, ahead of the
-        // instruction it marks. Without it the output referenced labels
-        // that were never defined anywhere, so it could not be fed back
-        // into the assembler.
-        if let Some(label) = &line.label {
-            println!("{}:", label);
-        }
-        if args.raw {
-            let hex: String = line
-                .raw_bytes
-                .iter()
-                .map(|b| format!(" {:02x}", b))
-                .collect();
-            print!("{:08x}:{}  ", line.address, hex);
-        } else {
-            print!("{:08x}:  ", line.address);
-        }
-        match &line.comment {
-            // Rendered as a trailing comment so the instruction text stays
-            // exactly what the assembler accepts.
-            Some(note) => println!("{:<40} ; {}", line.text, note),
-            None => println!("{}", line.text),
-        }
+        out.flush()
+    })();
+    match written {
+        // The reader closed the pipe (`| head`, `| grep -q`): the listing
+        // was cut short on purpose, so it is not an error.
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+        other => other.map_err(|e| format!("cannot write to stdout: {}", e)),
     }
-
-    Ok(())
 }
 
 fn main() {
