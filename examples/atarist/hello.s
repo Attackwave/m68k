@@ -2,7 +2,7 @@
 ; Written position-independent, as a TOS program is loaded at whatever
 ; address GEMDOS finds free.
 ;
-;     m68k-asm -I include -f binary -o hello.bin examples/atarist/hello.s
+;     m68k-asm -I include -f prg -o hello.prg examples/atarist/hello.s
 
         include 'atarist/tos.i'
         include 'atarist/hardware.i'

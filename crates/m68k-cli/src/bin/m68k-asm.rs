@@ -6,6 +6,8 @@ use std::process;
 use clap::{Parser, ValueEnum};
 use m68k_asm::amiga_hunk_writer::{LineOf, generate_relocatable_hunk_exe};
 use m68k_asm::assembler::Assembler;
+use m68k_asm::atari_prg_writer::generate_prg;
+use m68k_asm::directives::SectionKind;
 use m68k_asm::ieee695::generate_ieee695_sections;
 use m68k_asm::output::{
     OutputFormat, apply_megadrive_checksum, generate_binary_from, generate_elf_sections,
@@ -101,8 +103,8 @@ struct Args {
     #[arg(long, value_name = "FILE")]
     depfile: Option<PathBuf>,
 
-    /// Pad a binary image to this size (hex with `$`/`0x` or decimal), or
-    /// to the next power of two with `pow2`, the way a cartridge or EPROM
+    /// Pad a binary image to this size (hex with `$`/`0x` or decimal, with
+    /// an optional `K` or `M` unit), or to the next power of two with `pow2`, the way a cartridge or EPROM
     /// image fills its chip. Binary output only
     #[arg(long, value_name = "SIZE|pow2")]
     pad: Option<String>,
@@ -129,14 +131,14 @@ enum ChecksumArg {
 /// covers the filler the console will read as well.
 fn finish_rom_image(bytes: &mut Vec<u8>, args: &Args) -> Result<(), String> {
     if let Some(size) = &args.pad {
-        let fill = parse_origin(&args.fill)
+        let fill = parse_number(&args.fill)
             .ok()
             .and_then(|v| u8::try_from(v).ok())
             .ok_or_else(|| format!("--fill: expected a byte value, got '{}'", args.fill))?;
         let size = if size.eq_ignore_ascii_case("pow2") {
             next_power_of_two(bytes.len())
         } else {
-            parse_origin(size).map_err(|e| format!("--pad: {e}"))? as usize
+            parse_number(size).map_err(|e| format!("--pad: {e}"))? as usize
         };
         pad_image(bytes, size, fill);
     }
@@ -156,6 +158,7 @@ enum OutputFormatArg {
     Elf,
     Ieee695,
     HunkExe,
+    Prg,
 }
 
 impl From<OutputFormatArg> for OutputFormat {
@@ -166,24 +169,35 @@ impl From<OutputFormatArg> for OutputFormat {
             OutputFormatArg::IntelHex => OutputFormat::IntelHex,
             OutputFormatArg::Elf => OutputFormat::Elf,
             OutputFormatArg::Ieee695 => OutputFormat::Ieee695,
-            // HunkExe has no OutputFormat counterpart — it's written directly
-            // via amiga_hunk_writer::generate_hunk_exe, bypassing OutputFormat
+            // HunkExe and Prg have no OutputFormat counterpart — they are
+            // written directly by their own writers, bypassing OutputFormat
             // entirely (same as Elf/Ieee695 already do in `run()`'s match).
-            OutputFormatArg::HunkExe => OutputFormat::Elf,
+            OutputFormatArg::HunkExe | OutputFormatArg::Prg => OutputFormat::Elf,
         }
     }
 }
 
-fn parse_origin(s: &str) -> Result<u32, String> {
+/// Parses a number as `--origin`, `--pad` and `--fill` take it: hex with
+/// `$` or `0x`, otherwise decimal, with an optional `K` or `M` unit
+/// (`512K`, `$80000`, `4M`).
+fn parse_number(s: &str) -> Result<u32, String> {
     let s = s.trim();
-    if let Some(hex) = s.strip_prefix('$') {
-        u32::from_str_radix(hex, 16).map_err(|e| format!("invalid hex origin: {}", e))
-    } else if let Some(hex) = s.strip_prefix("0x") {
-        u32::from_str_radix(hex, 16).map_err(|e| format!("invalid hex origin: {}", e))
+    let (digits, unit) = match s.char_indices().last() {
+        Some((i, 'k' | 'K')) => (&s[..i], 1024),
+        Some((i, 'm' | 'M')) => (&s[..i], 1024 * 1024),
+        _ => (s, 1),
+    };
+    let value = if let Some(hex) = digits.strip_prefix('$') {
+        u32::from_str_radix(hex, 16)
+    } else if let Some(hex) = digits.strip_prefix("0x") {
+        u32::from_str_radix(hex, 16)
     } else {
-        s.parse::<u32>()
-            .map_err(|e| format!("invalid origin: {}", e))
+        digits.parse::<u32>()
     }
+    .map_err(|e| format!("invalid number '{}': {}", s, e))?;
+    value
+        .checked_mul(unit)
+        .ok_or_else(|| format!("invalid number '{}': does not fit in 32 bits", s))
 }
 
 /// `-` means stdin/stdout, as documented in the README. Everything else is a
@@ -331,7 +345,7 @@ fn output_display(path: &Path) -> String {
 
 fn run(args: Args) -> Result<(), String> {
     m68k_core::cpu_gate::validate_cpu_name(&args.cpu)?;
-    let origin = parse_origin(&args.origin)?;
+    let origin = parse_number(&args.origin).map_err(|e| format!("--origin: {e}"))?;
     let reading_stdin = is_dash(&args.input);
     let input_name = if reading_stdin {
         "<stdin>".to_string()
@@ -451,6 +465,9 @@ fn run(args: Args) -> Result<(), String> {
                 OutputFormatArg::HunkExe => {
                     p.set_extension("");
                 }
+                OutputFormatArg::Prg => {
+                    p.set_extension("prg");
+                }
             }
             p
         }
@@ -475,6 +492,22 @@ fn run(args: Args) -> Result<(), String> {
     }
 
     // Generate output
+    // The relocatable formats assemble the source again with sections
+    // moved to find which longwords are addresses.
+    let reassemble = |origin: u32, overrides: &[(SectionKind, u32)]| {
+        let mut moved = new_assembler(origin);
+        for (kind, at) in overrides {
+            moved.sections.set_origin_override(kind.clone(), *at);
+        }
+        moved.assemble(&source)?;
+        Ok(moved)
+    };
+    let locate = |e: m68k_core::errors::AsmError| {
+        let mut asm_err = m68k_core::errors::Diagnostic::from(e);
+        asm_err.filename = String::new();
+        asm.locate_diagnostic(asm_err).to_string()
+    };
+
     let output_data = match args.format {
         OutputFormatArg::Binary => {
             // Previously concatenated `instr.words` directly, ignoring
@@ -562,24 +595,23 @@ fn run(args: Args) -> Result<(), String> {
                 Some((path.to_string_lossy().into_owned(), origin.line as u32))
             };
             let line_of: Option<LineOf> = args.linedebug.then_some(&line_of as LineOf);
-            let hunk = generate_relocatable_hunk_exe(&asm, line_of, |origin, overrides| {
-                let mut moved = new_assembler(origin);
-                for (kind, at) in overrides {
-                    moved.sections.set_origin_override(kind.clone(), *at);
-                }
-                moved.assemble(&source)?;
-                Ok(moved)
-            })
-            .map_err(|e| {
-                let mut asm_err = m68k_core::errors::Diagnostic::from(e);
-                asm_err.filename = String::new();
-                asm.locate_diagnostic(asm_err).to_string()
-            })?;
+            let hunk = generate_relocatable_hunk_exe(&asm, line_of, reassemble).map_err(locate)?;
             write_output(&output_path, &hunk)?;
             eprintln!(
                 "Assembled {} instructions, {} bytes -> {}",
                 asm.code.len(),
                 hunk.len(),
+                output_display(&output_path)
+            );
+            return write_auxiliary_outputs(&asm, &args, &input_name);
+        }
+        OutputFormatArg::Prg => {
+            let prg = generate_prg(&asm, reassemble).map_err(locate)?;
+            write_output(&output_path, &prg)?;
+            eprintln!(
+                "Assembled {} instructions, {} bytes -> {}",
+                asm.code.len(),
+                prg.len(),
                 output_display(&output_path)
             );
             return write_auxiliary_outputs(&asm, &args, &input_name);

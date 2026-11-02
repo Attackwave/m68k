@@ -7,11 +7,13 @@ use clap::Parser;
 use m68k_cli::system::System;
 use m68k_core::amiga_hunk::{SectionKind, read_hunk_executable};
 use m68k_core::amiga_lvo::Library;
+use m68k_core::atari_prg::{looks_like_prg, read_prg};
 use m68k_disasm::disassembler::{Disassembler, parse_pc_trace};
 
-/// Layout facts recovered from an Amiga Hunk executable's own metadata,
-/// handed to the disassembler so it need not infer them from the bytes.
-struct HunkInfo {
+/// Layout facts recovered from a program file's own metadata (Amiga Hunk,
+/// TOS program), handed to the disassembler so it need not infer them
+/// from the bytes.
+struct LayoutInfo {
     /// Addresses of relocated 32-bit pointers.
     relocs: Vec<u32>,
     /// `[start, end)` spans of non-code hunks.
@@ -28,8 +30,8 @@ struct Args {
     input: PathBuf,
 
     /// Start address (hex, e.g. $1000 or 0x1000). For Amiga Hunk
-    /// executables this is the load base the first hunk is placed at,
-    /// rather than a required manual guess.
+    /// executables and TOS programs this is the load base the file is
+    /// placed at, rather than a required manual guess.
     #[arg(short, long, default_value = "0")]
     address: String,
 
@@ -136,7 +138,7 @@ fn run(args: Args) -> Result<(), String> {
     // Amiga Hunk executables (HUNK_HEADER magic 0x000003F3) get their
     // hunks loaded, relocated, and flattened into one image; everything
     // else is treated as a raw binary at the given start address.
-    let mut hunk_info: Option<HunkInfo> = None;
+    let mut layout: Option<LayoutInfo> = None;
     let (image, base_addr, known_labels) = if data.len() >= 4 && data[0..4] == [0, 0, 0x03, 0xf3] {
         let exe = read_hunk_executable(&data, start_addr)
             .map_err(|e| format!("cannot read '{}': {}", input_display(&args.input), e))?;
@@ -148,7 +150,7 @@ fn run(args: Args) -> Result<(), String> {
         // What the linker recorded about this executable: every relocated
         // longword is a pointer, and every non-Code hunk is data outright.
         // Both beat guessing from the bytes.
-        hunk_info = Some(HunkInfo {
+        layout = Some(LayoutInfo {
             relocs: exe.all_relocs(),
             data_ranges: exe
                 .sections
@@ -164,6 +166,20 @@ fn run(args: Args) -> Result<(), String> {
             entry: exe.sections.first().map(|s| s.address),
         });
         (exe.image, exe.load_base, labels)
+    } else if looks_like_prg(&data) {
+        // A TOS program: text and data loaded back to back at the given
+        // address, every relocated longword a pointer, the data segment
+        // data by the file's own account. Execution begins at the start
+        // of the text segment.
+        let prg = read_prg(&data, start_addr)
+            .map_err(|e| format!("cannot read '{}': {}", input_display(&args.input), e))?;
+        let data_start = prg.load_base.wrapping_add(prg.text_len);
+        layout = Some(LayoutInfo {
+            relocs: prg.relocs,
+            data_ranges: vec![(data_start, data_start.wrapping_add(prg.data_len))],
+            entry: Some(prg.load_base),
+        });
+        (prg.image, prg.load_base, Vec::new())
     } else {
         (data, start_addr, Vec::new())
     };
@@ -182,7 +198,7 @@ fn run(args: Args) -> Result<(), String> {
         disasm.add_entry_points(facts.entry_points);
         disasm.add_trap_names(facts.trap_names);
     }
-    if let Some(info) = hunk_info {
+    if let Some(info) = layout {
         disasm.add_pointer_sites(info.relocs);
         disasm.add_data_ranges(info.data_ranges);
         disasm.add_entry_points(info.entry);

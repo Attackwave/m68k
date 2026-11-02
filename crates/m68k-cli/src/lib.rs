@@ -6,8 +6,9 @@
 //!
 //! - **`m68k-asm`** (`src/bin/m68k-asm.rs`) — assembles a source file.
 //!   `-f`/`--format` selects the output format: `binary` (default),
-//!   `srecord`, `intel-hex`, `elf`, or `ieee695` (see that format's own
-//!   docs in `m68k_asm::ieee695` — unverified against a real reader).
+//!   `srecord`, `intel-hex`, `elf`, `ieee695` (see that format's own
+//!   docs in `m68k_asm::ieee695` — unverified against a real reader),
+//!   `hunk-exe` (Amiga) or `prg` (Atari ST).
 //!   `--listing`/`-l`, `--sym`, `--map` write auxiliary output files.
 //!   Example: `m68k-asm hello.s -f elf -o hello.o --cpu 68020`.
 //! - **`m68k-disasm`** (`src/bin/m68k-disasm.rs`) — disassembles a raw
