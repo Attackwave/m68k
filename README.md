@@ -152,7 +152,10 @@ to a label into `BSR`/`BRA` and an `LEA`/`PEA` of a label into the
 `(d16,PC)` form when the label is within 16-bit reach, which saves two
 bytes and two to four cycles each; a target named by an `EQU` (which may
 be hardware) or a program with more than one section is left alone,
-since a PC-relative reference needs a fixed distance.
+since a PC-relative reference needs a fixed distance. A run of `JMP`s is
+a jump table whose entries are reached by a fixed stride, so its entries
+keep their size; an explicit suffix (`JMP.L sub`, `JMP sub.L`) pins the
+form of any single instruction.
 
 ```asm
     MOVE.W  $1234,D0        ; default: 3039 00001234   --optimize: 3038 1234
