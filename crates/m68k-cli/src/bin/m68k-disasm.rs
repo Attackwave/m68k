@@ -67,7 +67,8 @@ struct Args {
     pc_trace: Option<PathBuf>,
 
     /// Annotate `jsr -$xx(a6)` calls with AmigaOS routine names from this
-    /// library (exec, dos, graphics, intuition). The library must be named
+    /// library (exec, dos, graphics, intuition, gadtools, utility, asl,
+    /// layers, diskfont). The library must be named
     /// because the offset alone is ambiguous — `-$1e` is exec/Supervisor
     /// but dos/Input — and which base a program keeps in a6 usually cannot
     /// be decided from the instruction.
