@@ -148,12 +148,25 @@ fn string_run_len(data: &[u8], start: usize) -> usize {
     // Instructions are word-aligned, so a data line of odd length would
     // leave every following line decoding at an odd address — the whole
     // listing after it desynchronizes. Round up to the word boundary,
-    // absorbing the pad byte (usually a second NUL) into this line.
+    // absorbing the pad byte (usually a second NUL) into this line —
+    // unless the next byte begins another string, as in a run of
+    // unpadded messages: that string is a data line too, so nothing
+    // desynchronizes, and taking its first byte would split it.
     let mut len = end - start;
-    if !len.is_multiple_of(2) && start + len < data.len() {
+    if !len.is_multiple_of(2) && start + len < data.len() && !starts_string(data, start + len) {
         len += 1;
     }
     len
+}
+
+/// True if a NUL-terminated printable run of at least [`MIN_STRING_RUN`]
+/// bytes starts at `data[at]`.
+fn starts_string(data: &[u8], at: usize) -> bool {
+    let printable = data[at..]
+        .iter()
+        .take_while(|&&b| is_string_byte(b))
+        .count();
+    printable >= MIN_STRING_RUN && data.get(at + printable) == Some(&0)
 }
 
 /// True if the instruction's `target_address` is somewhere execution can
@@ -487,7 +500,9 @@ impl Disassembler {
     /// Callers that have authoritative entry points should prefer those.
     pub fn seed_entry_points_from_pointer_tables(&mut self) {
         let end = self.origin.saturating_add(self.data.len() as u32);
-        let is_in_image = |v: u32| v >= self.origin && v < end && v.is_multiple_of(2);
+        // Odd addresses count: a table of string pointers has them. Only
+        // even ones can be entry points, see below.
+        let is_in_image = |v: u32| v >= self.origin && v < end;
 
         // Whether a longword read at each *word* offset points into the
         // image.
@@ -510,6 +525,8 @@ impl Disassembler {
         // means two word slots apart, since one pointer spans two of them;
         // a run is therefore walked in steps of 2.
         let mut found: Vec<u32> = Vec::new();
+        // Slots of pointers to text: a table of string pointers.
+        let mut string_pointers: Vec<u32> = Vec::new();
         for start in 0..pointer_at.len() {
             // Only start a run where one cannot already be in progress,
             // so each table is reported once from its true first entry.
@@ -524,7 +541,17 @@ impl Disassembler {
             if count >= MIN_POINTER_TABLE {
                 for j in (start..=end).step_by(2) {
                     let raw = &self.data[j * 2..j * 2 + 4];
-                    found.push(u32::from_be_bytes(raw.try_into().unwrap()));
+                    let target = u32::from_be_bytes(raw.try_into().unwrap());
+                    // A table of string pointers is a pointer run too; a
+                    // target that reads as text is not somewhere to run,
+                    // and the slot that points at it is data.
+                    if string_run_len(&self.data, (target - self.origin) as usize) > 0 {
+                        string_pointers.push(self.origin + j as u32 * 2);
+                        continue;
+                    }
+                    if target.is_multiple_of(2) {
+                        found.push(target);
+                    }
                 }
             }
         }
@@ -532,6 +559,7 @@ impl Disassembler {
         found.sort_unstable();
         found.dedup();
         self.entry_points.extend(found);
+        self.add_pointer_sites(string_pointers);
     }
 
     /// True if `addr` falls inside any range passed to

@@ -15,8 +15,12 @@ use m68k_disasm::disassembler::Disassembler;
 /// Regression guard: a change that lowers the reach must adjust the
 /// baseline deliberately. Recorded from Kickstart 1.3 (256 KiB) and
 /// 3.1 (512 KiB).
-const BASELINE_256K: (usize, usize, usize) = (80619, 74277, 75084);
-const BASELINE_512K: (usize, usize, usize) = (167758, 154467, 157072);
+///
+/// Lowered deliberately when consecutive unpadded strings stopped being
+/// split and pointers to text stopped seeding entry points: both had
+/// counted junk instructions decoded from message text as reach.
+const BASELINE_256K: (usize, usize, usize) = (80619, 71532, 71591);
+const BASELINE_512K: (usize, usize, usize) = (167758, 143088, 143530);
 
 fn instructions(mut disasm: Disassembler) -> usize {
     disasm
