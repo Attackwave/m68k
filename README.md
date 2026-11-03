@@ -81,8 +81,9 @@ m68k-disasm --system atarist -a $20000 program.bin
 A TOS program (`.PRG`, `.TOS`, `.TTP`, `.ACC`; magic `$601A` with a
 consistent header) is loaded the same way: text and data are placed back
 to back at `--address`, the relocation table is applied, every relocated
-longword is emitted as a `dc.l` pointer, the data segment as data, and
-disassembly follows control flow from the start of the text segment.
+longword is emitted as a `dc.l` pointer, the data segment as data, the
+names in the symbol table replace generated labels, and disassembly
+follows control flow from the start of the text segment.
 
 ### Symbol File Format
 
@@ -250,10 +251,11 @@ release builds.
 
 `prg` output is an Atari ST / TOS program (`.PRG`, `.TOS`, `.TTP`, `.ACC`
 are the same format): the `text`, `data` and `bss` sections laid out back
-to back, as GEMDOS loads them, followed by a relocation table so the
-program can be loaded at any address. The same rule as for `hunk-exe`
-applies: only full 32-bit address fields can be relocated. Named sections
-are not allowed, and no symbol table is written.
+to back, as GEMDOS loads them, followed by a DRI symbol table (every
+label, with names longer than 8 characters in the GST extended form that
+holds 22) and a relocation table so the program can be loaded at any
+address. The same rule as for `hunk-exe` applies: only full 32-bit
+address fields can be relocated. Named sections are not allowed.
 
 ### System includes
 

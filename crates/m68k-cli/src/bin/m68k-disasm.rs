@@ -169,8 +169,8 @@ fn run(args: Args) -> Result<(), String> {
     } else if looks_like_prg(&data) {
         // A TOS program: text and data loaded back to back at the given
         // address, every relocated longword a pointer, the data segment
-        // data by the file's own account. Execution begins at the start
-        // of the text segment.
+        // data by the file's own account, and its symbol table's names as
+        // labels. Execution begins at the start of the text segment.
         let prg = read_prg(&data, start_addr)
             .map_err(|e| format!("cannot read '{}': {}", input_display(&args.input), e))?;
         let data_start = prg.load_base.wrapping_add(prg.text_len);
@@ -179,7 +179,7 @@ fn run(args: Args) -> Result<(), String> {
             data_ranges: vec![(data_start, data_start.wrapping_add(prg.data_len))],
             entry: Some(prg.load_base),
         });
-        (prg.image, prg.load_base, Vec::new())
+        (prg.image, prg.load_base, prg.symbols)
     } else {
         (data, start_addr, Vec::new())
     };

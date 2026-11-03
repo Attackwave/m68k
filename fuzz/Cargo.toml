@@ -69,3 +69,10 @@ path = "fuzz_targets/floppy_amigados_write.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "atari_prg"
+path = "fuzz_targets/atari_prg.rs"
+test = false
+doc = false
+bench = false
