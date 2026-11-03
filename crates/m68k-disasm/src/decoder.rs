@@ -114,6 +114,7 @@ pub enum DecodeResult {
 /// bit position. For `MOVEM D0-D7,-(SP)` the opword's EA field is the
 /// destination and `src_ea` describes the register list, so checking the
 /// wrong field rejects a perfectly ordinary instruction.
+#[derive(PartialEq)]
 enum StandardEa {
     Source,
     Destination,
@@ -183,16 +184,22 @@ fn standard_ea_role(parser: ParserType) -> Option<StandardEa> {
 /// A category of 0 means "not filled in", not "nothing allowed", so those
 /// patterns are left alone rather than having everything rejected.
 fn ea_field_is_legal_for(op: u16, pat: &m68k_core::opcodes::OpcodePattern) -> bool {
+    let mode = ((op >> 3) & 0x7) as u8;
+    let reg = (op & 0x7) as u8;
     let category = match standard_ea_role(pat.parser) {
         Some(StandardEa::Source) => pat.src_ea,
         Some(StandardEa::Destination) => pat.dst_ea,
         None => return true,
     };
     if category == 0 {
-        return true;
+        // Nothing filled in, so the only thing to check is what holds for
+        // every written operand: PC-relative and immediate forms cannot be
+        // written to. BTST only reads its operand and takes both.
+        return !(standard_ea_role(pat.parser) == Some(StandardEa::Destination)
+            && mode == 7
+            && reg > 1
+            && pat.mnemonic != "BTST");
     }
-    let mode = ((op >> 3) & 0x7) as u8;
-    let reg = (op & 0x7) as u8;
     m68k_core::ea_categories::ea_matches(mode, reg, category)
 }
 
@@ -272,6 +279,11 @@ fn parse_operands(
             let src_reg = (op & 0x7) as u8;
             let dst_mode = ((op >> 6) & 0x7) as u8;
             let dst_reg = ((op >> 9) & 0x7) as u8;
+            // The destination is written, so PC-relative and immediate
+            // forms (mode 7, registers 2-4) are not encodings of MOVE.
+            if dst_mode == 7 && dst_reg > 1 {
+                return Err("MOVE to a non-alterable destination".into());
+            }
             let src = decode_ea(src_mode, src_reg, size, stream, inst_pc, cpu)?;
             let dst = decode_ea(dst_mode, dst_reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(src));
@@ -306,6 +318,11 @@ fn parse_operands(
             let mode = ((op >> 3) & 0x7) as u8;
             let _reg = (op & 0x7) as u8;
             let mask = stream.read_word()?;
+            // An empty list is not an instruction any assembler emits, and
+            // registers-to-memory has no postincrement form.
+            if mask == 0 || mode == 3 {
+                return Err("MOVEM with an empty list or (An)+ destination".into());
+            }
             let is_predec = mode == 4;
             let display_mask = if is_predec {
                 let mut m = 0u16;
@@ -329,6 +346,10 @@ fn parse_operands(
             let mode = ((op >> 3) & 0x7) as u8;
             let _reg = (op & 0x7) as u8;
             let mask = stream.read_word()?;
+            // Memory-to-registers has no predecrement form.
+            if mask == 0 || mode == 4 {
+                return Err("MOVEM with an empty list or -(An) source".into());
+            }
             let regs = format_movem_list(mask);
             let ea = decode_ea(mode, _reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(ea));
@@ -510,6 +531,11 @@ fn parse_operands(
                 let ext_pc = stream.current_pc();
                 ((ext_pc as i32).wrapping_add(disp as i32) as u32, "s")
             };
+            // A branch to an odd address is an address error, not a
+            // destination a compiler or programmer ever encoded.
+            if !target.is_multiple_of(2) {
+                return Err("branch to an odd address".into());
+            }
             target_addr = Some(target);
             operands.push(DecodedOperand::from_ea(EAOperand::AbsoluteLong(target)));
             Ok((format!("{}.{}", cc_name, suffix), operands, target_addr))
@@ -525,6 +551,9 @@ fn parse_operands(
             let ext_pc = stream.current_pc();
             let disp = sign_extend_16(stream.read_word()?);
             let target = (ext_pc as i32).wrapping_add(disp) as u32;
+            if !target.is_multiple_of(2) {
+                return Err("branch to an odd address".into());
+            }
             target_addr = Some(target);
             operands.push(DecodedOperand::from_ea(EAOperand::DataReg(reg)));
             operands.push(DecodedOperand::from_ea(EAOperand::AbsoluteLong(target)));
@@ -558,6 +587,11 @@ fn parse_operands(
             let dst_mode = ((op >> 3) & 0x7) as u8;
             let dst_reg = (op & 0x7) as u8;
             let bit = stream.read_word()?;
+            // The bit number lives in the low byte; a set high byte is
+            // data, not an encoding an assembler produces.
+            if bit & 0xFF00 != 0 {
+                return Err("bit number with a non-zero high byte".into());
+            }
             let size = if dst_mode == 0 { "l" } else { "b" };
             let dst = decode_ea(dst_mode, dst_reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(EAOperand::Immediate(
@@ -1919,8 +1953,13 @@ fn control_reg_name(cr: u16) -> String {
 fn read_immediate(size: &str, stream: &mut InstructionStream) -> Result<EAOperand, String> {
     match size {
         "b" => {
-            let val = stream.read_word()? as u64 & 0xFF;
-            Ok(EAOperand::Immediate(val, "b".into()))
+            // The high byte of a byte immediate's word is zero in every
+            // encoding an assembler emits; a word with it set is data.
+            let word = stream.read_word()?;
+            if word & 0xFF00 != 0 {
+                return Err("byte immediate with a non-zero high byte".into());
+            }
+            Ok(EAOperand::Immediate(word as u64, "b".into()))
         }
         "w" => {
             let val = stream.read_word()? as u64;
@@ -1996,8 +2035,12 @@ mod ea_validation_tests {
     /// Decode a single instruction, returning just its mnemonic — or
     /// `"dc.w"` when the bytes did not resolve to an instruction at all.
     fn decode_one(bytes: &[u8]) -> String {
-        let mut stream = InstructionStream::new(bytes, 0);
-        match decode_next(&mut stream, "68020") {
+        decode_one_on(bytes, "68020")
+    }
+
+    fn decode_one_on(bytes: &[u8], cpu: &str) -> String {
+        let mut stream = InstructionStream::new(bytes, 0x1000);
+        match decode_next(&mut stream, cpu) {
             Ok((_, DecodeResult::Instruction(i))) => i.mnemonic,
             Ok((_, DecodeResult::DataWord(_))) => "dc.w".to_string(),
             Err(e) => format!("error: {}", e),
@@ -2013,6 +2056,63 @@ mod ea_validation_tests {
         // instruction that does not exist, produced from a data region.
         assert_eq!(decode_one(&[0x00, 0x0A, 0x00, 0x50]), "dc.w");
         assert_eq!(decode_one(&[0x00, 0x08, 0x00, 0x01]), "dc.w");
+    }
+
+    #[test]
+    fn byte_access_to_an_address_register_is_data() {
+        // MOVE.B -(A0),A1, SUBQ.B #7,A0, MOVE.B A0,-(SP): none exists,
+        // all came out of data regions.
+        assert_eq!(decode_one(&[0x12, 0x60]), "dc.w");
+        assert_eq!(decode_one(&[0x5F, 0x08]), "dc.w");
+        assert_eq!(decode_one(&[0x1F, 0x48, 0xE7, 0xC0]), "dc.w");
+        // The word and long forms on An are real instructions.
+        assert_eq!(decode_one(&[0x5F, 0x48]), "subq.w");
+        assert_eq!(decode_one(&[0x30, 0x48]), "move.w");
+    }
+
+    #[test]
+    fn non_canonical_encodings_are_data() {
+        // ORI.B #$ff,D0 with the immediate's high byte set (0000 FFFF is
+        // the Kickstart ROM header); an index word with scale bits on a
+        // 68000 (the brief format's bits 10-8 are reserved there).
+        assert_eq!(decode_one(&[0x00, 0x00, 0xFF, 0xFF]), "dc.w");
+        assert_eq!(decode_one(&[0x00, 0x00, 0x00, 0xFF]), "ori.b");
+        assert_eq!(decode_one(&[0x08, 0x04, 0x08, 0xA4]), "dc.w"); // btst #$08a4,d4
+        assert_eq!(decode_one(&[0x08, 0x04, 0x00, 0x04]), "btst");
+        assert_eq!(decode_one_on(&[0x20, 0x70, 0x5E, 0x08], "68000"), "dc.w");
+        assert_eq!(decode_one_on(&[0x20, 0x70, 0x5E, 0x08], "68020"), "movea.l");
+        assert_eq!(decode_one_on(&[0x20, 0x70, 0x58, 0x08], "68000"), "movea.l");
+    }
+
+    #[test]
+    fn movem_without_registers_or_with_the_wrong_step_is_data() {
+        assert_eq!(decode_one(&[0x48, 0x9C, 0x00, 0x00]), "dc.w"); // movem.w ,(a4)+
+        assert_eq!(decode_one(&[0x48, 0x9C, 0x00, 0x03]), "dc.w"); // movem.w d0-d1,(a4)+
+        assert_eq!(decode_one(&[0x4C, 0xA4, 0x00, 0x03]), "dc.w"); // movem.w -(a4),d0-d1
+        assert_eq!(decode_one(&[0x48, 0xA4, 0x00, 0x03]), "movem.w"); // movem.w d0-d1,-(a4)... mask reversed, still a list
+        assert_eq!(decode_one(&[0x4C, 0x9C, 0x00, 0x03]), "movem.w"); // movem.w (a4)+,d0-d1
+    }
+
+    #[test]
+    fn branches_to_odd_addresses_are_data() {
+        // BRA.S with displacement $51 lands on an odd address; so does
+        // DBF with a word displacement of 1. Both came out of a data
+        // region and are address errors, not instructions.
+        assert_eq!(decode_one(&[0x60, 0x51]), "dc.w");
+        assert_eq!(decode_one(&[0x51, 0xC8, 0x00, 0x01]), "dc.w");
+        assert_eq!(decode_one(&[0x60, 0x50]), "bra.s");
+    }
+
+    #[test]
+    fn move_to_a_non_alterable_destination_is_data() {
+        // MOVE.B D2,#imm and MOVE.L -(A0),(d16,PC): mode 7 registers 4
+        // and 2 as destination.
+        assert_eq!(decode_one(&[0x19, 0xC2, 0x00, 0x00]), "dc.w");
+        // ADDQ.W #5,(d16,PC): a quick operand must be alterable.
+        assert_eq!(decode_one(&[0x5A, 0x7A, 0xF7, 0xD7]), "dc.w");
+        assert_eq!(decode_one(&[0x5A, 0x78, 0x00, 0x10]), "addq.w");
+        assert_eq!(decode_one(&[0x27, 0xE0, 0x00, 0x10]), "dc.w");
+        assert_eq!(decode_one(&[0x23, 0xE0, 0x00, 0x00, 0x10, 0x00]), "move.l");
     }
 
     #[test]

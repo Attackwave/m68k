@@ -334,15 +334,13 @@ fn format_signed(val: i32) -> String {
 }
 
 fn format_disp(disp: i32, reg: Option<&str>, idx: Option<(&String, &String, &u8)>) -> String {
-    // A zero displacement with a base register renders without the
-    // leading "$0" — `(a0)` / `(a0,d1.w)`, not `$0(a0)` / `$0(a0,d1.w)` —
-    // matching how every other m68k assembler/disassembler shows a plain
-    // register-indirect (with index) mode. Only applies when there's a
-    // base register: a bare `$0` with no `(reg)` suffix (e.g. formatting
-    // an absolute address or outer displacement elsewhere) is unaffected,
-    // since this function is only reached from AddrDisp/AddrIndex, both
-    // of which always pass a base register.
-    let disp_str = if disp == 0 && reg.is_some() {
+    // A zero displacement in the indexed form renders as `(a0,d1.w)`:
+    // that reassembles to the same extension word. In the plain
+    // displacement form it must stay visible — `$0(a0)` is the d16 mode
+    // with a zero word, which compilers emit, whereas `(a0)` is the
+    // two-bytes-shorter register-indirect mode. Dropping the zero would
+    // make the listing reassemble to different bytes.
+    let disp_str = if disp == 0 && reg.is_some() && idx.is_some() {
         String::new()
     } else {
         format_signed(disp)
@@ -502,6 +500,10 @@ pub fn decode_ea(
 
     match mode {
         0 => Ok(EAOperand::DataReg(reg)),
+        // No instruction has a byte-sized form on an address register:
+        // the hardware has no byte access to An. An opword that says so
+        // is data, and must not decode.
+        1 if size == "b" => Err("byte access to an address register".into()),
         1 => Ok(EAOperand::AddrReg(reg)),
         2 => Ok(EAOperand::AddrIndirect(reg)),
         3 => Ok(EAOperand::PostInc(reg)),
@@ -512,6 +514,12 @@ pub fn decode_ea(
         }
         6 => {
             let ext_word = stream.read_word()?;
+            // Before the 68020 the scale and full-format bits of the
+            // extension word are unused and always zero; a word with them
+            // set is data, not an index operand any assembler produced.
+            if level < 2 && ext_word & 0x0700 != 0 {
+                return Err("index extension bits reserved on this CPU".into());
+            }
             if ext_word & 0x0100 == 0 || level < 2 {
                 let (idx_reg, idx_size, disp, scale) = parse_index_extension(ext_word);
                 Ok(EAOperand::AddrIndex(reg, disp, idx_reg, idx_size, scale))
@@ -538,6 +546,9 @@ pub fn decode_ea(
             3 => {
                 let ext_pc = stream.current_pc();
                 let ext_word = stream.read_word()?;
+                if level < 2 && ext_word & 0x0700 != 0 {
+                    return Err("index extension bits reserved on this CPU".into());
+                }
                 if ext_word & 0x0100 == 0 || level < 2 {
                     let (idx_reg, idx_size, disp, scale) = parse_index_extension(ext_word);
                     let target = (ext_pc as i32 + disp as i32) as u32;
@@ -562,8 +573,14 @@ pub fn decode_ea(
                 let sz = size.to_uppercase();
                 match sz.as_str() {
                     "B" => {
-                        let val = stream.read_word()? as u64 & 0xFF;
-                        Ok(EAOperand::Immediate(val, size.to_string()))
+                        // A byte immediate occupies the low byte of its
+                        // word; the high byte is zero in every encoding an
+                        // assembler emits, so a word with it set is data.
+                        let word = stream.read_word()?;
+                        if word & 0xFF00 != 0 {
+                            return Err("byte immediate with a non-zero high byte".into());
+                        }
+                        Ok(EAOperand::Immediate(word as u64, size.to_string()))
                     }
                     "W" => {
                         let val = stream.read_word()? as u64;
@@ -666,13 +683,15 @@ mod tests {
     }
 
     /// Regression: `(d16,An)`/`(d8,An,Xn)` with disp==0 previously rendered
-    /// as `$0(a0)` instead of the conventional `(a0)`.
+    /// as `$0(a0)` instead of the conventional `(a0)` — which is right
+    /// for the d16 form, a different encoding from `(a0)`, but not for
+    /// the indexed form, where the zero adds nothing.
     #[test]
     fn test_zero_displacement_omits_dollar_zero() {
         let labels = HashMap::new();
         assert_eq!(
             EAOperand::AddrDisp(0, 0).format(&labels),
-            "(a0)".to_string()
+            "$0(a0)".to_string()
         );
         assert_eq!(
             EAOperand::AddrIndex(0, 0, "d1".to_string(), "w".to_string(), 1).format(&labels),

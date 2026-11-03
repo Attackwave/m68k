@@ -149,18 +149,20 @@ fn string_run_len(data: &[u8], start: usize) -> usize {
         return 0;
     }
     end += 1;
-    // Instructions are word-aligned, so a data line of odd length would
-    // leave every following line decoding at an odd address — the whole
-    // listing after it desynchronizes. Round up to the word boundary,
-    // absorbing the pad byte (usually a second NUL) into this line —
-    // unless the next byte begins another string, as in a run of
-    // unpadded messages: that string is a data line too, so nothing
-    // desynchronizes, and taking its first byte would split it.
-    let mut len = end - start;
-    if !len.is_multiple_of(2) && start + len < data.len() && !starts_string(data, start + len) {
-        len += 1;
+    // Instructions are word-aligned, so a data line ending at an odd
+    // address would leave every following line decoding at an odd
+    // address — the whole listing after it desynchronizes. Round the end
+    // up to the word boundary, absorbing the pad byte (usually a second
+    // NUL) into this line — unless the next byte begins another string,
+    // as in a run of unpadded messages: that string is a data line too,
+    // so nothing desynchronizes, and taking its first byte would split
+    // it. What matters is where the line ends, not how long it is: a
+    // string that itself starts at an odd address (the second of such a
+    // run) and has an odd length already ends on a word boundary.
+    if !end.is_multiple_of(2) && end < data.len() && !starts_string(data, end) {
+        end += 1;
     }
-    len
+    end - start
 }
 
 /// True if a NUL-terminated printable run of at least [`MIN_STRING_RUN`]
@@ -961,7 +963,7 @@ impl Disassembler {
                     // for run detection, but emitting them literally would
                     // break the line in two and produce output that cannot
                     // be reassembled.
-                    if (0x20..=0x7E).contains(&b) && b != b'"' {
+                    if (0x20..=0x7E).contains(&b) && b != b'"' && b != b'\\' {
                         quoted.push(b as char);
                     } else {
                         if !quoted.is_empty() {
@@ -1435,6 +1437,11 @@ mod tests {
         assert_eq!(string_run_len(b"abcde\x00zz", 0), 6);
         // "abcd" + NUL = 5, padded up to 6.
         assert_eq!(string_run_len(b"abcd\x00zz", 0), 6);
+        // The same string starting at an odd offset already ends on a
+        // word boundary: padding it would be what desynchronizes.
+        assert_eq!(string_run_len(b"xabcd\x00zz", 1), 5);
+        // And one of even length at an odd offset needs the pad.
+        assert_eq!(string_run_len(b"xabcde\x00zz", 1), 7);
     }
 
     /// Printable bytes without a NUL terminator are not a string. This is

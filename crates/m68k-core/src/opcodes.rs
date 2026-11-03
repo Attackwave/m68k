@@ -1385,7 +1385,9 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x5000,
             mnemonic: "ADDQ",
             src_ea: DATA,
-            dst_ea: ALL,
+            // Every alterable mode; An only in the word and long forms,
+            // which the EA decoder enforces by size.
+            dst_ea: MEM_ALT | AREG,
             cpu: "68000",
             parser: ParserType::Quick,
             fixed_size: None,
@@ -1415,7 +1417,9 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x5100,
             mnemonic: "SUBQ",
             src_ea: DATA,
-            dst_ea: ALL,
+            // Every alterable mode; An only in the word and long forms,
+            // which the EA decoder enforces by size.
+            dst_ea: MEM_ALT | AREG,
             cpu: "68000",
             parser: ParserType::Quick,
             fixed_size: None,
