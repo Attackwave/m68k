@@ -8,7 +8,10 @@
 //! table (pointers, and entry points for every vector inside the image)
 //! and the header (data). Atari TOS adds the names of its `trap` calls.
 
+use std::collections::HashMap;
+
 use m68k_asm::assembler::Assembler;
+use m68k_disasm::disassembler::WriteNote;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum System {
@@ -27,13 +30,15 @@ pub enum System {
 pub type TrapName = ((u8, u16), String);
 
 /// What the disassembler is told about an image for a system.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub struct SystemFacts {
     pub labels: Vec<(u32, String)>,
     pub data_ranges: Vec<(u32, u32)>,
     pub pointer_sites: Vec<u32>,
     pub entry_points: Vec<u32>,
     pub trap_names: Vec<TrapName>,
+    /// What an immediate written to a hardware address means.
+    pub write_notes: Vec<(u32, WriteNote)>,
 }
 
 const MEGADRIVE_HARDWARE: &str = include_str!("../../../include/megadrive/hardware.i");
@@ -97,6 +102,70 @@ fn tos_trap_names() -> Result<Vec<TrapName>, String> {
         }
     }
     Ok(names)
+}
+
+/// The VDP's access code from a control-port longword: CD1-0 sit in bits
+/// 31-30, CD5-2 in bits 7-4.
+fn vdp_access_code(value: u32) -> u32 {
+    ((value >> 30) & 3) | (((value >> 4) & 0xF) << 2)
+}
+
+/// What a value written to the Mega Drive VDP control port means: a word
+/// `$8rvv` sets register `r` to `vv` (a longword can set two), any other
+/// longword selects a VRAM, CRAM or VSRAM address for the data port. The
+/// register and access names come from `hardware.i`.
+fn vdp_control_note() -> Result<WriteNote, String> {
+    let symbols = equates(MEGADRIVE_HARDWARE)?;
+    let registers: HashMap<u32, String> = symbols
+        .iter()
+        .filter_map(|(name, value, _)| Some((*value, name.strip_prefix("VDPREG_")?.to_string())))
+        .collect();
+    // VDP_VRAM_WRITE and friends are the full control longwords; what
+    // identifies the access is their code.
+    let accesses: HashMap<u32, String> = symbols
+        .iter()
+        .filter_map(|(name, value, _)| {
+            let (memory, direction) = name.strip_prefix("VDP_")?.rsplit_once('_')?;
+            matches!(direction, "READ" | "WRITE").then(|| {
+                (
+                    vdp_access_code(*value),
+                    format!("{} {}", memory, direction.to_ascii_lowercase()),
+                )
+            })
+        })
+        .collect();
+    let register_write = move |word: u32| -> Option<String> {
+        if word & 0xE000 != 0x8000 {
+            return None;
+        }
+        let (reg, value) = ((word >> 8) & 0x1F, word & 0xFF);
+        Some(match registers.get(&reg) {
+            Some(name) => format!("VDP reg {} {} = ${:02x}", reg, name, value),
+            None => format!("VDP reg {} = ${:02x}", reg, value),
+        })
+    };
+    Ok(Box::new(move |value, size| {
+        let value = u32::try_from(value).ok()?;
+        match size {
+            2 => register_write(value),
+            4 => match (register_write(value >> 16), register_write(value & 0xFFFF)) {
+                (Some(high), Some(low)) => Some(format!("{}; {}", high, low)),
+                _ => {
+                    let code = vdp_access_code(value);
+                    let address = ((value >> 16) & 0x3FFF) | ((value & 3) << 14);
+                    // CD5 (bit 7 of the low word) starts a DMA transfer.
+                    let dma = if code & 0x20 != 0 { " (DMA)" } else { "" };
+                    Some(format!(
+                        "VDP {} ${:04x}{}",
+                        accesses.get(&(code & 0xF))?,
+                        address,
+                        dma
+                    ))
+                }
+            },
+            _ => None,
+        }
+    }))
 }
 
 impl System {
@@ -190,8 +259,15 @@ impl System {
             }
         }
 
-        if self == System::Atarist {
-            facts.trap_names = tos_trap_names()?;
+        match self {
+            System::Atarist => facts.trap_names = tos_trap_names()?,
+            System::Megadrive => {
+                // The control port and its mirror.
+                let ctrl = 0xC0_0004;
+                facts.write_notes =
+                    vec![(ctrl, vdp_control_note()?), (ctrl + 2, vdp_control_note()?)];
+            }
+            System::Neogeo => {}
         }
         Ok(facts)
     }
@@ -229,6 +305,39 @@ mod tests {
         assert_eq!(facts.entry_points, vec![0x200, 0x300]);
         assert_eq!(facts.data_ranges, vec![(0x100, 0x200)]);
         assert!(facts.trap_names.is_empty());
+    }
+
+    #[test]
+    fn megadrive_explains_what_is_written_to_the_vdp_control_port() {
+        let facts = System::Megadrive.facts(0x1000, &[0x4E, 0x75]).unwrap();
+        let note = |addr: u32| {
+            &facts
+                .write_notes
+                .iter()
+                .find(|(a, _)| *a == addr)
+                .unwrap()
+                .1
+        };
+        let ctrl = note(0xC0_0004);
+        assert_eq!(ctrl(0x8F02, 2).as_deref(), Some("VDP reg 15 AUTOINC = $02"));
+        assert_eq!(ctrl(0x8600, 2).as_deref(), Some("VDP reg 6 = $00"));
+        assert_eq!(ctrl(0x1234, 2), None);
+        assert_eq!(
+            ctrl(0x8104_8F02, 4).as_deref(),
+            Some("VDP reg 1 MODE2 = $04; VDP reg 15 AUTOINC = $02")
+        );
+        assert_eq!(
+            ctrl(0xC000_0000, 4).as_deref(),
+            Some("VDP CRAM write $0000")
+        );
+        // VRAM write to $c000 with DMA: A15-14 in bits 1-0, DMA in bit 7.
+        assert_eq!(
+            ctrl(0x4000_0083, 4).as_deref(),
+            Some("VDP VRAM write $c000 (DMA)")
+        );
+        assert_eq!(ctrl(0x1234_5678, 4), None);
+        assert_eq!(ctrl(0x8F, 1), None);
+        assert!(note(0xC0_0006)(0x8F02, 2).is_some());
     }
 
     #[test]
