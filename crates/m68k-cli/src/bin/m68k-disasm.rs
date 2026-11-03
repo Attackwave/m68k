@@ -241,6 +241,7 @@ fn run(args: Args) -> Result<(), String> {
         disasm.add_data_ranges(facts.data_ranges);
         disasm.add_entry_points(facts.entry_points);
         disasm.add_trap_names(facts.trap_names);
+        disasm.add_write_notes(facts.write_notes);
     }
     if let Some(info) = layout {
         disasm.add_pointer_sites(info.relocs);
