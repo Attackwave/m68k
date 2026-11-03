@@ -1,4 +1,5 @@
-//! Read-only FAT12, the filesystem of Atari ST (and PC) floppies.
+//! FAT12, the filesystem of Atari ST (and PC) floppies, read through any
+//! [`FloppyImageReader`]. Writing is in [`crate::fat12_write`].
 //!
 //! The boot sector's BIOS parameter block gives the layout in logical
 //! sectors: reserved sectors, then the FATs, then the fixed-size root
@@ -14,49 +15,46 @@
 use crate::amigados::DirEntry;
 use crate::floppy_base::{FloppyError, FloppyImageReader};
 
-const SECTOR_SIZE: usize = 512;
-const ENTRY_SIZE: usize = 32;
-const ATTR_DIRECTORY: u8 = 0x10;
-const ATTR_VOLUME: u8 = 0x08;
+pub(crate) const SECTOR_SIZE: usize = 512;
+pub(crate) const ENTRY_SIZE: usize = 32;
+pub(crate) const ATTR_DIRECTORY: u8 = 0x10;
+pub(crate) const ATTR_VOLUME: u8 = 0x08;
 const ATTR_LONG_NAME: u8 = 0x0F;
-const FIRST_DATA_CLUSTER: u32 = 2;
+pub(crate) const FIRST_DATA_CLUSTER: u32 = 2;
 const END_OF_CHAIN: u32 = 0xFF8;
 
-/// A mounted FAT12 filesystem over a floppy image. In the [`DirEntry`]s
-/// it hands out, `block` is the entry's first cluster.
-pub struct Fat12<'a> {
-    reader: &'a mut dyn FloppyImageReader,
-    sectors_per_track: u32,
-    sides: u32,
-    sectors_per_cluster: u32,
-    fat: Vec<u8>,
-    root_start: u32,
-    root_sectors: u32,
-    data_start: u32,
+/// The layout a boot sector's BIOS parameter block describes, in logical
+/// sectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Layout {
+    pub sectors_per_track: u32,
+    pub sides: u32,
+    pub sectors_per_cluster: u32,
+    pub reserved: u32,
+    pub fats: u32,
+    pub sectors_per_fat: u32,
+    pub root_start: u32,
+    pub root_sectors: u32,
+    pub data_start: u32,
+    pub total_sectors: u32,
     /// Clusters in the data area, the bound on any chain's length.
-    cluster_count: u32,
+    pub cluster_count: u32,
 }
 
-fn le16(block: &[u8], at: usize) -> u16 {
-    u16::from_le_bytes([block[at], block[at + 1]])
-}
-
-impl<'a> Fat12<'a> {
-    /// Mount the filesystem by its boot sector.
-    pub fn mount(reader: &'a mut dyn FloppyImageReader) -> Result<Self, FloppyError> {
-        let boot = reader.read_sector(0, 0, 0)?;
+impl Layout {
+    pub(crate) fn parse(boot: &[u8]) -> Result<Self, FloppyError> {
         if boot.len() < 32 {
             return Err(FloppyError::new("boot sector is shorter than 32 bytes"));
         }
-        let bytes_per_sector = le16(&boot, 11) as u32;
+        let bytes_per_sector = le16(boot, 11) as u32;
         let sectors_per_cluster = boot[13] as u32;
-        let reserved = le16(&boot, 14) as u32;
+        let reserved = le16(boot, 14) as u32;
         let fats = boot[16] as u32;
-        let root_entries = le16(&boot, 17) as u32;
-        let total_sectors = le16(&boot, 19) as u32;
-        let sectors_per_fat = le16(&boot, 22) as u32;
-        let sectors_per_track = le16(&boot, 24) as u32;
-        let sides = le16(&boot, 26) as u32;
+        let root_entries = le16(boot, 17) as u32;
+        let total_sectors = le16(boot, 19) as u32;
+        let sectors_per_fat = le16(boot, 22) as u32;
+        let sectors_per_track = le16(boot, 24) as u32;
+        let sides = le16(boot, 26) as u32;
         if bytes_per_sector != SECTOR_SIZE as u32
             || sectors_per_cluster == 0
             || fats == 0
@@ -77,39 +75,26 @@ impl<'a> Fat12<'a> {
                 "FAT12 layout leaves no room for a data area",
             ));
         }
-        let cluster_count = (total_sectors - data_start) / sectors_per_cluster;
-        let mut fs = Self {
-            reader,
+        Ok(Self {
             sectors_per_track,
             sides,
             sectors_per_cluster,
-            fat: Vec::new(),
+            reserved,
+            fats,
+            sectors_per_fat,
             root_start,
             root_sectors,
             data_start,
-            cluster_count,
-        };
-        fs.fat = fs.read_logical(reserved, sectors_per_fat)?;
-        Ok(fs)
+            total_sectors,
+            cluster_count: (total_sectors - data_start) / sectors_per_cluster,
+        })
     }
 
-    /// `count` logical sectors from `start`.
-    fn read_logical(&mut self, start: u32, count: u32) -> Result<Vec<u8>, FloppyError> {
-        let mut out = Vec::with_capacity(count as usize * SECTOR_SIZE);
-        for n in start..start + count {
-            let track = n / (self.sectors_per_track * self.sides);
-            let side = (n / self.sectors_per_track) % self.sides;
-            let sector = n % self.sectors_per_track;
-            out.extend(self.reader.read_sector(track, side, sector)?);
-        }
-        Ok(out)
-    }
-
-    /// The FAT entry for `cluster`: the next cluster in its chain, or an
-    /// end-of-chain mark.
-    fn next_cluster(&self, cluster: u32) -> Option<u32> {
+    /// The 12-bit FAT entry for `cluster` in `fat`, if the FAT is long
+    /// enough to hold it.
+    pub(crate) fn fat_entry(fat: &[u8], cluster: u32) -> Option<u32> {
         let at = (cluster as usize * 3) / 2;
-        let pair = self.fat.get(at..at + 2)?;
+        let pair = fat.get(at..at + 2)?;
         let value = u16::from_le_bytes([pair[0], pair[1]]);
         Some(if cluster.is_multiple_of(2) {
             (value & 0x0FFF) as u32
@@ -118,9 +103,14 @@ impl<'a> Fat12<'a> {
         })
     }
 
-    /// The clusters of a chain starting at `first`, in order. A chain
-    /// longer than the disk has clusters is a loop and an error.
-    fn chain(&self, first: u32) -> Result<Vec<u32>, FloppyError> {
+    /// The clusters of a chain starting at `first`, in order, following
+    /// `next`. A chain longer than the disk has clusters is a loop and an
+    /// error.
+    pub(crate) fn chain(
+        &self,
+        first: u32,
+        next: impl Fn(u32) -> Option<u32>,
+    ) -> Result<Vec<u32>, FloppyError> {
         let mut clusters = Vec::new();
         let mut cluster = first;
         while (FIRST_DATA_CLUSTER..FIRST_DATA_CLUSTER + self.cluster_count).contains(&cluster) {
@@ -131,7 +121,7 @@ impl<'a> Fat12<'a> {
                     first
                 )));
             }
-            cluster = self.next_cluster(cluster).ok_or_else(|| {
+            cluster = next(cluster).ok_or_else(|| {
                 FloppyError::new(format!("cluster {} is beyond the FAT", cluster))
             })?;
         }
@@ -144,70 +134,119 @@ impl<'a> Fat12<'a> {
         Ok(clusters)
     }
 
-    /// The bytes of a whole cluster chain.
-    fn read_chain(&mut self, first: u32) -> Result<Vec<u8>, FloppyError> {
-        let mut out = Vec::new();
-        for cluster in self.chain(first)? {
-            let start = self.data_start + (cluster - FIRST_DATA_CLUSTER) * self.sectors_per_cluster;
-            out.extend(self.read_logical(start, self.sectors_per_cluster)?);
+    /// First logical sector of `cluster`.
+    pub(crate) fn cluster_sector(&self, cluster: u32) -> u32 {
+        self.data_start + (cluster - FIRST_DATA_CLUSTER) * self.sectors_per_cluster
+    }
+}
+
+/// A mounted FAT12 filesystem over a floppy image. In the [`DirEntry`]s
+/// it hands out, `block` is the entry's first cluster.
+pub struct Fat12<'a> {
+    reader: &'a mut dyn FloppyImageReader,
+    layout: Layout,
+    fat: Vec<u8>,
+}
+
+pub(crate) fn le16(block: &[u8], at: usize) -> u16 {
+    u16::from_le_bytes([block[at], block[at + 1]])
+}
+
+/// The directory entries of a region: the root directory's sectors, or a
+/// subdirectory's cluster chain. Deleted, long-name, volume-label and
+/// `.`/`..` entries are skipped.
+pub(crate) fn entries_in(region: &[u8]) -> Vec<DirEntry> {
+    let mut entries = Vec::new();
+    for raw in region.chunks_exact(ENTRY_SIZE) {
+        match raw[0] {
+            0x00 => break,
+            0xE5 => continue,
+            _ => {}
+        }
+        let attr = raw[11];
+        if attr & ATTR_LONG_NAME == ATTR_LONG_NAME || attr & ATTR_VOLUME != 0 {
+            continue;
+        }
+        let base = String::from_utf8_lossy(&raw[0..8]).trim_end().to_string();
+        let ext = String::from_utf8_lossy(&raw[8..11]).trim_end().to_string();
+        if base == "." || base == ".." {
+            continue;
+        }
+        // $05 stands in for a leading $E5, which would mean "deleted".
+        let base = match base.strip_prefix('\u{5}') {
+            Some(rest) => format!("\u{e5}{rest}"),
+            None => base,
+        };
+        let name = if ext.is_empty() {
+            base
+        } else {
+            format!("{base}.{ext}")
+        };
+        let is_dir = attr & ATTR_DIRECTORY != 0;
+        entries.push(DirEntry {
+            name,
+            is_dir,
+            size: if is_dir {
+                0
+            } else {
+                u32::from_le_bytes(raw[28..32].try_into().unwrap())
+            },
+            block: le16(raw, 26) as u32,
+        });
+    }
+    entries
+}
+
+impl<'a> Fat12<'a> {
+    /// Mount the filesystem by its boot sector.
+    pub fn mount(reader: &'a mut dyn FloppyImageReader) -> Result<Self, FloppyError> {
+        let boot = reader.read_sector(0, 0, 0)?;
+        let layout = Layout::parse(&boot)?;
+        let mut fs = Self {
+            reader,
+            layout,
+            fat: Vec::new(),
+        };
+        fs.fat = fs.read_logical(layout.reserved, layout.sectors_per_fat)?;
+        Ok(fs)
+    }
+
+    /// `count` logical sectors from `start`.
+    fn read_logical(&mut self, start: u32, count: u32) -> Result<Vec<u8>, FloppyError> {
+        let (spt, sides) = (self.layout.sectors_per_track, self.layout.sides);
+        let mut out = Vec::with_capacity(count as usize * SECTOR_SIZE);
+        for n in start..start + count {
+            out.extend(
+                self.reader
+                    .read_sector(n / (spt * sides), (n / spt) % sides, n % spt)?,
+            );
         }
         Ok(out)
     }
 
-    /// Entries of a directory region: the root directory's sectors, or a
-    /// subdirectory's cluster chain.
-    fn entries_in(&self, region: &[u8]) -> Vec<DirEntry> {
-        let mut entries = Vec::new();
-        for raw in region.chunks_exact(ENTRY_SIZE) {
-            match raw[0] {
-                0x00 => break,
-                0xE5 => continue,
-                _ => {}
-            }
-            let attr = raw[11];
-            if attr & ATTR_LONG_NAME == ATTR_LONG_NAME || attr & ATTR_VOLUME != 0 {
-                continue;
-            }
-            let base = String::from_utf8_lossy(&raw[0..8]).trim_end().to_string();
-            let ext = String::from_utf8_lossy(&raw[8..11]).trim_end().to_string();
-            if base == "." || base == ".." {
-                continue;
-            }
-            // $05 stands in for a leading $E5, which would mean "deleted".
-            let base = match base.strip_prefix('\u{5}') {
-                Some(rest) => format!("\u{e5}{rest}"),
-                None => base,
-            };
-            let name = if ext.is_empty() {
-                base
-            } else {
-                format!("{base}.{ext}")
-            };
-            let is_dir = attr & ATTR_DIRECTORY != 0;
-            entries.push(DirEntry {
-                name,
-                is_dir,
-                size: if is_dir {
-                    0
-                } else {
-                    u32::from_le_bytes(raw[28..32].try_into().unwrap())
-                },
-                block: le16(raw, 26) as u32,
-            });
+    /// The bytes of a whole cluster chain.
+    fn read_chain(&mut self, first: u32) -> Result<Vec<u8>, FloppyError> {
+        let chain = self
+            .layout
+            .chain(first, |c| Layout::fat_entry(&self.fat, c))?;
+        let mut out = Vec::new();
+        for cluster in chain {
+            let start = self.layout.cluster_sector(cluster);
+            out.extend(self.read_logical(start, self.layout.sectors_per_cluster)?);
         }
-        entries
+        Ok(out)
     }
 
     /// List the root directory.
     pub fn list_root(&mut self) -> Result<Vec<DirEntry>, FloppyError> {
-        let region = self.read_logical(self.root_start, self.root_sectors)?;
-        Ok(self.entries_in(&region))
+        let region = self.read_logical(self.layout.root_start, self.layout.root_sectors)?;
+        Ok(entries_in(&region))
     }
 
     /// List the directory whose first cluster is `cluster`.
     pub fn list_dir(&mut self, cluster: u32) -> Result<Vec<DirEntry>, FloppyError> {
         let region = self.read_chain(cluster)?;
-        Ok(self.entries_in(&region))
+        Ok(entries_in(&region))
     }
 
     /// The entry at `path` (components separated by `/` or `\`, matched
