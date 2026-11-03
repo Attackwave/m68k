@@ -93,9 +93,9 @@ impl<'a> Mounted<'a> {
 
 #[derive(Parser, Debug)]
 #[command(name = "m68k-floppy", version)]
-#[command(about = "Inspect Amiga and Atari ST floppy disk images and extract data", long_about = None)]
+#[command(about = "Inspect and write Amiga and Atari ST floppy disk images", long_about = None)]
 struct Args {
-    /// Path to the disk image (.adf or .ipf)
+    /// Path to the disk image (.adf, .ipf, .st or .msa)
     image: PathBuf,
 
     /// Backend to use (default: auto-detect from extension)
@@ -143,21 +143,23 @@ struct Args {
     #[arg(long)]
     fix_bootblock: bool,
 
-    /// Create a new empty, mountable AmigaDOS disk image at IMAGE with the
-    /// given volume name, then apply any write options below to it
+    /// Create a new empty, mountable disk image at IMAGE with the given
+    /// volume name, then apply any write options below to it: AmigaDOS
+    /// (OFS, or FFS with --ffs), or a 720 KiB FAT12 disk when IMAGE ends
+    /// in .st
     #[arg(long, value_name = "VOLUME_NAME")]
     format: Option<String>,
 
-    /// Use FFS instead of OFS when creating a disk with --format
+    /// Use FFS instead of OFS when creating an AmigaDOS disk with --format
     #[arg(long)]
     ffs: bool,
 
     // Every write option can be given more than once. The pair options
     // used to be collected into one flat list of which only the first two
     // values were read, so a second --add-file was silently dropped.
-    /// Write a local file into the image: --add-file LOCAL AMIGA_PATH
-    /// (repeatable)
-    #[arg(long, num_args = 2, value_names = ["LOCAL", "AMIGA_PATH"])]
+    /// Write a local file into the image: --add-file LOCAL DISK_PATH
+    /// (repeatable). On FAT12 the name must fit 8.3
+    #[arg(long, num_args = 2, value_names = ["LOCAL", "DISK_PATH"])]
     add_file: Vec<String>,
 
     /// Delete a file from the image (repeatable)
@@ -177,12 +179,13 @@ struct Args {
     #[arg(long, num_args = 2, value_names = ["FROM", "TO"])]
     rename: Vec<String>,
 
-    /// Set an entry's comment: --set-comment PATH TEXT (repeatable)
+    /// Set an entry's comment: --set-comment PATH TEXT (repeatable;
+    /// AmigaDOS only)
     #[arg(long, num_args = 2, value_names = ["PATH", "TEXT"])]
     set_comment: Vec<String>,
 
     /// Set an entry's protection bits: --set-protection PATH BITS
-    /// (decimal, or hex with a 0x prefix; repeatable)
+    /// (decimal, or hex with a 0x prefix; repeatable; AmigaDOS only)
     #[arg(long, num_args = 2, value_names = ["PATH", "BITS"])]
     set_protection: Vec<String>,
 }
@@ -199,19 +202,45 @@ fn has_write_ops(args: &Args) -> bool {
         || !args.set_protection.is_empty()
 }
 
+/// Whether the image path has the extension `ext`, compared without
+/// regard to case.
+fn has_extension(args: &Args, ext: &str) -> bool {
+    args.image
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+}
+
 /// Apply every requested filesystem modification, in a fixed order, to a
 /// raw image buffer and write it back.
 ///
-/// These operate on the raw ADF bytes rather than through the backend
+/// These operate on the raw image bytes rather than through the backend
 /// abstraction: IPF is a flux-level format that cannot be written back,
-/// and UAE-extended images have variable-length tracks. A plain
-/// sector-addressable image is the only kind a filesystem writer applies
-/// to, so that is what this requires.
+/// UAE-extended images have variable-length tracks, and MSA is an
+/// archive. A plain sector-addressable image (ADF, ST) is the only kind a
+/// filesystem writer applies to, so that is what this requires. The
+/// filesystem is the one the boot sector announces, as for reading; a
+/// new image is AmigaDOS unless its name ends in `.st`.
 fn run_write_ops(args: &Args) -> Result<(), String> {
     use m68k_floppy::adf_writer;
-    use m68k_floppy::amigados_write::AmigaFsWriter;
+    use m68k_floppy::fat12_write;
 
-    let mut image = match &args.format {
+    if has_extension(args, "msa") {
+        return Err("an MSA archive cannot be written; use a .st image".into());
+    }
+    let (mut image, fat) = match &args.format {
+        Some(volume_name) if has_extension(args, "st") => {
+            if args.ffs {
+                return Err("--ffs applies to AmigaDOS images, not to a .st image".into());
+            }
+            let created = fat12_write::format_empty_st_disk(volume_name, 2)
+                .map_err(|e| format!("cannot format image: {}", e))?;
+            eprintln!(
+                "Formatted FAT12 volume {:?} ({} KiB)",
+                volume_name,
+                created.len() / 1024
+            );
+            (created, true)
+        }
         Some(volume_name) => {
             let created = if args.ffs {
                 adf_writer::format_empty_ffs_disk(volume_name)
@@ -225,13 +254,74 @@ fn run_write_ops(args: &Args) -> Result<(), String> {
                 volume_name,
                 created.len() / 1024
             );
-            created
+            (created, false)
         }
-        None => std::fs::read(&args.image).map_err(|e| format!("cannot read image: {}", e))?,
+        None => {
+            let image =
+                std::fs::read(&args.image).map_err(|e| format!("cannot read image: {}", e))?;
+            let fat = !image.starts_with(b"DOS");
+            (image, fat)
+        }
     };
 
+    if fat {
+        fat_write_ops(args, &mut image)?;
+        std::fs::write(&args.image, &image).map_err(|e| format!("cannot write image: {}", e))?;
+    } else {
+        amiga_write_ops(args, &mut image)?;
+        adf_writer::write_adf_file(&args.image, &image)
+            .map_err(|e| format!("cannot write image: {}", e))?;
+    }
+    eprintln!("Image written to {}", args.image.display());
+    Ok(())
+}
+
+/// The write options on a FAT12 image, in the same order as for AmigaDOS.
+/// FAT has no comments or protection bits, so those options are refused.
+fn fat_write_ops(args: &Args, image: &mut Vec<u8>) -> Result<(), String> {
+    use m68k_floppy::fat12_write::Fat12Writer;
+
+    if !args.set_comment.is_empty() || !args.set_protection.is_empty() {
+        return Err("FAT12 has no comments or protection bits".into());
+    }
+    let mut fs = Fat12Writer::mount(image)
+        .map_err(|e| format!("cannot mount filesystem for writing: {}", e))?;
+    for path in &args.make_dir {
+        fs.create_dir(path)
+            .map_err(|e| format!("cannot create directory {:?}: {}", path, e))?;
+        eprintln!("Created directory {}", path);
+    }
+    for [local, target] in args.add_file.as_chunks::<2>().0 {
+        let data = std::fs::read(local).map_err(|e| format!("cannot read {:?}: {}", local, e))?;
+        fs.write_file(target, &data)
+            .map_err(|e| format!("cannot write {:?}: {}", target, e))?;
+        eprintln!("Wrote {} ({} bytes) to {}", local, data.len(), target);
+    }
+    for pair in args.rename.as_chunks::<2>().0 {
+        fs.rename(&pair[0], &pair[1])
+            .map_err(|e| format!("cannot rename {:?}: {}", pair[0], e))?;
+        eprintln!("Renamed {} to {}", pair[0], pair[1]);
+    }
+    for path in &args.delete_file {
+        fs.delete_file(path)
+            .map_err(|e| format!("cannot delete {:?}: {}", path, e))?;
+        eprintln!("Deleted {}", path);
+    }
+    for path in &args.delete_dir {
+        fs.delete_dir(path)
+            .map_err(|e| format!("cannot delete directory {:?}: {}", path, e))?;
+        eprintln!("Deleted directory {}", path);
+    }
+    eprintln!("{} clusters free", fs.free_clusters());
+    Ok(())
+}
+
+/// The write options on an AmigaDOS image.
+fn amiga_write_ops(args: &Args, image: &mut Vec<u8>) -> Result<(), String> {
+    use m68k_floppy::amigados_write::AmigaFsWriter;
+
     {
-        let mut fs = AmigaFsWriter::mount(&mut image)
+        let mut fs = AmigaFsWriter::mount(image)
             .map_err(|e| format!("cannot mount filesystem for writing: {}", e))?;
 
         // Kinds run in a fixed order (directories first, deletions last);
@@ -286,10 +376,6 @@ fn run_write_ops(args: &Args) -> Result<(), String> {
 
         eprintln!("{} blocks free", fs.free_blocks());
     }
-
-    adf_writer::write_adf_file(&args.image, &image)
-        .map_err(|e| format!("cannot write image: {}", e))?;
-    eprintln!("Image written to {}", args.image.display());
     Ok(())
 }
 

@@ -8,6 +8,7 @@
 //! - [`floppy_base`] — the [`floppy_base::FloppyImageReader`] trait and [`floppy_base::FloppyError`].
 //! - [`amigados`] — read-only OFS/FFS filesystem support (directory listing, file extraction).
 //! - [`adf_writer`] — ADF image creation/writing.
+//! - [`st`] — Atari ST `.st`/`.msa` images, [`fat12`] reads and [`fat12_write`] writes their FAT12 filesystem.
 //!
 //! Not implemented: the proprietary `capsimg`-library-backed IPF backend. It
 //! would require FFI bindings to a closed-source `capsimg.{dll,so}` that may
@@ -22,6 +23,7 @@ pub mod amigados;
 pub mod amigados_write;
 pub mod factory;
 pub mod fat12;
+pub mod fat12_write;
 pub mod floppy_base;
 pub mod ipf;
 pub mod mfm;
