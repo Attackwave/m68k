@@ -19,8 +19,17 @@ use m68k_disasm::disassembler::Disassembler;
 /// Lowered deliberately when consecutive unpadded strings stopped being
 /// split and pointers to text stopped seeding entry points: both had
 /// counted junk instructions decoded from message text as reach.
-const BASELINE_256K: (usize, usize, usize) = (80619, 71532, 71591);
-const BASELINE_512K: (usize, usize, usize) = (167758, 143088, 143530);
+///
+/// Lowered again (linear) when the decoder stopped accepting encodings
+/// no assembler emits — byte access to An, byte immediates with a high
+/// byte, branches to odd addresses, empty MOVEM lists, writes to
+/// PC-relative operands: those were data. The traced figures rose at the
+/// same time, because a string whose pad byte was decided by its length
+/// rather than by its end address left everything after it decoding at
+/// odd addresses. The listing now reassembles to the ROM byte for byte
+/// (`rom_roundtrip` in m68k-cli).
+const BASELINE_256K: (usize, usize, usize) = (79746, 73846, 74113);
+const BASELINE_512K: (usize, usize, usize) = (165823, 153475, 155526);
 
 fn instructions(mut disasm: Disassembler) -> usize {
     disasm

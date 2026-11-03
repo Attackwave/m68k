@@ -31,6 +31,7 @@ m68k-disasm <binary-file> [options]
 - `input`: Path to the input binary file. Use `-` to read the image from standard input.
 - `-a`, `--address`: Set the origin base execution address (e.g. `0x1000`, `$1000`, or `4096`). Default is `0`.
 - `-r`, `--raw`: Include raw instruction hexadecimal bytes in the output.
+- `--source`: emit assembler source instead of a listing: an `ORG` line, no address column, instructions indented. Assembling the output with the same `--cpu` reproduces the input byte for byte (see below).
 - `-c`, `--cpu`: Target CPU limit for decoding (`68000`, `68010`, `68020`, `68030`, `68040`, `68060`). Default is `68000`.
 - `--system <megadrive|neogeo|atarist>`: name the machine's hardware registers, system variables and OS entry points, and apply its cartridge layout (see below).
 - `--symbols <file>`: name addresses from a symbol file (`address name` or `name = address` per line, see below). Repeatable.
@@ -412,6 +413,15 @@ The disassembler's reach on a real Kickstart ROM (instructions found by a
 linear scan, by control-flow tracing from the reset vector, and with pointer
 table scanning) is guarded by an ignored test; run it with a ROM at hand:
 `M68K_ROM=tmp/<rom> cargo test -p m68k-disasm --test rom_reach -- --ignored --nocapture`.
+
+The listing is also required to reassemble to the input: `m68k-disasm
+--source` on a Kickstart ROM, fed to `m68k-asm`, must give back the ROM
+byte for byte. Every encoding the decoder accepts must therefore be one
+the assembler produces, so opwords no assembler emits (a byte operation
+on an address register, a byte immediate with its high byte set, a
+branch to an odd address, an empty MOVEM list, a write to a PC-relative
+operand) are data. The same ignored test exists for this property:
+`M68K_ROM=tmp/<rom> cargo test -p m68k-cli --test rom_roundtrip -- --ignored --nocapture`.
 
 Golden-vector tests (`crates/m68k-asm/tests/golden_*.rs`) check encoder,
 decoder, float, expression, and token behavior against fixed reference

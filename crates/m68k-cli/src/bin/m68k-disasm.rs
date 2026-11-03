@@ -40,8 +40,14 @@ struct Args {
     cpu: String,
 
     /// Show raw bytes before each instruction
-    #[arg(short = 'r', long)]
+    #[arg(short = 'r', long, conflicts_with = "source")]
     raw: bool,
+
+    /// Emit assembler source instead of a listing: an ORG line, no
+    /// address column, instructions indented. Feeding the output back to
+    /// m68k-asm with the same --cpu reproduces the input byte for byte.
+    #[arg(long)]
+    source: bool,
 
     /// Follow control flow from this address instead of decoding linearly
     /// (hex, e.g. $1000). Repeatable. Only code reachable from the given
@@ -323,6 +329,9 @@ fn run(args: Args) -> Result<(), String> {
 
     let mut out = std::io::stdout().lock();
     let written = (|| -> std::io::Result<()> {
+        if args.source {
+            writeln!(out, "        org     ${:x}", base_addr)?;
+        }
         for line in disasm.disassemble() {
             if line.is_error {
                 eprintln!("{}", line.text);
@@ -335,7 +344,11 @@ fn run(args: Args) -> Result<(), String> {
             if let Some(label) = &line.label {
                 writeln!(out, "{}:", label)?;
             }
-            if args.raw {
+            if args.source {
+                // Column one is where labels live; an instruction without
+                // operands there (`rts`) would be read as one.
+                write!(out, "        ")?;
+            } else if args.raw {
                 let hex: String = line
                     .raw_bytes
                     .iter()
