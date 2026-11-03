@@ -82,6 +82,21 @@ struct Args {
     /// names GEMDOS, BIOS and XBIOS trap calls
     #[arg(long, value_name = "SYSTEM", value_enum)]
     system: Option<System>,
+
+    /// Symbol file: one `address name` per line (`$1000 main`, `0x1000
+    /// main` or `4096 main`; blank lines and `#`/`;` comments are
+    /// ignored). Repeatable. The names replace generated labels and are
+    /// used for any reference to those addresses
+    #[arg(long = "symbols", value_name = "FILE")]
+    symbols: Vec<PathBuf>,
+
+    /// Equates file: assembler source whose `EQU` and label definitions
+    /// name addresses (`custom.i`, a hardware map of your own). Every
+    /// defined symbol becomes a label; unlike `--system` no address range
+    /// is applied, so keep register numbers and bit masks out of it.
+    /// Repeatable
+    #[arg(long = "equates", value_name = "FILE")]
+    equates: Vec<PathBuf>,
 }
 
 fn parse_address(s: &str) -> Result<u32, String> {
@@ -94,6 +109,34 @@ fn parse_address(s: &str) -> Result<u32, String> {
         s.parse::<u32>()
             .map_err(|e| format!("invalid address: {}", e))
     }
+}
+
+/// Parses a symbol file: `address name` or `name = address` per line (the
+/// latter is what `m68k-asm --sym` writes), blank lines and `#`/`;`
+/// comments ignored. On failure returns the 1-based line and its text.
+fn parse_symbol_file(text: &str) -> Result<Vec<(u32, String)>, (usize, String)> {
+    let mut labels = Vec::new();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let parsed = match line.split_once('=') {
+            Some((name, addr)) => Some((addr.trim(), name.trim())),
+            None => line.split_once(char::is_whitespace),
+        }
+        .and_then(|(addr, name)| {
+            let name = name.trim();
+            (!name.is_empty() && !name.contains(char::is_whitespace))
+                .then(|| parse_address(addr).ok().map(|a| (a, name.to_string())))
+                .flatten()
+        });
+        match parsed {
+            Some(label) => labels.push(label),
+            None => return Err((index + 1, line.to_string())),
+        }
+    }
+    Ok(labels)
 }
 
 /// `-` means stdin, as documented in the README. Everything else is a
@@ -203,6 +246,34 @@ fn run(args: Args) -> Result<(), String> {
         disasm.add_pointer_sites(info.relocs);
         disasm.add_data_ranges(info.data_ranges);
         disasm.add_entry_points(info.entry);
+    }
+    for path in &args.symbols {
+        let text = fs::read_to_string(path)
+            .map_err(|e| format!("cannot read '{}': {}", path.display(), e))?;
+        let labels = parse_symbol_file(&text).map_err(|(line, text)| {
+            format!(
+                "{}:{}: expected 'address name', got: {}",
+                path.display(),
+                line,
+                text
+            )
+        })?;
+        disasm.add_known_labels(labels);
+    }
+    for path in &args.equates {
+        let source = fs::read_to_string(path)
+            .map_err(|e| format!("cannot read '{}': {}", path.display(), e))?;
+        let labels = m68k_cli::system::equates(&source)
+            .map_err(|e| format!("{}: {}", path.display(), e))?
+            .into_iter()
+            // Register numbers, bit masks and sizes are small values that
+            // would otherwise name the first bytes of an image at 0; a
+            // place inside the image is named through `--symbols`.
+            .filter(|(_, value, _)| {
+                !(base_addr..base_addr.wrapping_add(image_len as u32)).contains(value)
+            })
+            .map(|(name, value, _)| (value, name));
+        disasm.add_known_labels(labels);
     }
     let extra_entries = args
         .entries

@@ -171,7 +171,9 @@ impl OperandTrait for EAOperand {
                 // a 6-byte one. Both the assembler here and the reference
                 // accept the suffix on a bare address and on a label alike.
                 let se = sign_extend_16(*addr) as u32;
-                match labels.get(&se) {
+                // A 24-bit machine reaches its top I/O page through the short
+                // form, so a label at $ff8240 names $ffff8240.w as well.
+                match labels.get(&se).or_else(|| labels.get(&(se & 0x00FF_FFFF))) {
                     Some(label) => format!("{}.w", label),
                     None => format!("${:08x}.w", se),
                 }

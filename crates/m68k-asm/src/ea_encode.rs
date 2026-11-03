@@ -86,12 +86,16 @@ pub fn encode_ea(
             // encode identically — which they already do here, since an
             // address that high has wrapped to a negative `i32` by the
             // time it arrives. The check only has to be signed.
+            // A 68000/68010 has 24 address lines, so `$ff8240.w` reaches
+            // the same I/O register as `$ffff8240.w` and is how Atari ST
+            // code writes it; that form is taken as well on those CPUs.
             let a = *addr;
-            if !(-32768..=32767).contains(&a) {
+            let top_24_bit_page = cpu_level < 2 && (0xFF_8000..=0xFF_FFFF).contains(&a);
+            if !(-32768..=32767).contains(&a) && !top_24_bit_page {
                 return Err(AsmError::new("absolute short address out of range"));
             }
             check_ea(mode, reg, allowed)?;
-            Ok((mode, reg, vec![to_word(a)]))
+            Ok((mode, reg, vec![to_word(a & 0xFFFF)]))
         }
         Operand::AbsoluteLong(addr) => {
             let (mode, reg) = (7, 1);
@@ -467,6 +471,20 @@ mod tests {
             encode_ea(&Operand::AbsoluteShort(0x1234), "w", 0, 0xFFFF, "68000").unwrap();
         assert_eq!((mode, reg), (7, 0));
         assert_eq!(ext, vec![0x1234]);
+    }
+
+    #[test]
+    fn absolute_short_reaches_the_top_24_bit_page_on_a_68000_only() {
+        let short = |addr: i32, cpu: &str| {
+            encode_ea(&Operand::AbsoluteShort(addr), "w", 0, 0xFFFF, cpu).map(|(_, _, ext)| ext)
+        };
+        // $ff8240.w and $ffff8240.w name the same register on 24 address lines.
+        assert_eq!(short(0xFF_8240, "68000").unwrap(), vec![0x8240]);
+        assert_eq!(short(0xFF_8240, "68010").unwrap(), vec![0x8240]);
+        assert_eq!(short(-0x7DC0, "68000").unwrap(), vec![0x8240]);
+        assert!(short(0xFF_8240, "68020").is_err());
+        assert!(short(0xFF_7FFF, "68000").is_err());
+        assert!(short(0x8000, "68000").is_err());
     }
 
     fn base_mi() -> MemoryIndirectOperand {
