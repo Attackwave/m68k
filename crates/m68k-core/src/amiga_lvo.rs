@@ -33,6 +33,11 @@ pub enum Library {
     Dos,
     Graphics,
     Intuition,
+    Gadtools,
+    Utility,
+    Asl,
+    Layers,
+    Diskfont,
 }
 
 impl Library {
@@ -49,13 +54,28 @@ impl Library {
             "dos" => Some(Library::Dos),
             "graphics" | "gfx" => Some(Library::Graphics),
             "intuition" => Some(Library::Intuition),
+            "gadtools" => Some(Library::Gadtools),
+            "utility" => Some(Library::Utility),
+            "asl" => Some(Library::Asl),
+            "layers" => Some(Library::Layers),
+            "diskfont" => Some(Library::Diskfont),
             _ => None,
         }
     }
 
     /// The names accepted by [`Library::parse`], for error messages.
     pub fn names() -> &'static [&'static str] {
-        &["exec", "dos", "graphics", "intuition"]
+        &[
+            "exec",
+            "dos",
+            "graphics",
+            "intuition",
+            "gadtools",
+            "utility",
+            "asl",
+            "layers",
+            "diskfont",
+        ]
     }
 
     /// The library file name (e.g. "exec.library").
@@ -65,6 +85,11 @@ impl Library {
             Library::Dos => "dos.library",
             Library::Graphics => "graphics.library",
             Library::Intuition => "intuition.library",
+            Library::Gadtools => "gadtools.library",
+            Library::Utility => "utility.library",
+            Library::Asl => "asl.library",
+            Library::Layers => "layers.library",
+            Library::Diskfont => "diskfont.library",
         }
     }
 
@@ -79,6 +104,11 @@ impl Library {
             Library::Dos => DOS,
             Library::Graphics => GRAPHICS,
             Library::Intuition => INTUITION,
+            Library::Gadtools => GADTOOLS,
+            Library::Utility => UTILITY,
+            Library::Asl => ASL,
+            Library::Layers => LAYERS,
+            Library::Diskfont => DISKFONT,
         }
     }
 }
@@ -376,6 +406,127 @@ const INTUITION: &[(u16, &str)] = &[
     (0x18C, "WBenchToFront"),
 ];
 
+/// `gadtools.library`.
+const GADTOOLS: &[(u16, &str)] = &[
+    (0x1E, "CreateGadgetA"),
+    (0x24, "FreeGadgets"),
+    (0x2A, "GT_SetGadgetAttrsA"),
+    (0x30, "CreateMenusA"),
+    (0x36, "FreeMenus"),
+    (0x3C, "LayoutMenuItemsA"),
+    (0x42, "LayoutMenusA"),
+    (0x48, "GT_GetIMsg"),
+    (0x4E, "GT_ReplyIMsg"),
+    (0x54, "GT_RefreshWindow"),
+    (0x5A, "GT_BeginRefresh"),
+    (0x60, "GT_EndRefresh"),
+    (0x66, "GT_FilterIMsg"),
+    (0x6C, "GT_PostFilterIMsg"),
+    (0x72, "CreateContext"),
+    (0x78, "DrawBevelBoxA"),
+    (0x7E, "GetVisualInfoA"),
+    (0x84, "FreeVisualInfo"),
+    (0xAE, "GT_GetGadgetAttrsA"),
+];
+
+/// `utility.library`.
+const UTILITY: &[(u16, &str)] = &[
+    (0x1E, "FindTagItem"),
+    (0x24, "GetTagData"),
+    (0x2A, "PackBoolTags"),
+    (0x30, "NextTagItem"),
+    (0x36, "FilterTagChanges"),
+    (0x3C, "MapTags"),
+    (0x42, "AllocateTagItems"),
+    (0x48, "CloneTagItems"),
+    (0x4E, "FreeTagItems"),
+    (0x54, "RefreshTagItemClones"),
+    (0x5A, "TagInArray"),
+    (0x60, "FilterTagItems"),
+    (0x66, "CallHookPkt"),
+    (0x78, "Amiga2Date"),
+    (0x7E, "Date2Amiga"),
+    (0x84, "CheckDate"),
+    (0x8A, "SMult32"),
+    (0x90, "UMult32"),
+    (0x96, "SDivMod32"),
+    (0x9C, "UDivMod32"),
+    (0xA2, "Stricmp"),
+    (0xA8, "Strnicmp"),
+    (0xAE, "ToUpper"),
+    (0xB4, "ToLower"),
+    (0xBA, "ApplyTagChanges"),
+    (0xC6, "SMult64"),
+    (0xCC, "UMult64"),
+    (0xD2, "PackStructureTags"),
+    (0xD8, "UnpackStructureTags"),
+    (0xDE, "AddNamedObject"),
+    (0xE4, "AllocNamedObjectA"),
+    (0xEA, "AttemptRemNamedObject"),
+    (0xF0, "FindNamedObject"),
+    (0xF6, "FreeNamedObject"),
+    (0xFC, "NamedObjectName"),
+    (0x102, "ReleaseNamedObject"),
+    (0x108, "RemNamedObject"),
+    (0x10E, "GetUniqueID"),
+];
+
+/// `asl.library`.
+const ASL: &[(u16, &str)] = &[
+    (0x1E, "AllocFileRequest"),
+    (0x24, "FreeFileRequest"),
+    (0x2A, "RequestFile"),
+    (0x30, "AllocAslRequest"),
+    (0x36, "FreeAslRequest"),
+    (0x3C, "AslRequest"),
+];
+
+/// `layers.library`.
+const LAYERS: &[(u16, &str)] = &[
+    (0x1E, "InitLayers"),
+    (0x24, "CreateUpfrontLayer"),
+    (0x2A, "CreateBehindLayer"),
+    (0x30, "UpfrontLayer"),
+    (0x36, "BehindLayer"),
+    (0x3C, "MoveLayer"),
+    (0x42, "SizeLayer"),
+    (0x48, "ScrollLayer"),
+    (0x4E, "BeginUpdate"),
+    (0x54, "EndUpdate"),
+    (0x5A, "DeleteLayer"),
+    (0x60, "LockLayer"),
+    (0x66, "UnlockLayer"),
+    (0x6C, "LockLayers"),
+    (0x72, "UnlockLayers"),
+    (0x78, "LockLayerInfo"),
+    (0x7E, "SwapBitsRastPortClipRect"),
+    (0x84, "WhichLayer"),
+    (0x8A, "UnlockLayerInfo"),
+    (0x90, "NewLayerInfo"),
+    (0x96, "DisposeLayerInfo"),
+    (0x9C, "FattenLayerInfo"),
+    (0xA2, "ThinLayerInfo"),
+    (0xA8, "MoveLayerInFrontOf"),
+    (0xAE, "InstallClipRegion"),
+    (0xB4, "MoveSizeLayer"),
+    (0xBA, "CreateUpfrontHookLayer"),
+    (0xC0, "CreateBehindHookLayer"),
+    (0xC6, "InstallLayerHook"),
+    (0xCC, "InstallLayerInfoHook"),
+    (0xD2, "SortLayerCR"),
+    (0xD8, "DoHookClipRects"),
+    (0xDE, "ChangeLayerShape"),
+    (0xE4, "ScaleLayer"),
+];
+
+/// `diskfont.library`.
+const DISKFONT: &[(u16, &str)] = &[
+    (0x1E, "OpenDiskFont"),
+    (0x24, "AvailFonts"),
+    (0x2A, "NewFontContents"),
+    (0x30, "DisposeFontContents"),
+    (0x36, "NewScaledDiskFont"),
+];
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,6 +569,22 @@ mod tests {
         assert_eq!(Library::parse("nonesuch"), None);
     }
 
+    /// One vector per added library, at offsets taken from the function
+    /// order of the library's FD file (first function at -30, then -6
+    /// per slot, reserved slots counted).
+    #[test]
+    fn added_libraries_name_their_vectors() {
+        assert_eq!(lookup(Library::Gadtools, 0x1E), Some("CreateGadgetA"));
+        assert_eq!(lookup(Library::Gadtools, 0xAE), Some("GT_GetGadgetAttrsA"));
+        assert_eq!(lookup(Library::Gadtools, 0x8A), None); // reserved
+        assert_eq!(lookup(Library::Utility, 0x78), Some("Amiga2Date"));
+        assert_eq!(lookup(Library::Utility, 0x10E), Some("GetUniqueID"));
+        assert_eq!(lookup(Library::Asl, 0x30), Some("AllocAslRequest"));
+        assert_eq!(lookup(Library::Layers, 0xAE), Some("InstallClipRegion"));
+        assert_eq!(lookup(Library::Diskfont, 0x1E), Some("OpenDiskFont"));
+        assert_eq!(Library::parse("gadtools.library"), Some(Library::Gadtools));
+    }
+
     /// Tables are keyed by offset; a duplicate would silently shadow.
     #[test]
     fn tables_have_no_duplicate_offsets() {
@@ -426,6 +593,11 @@ mod tests {
             Library::Dos,
             Library::Graphics,
             Library::Intuition,
+            Library::Gadtools,
+            Library::Utility,
+            Library::Asl,
+            Library::Layers,
+            Library::Diskfont,
         ] {
             let mut seen = std::collections::HashSet::new();
             for (offset, name) in lib.table() {
