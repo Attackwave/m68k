@@ -739,7 +739,10 @@ impl Disassembler {
     }
 
     /// Shorten `len` so a data line at `addr` stops before the first
-    /// address the trace proved is an instruction start.
+    /// address the trace proved is an instruction start, or that a symbol
+    /// table names: a symbol marks the start of something, so the bytes
+    /// before it are a different object even when both happen to be
+    /// printable.
     ///
     /// A string run is found by scanning bytes, which knows nothing about
     /// where code resumes; without this a run of printable bytes ending
@@ -750,7 +753,10 @@ impl Disassembler {
         // following line the same way an odd-length run does.
         (2..len)
             .step_by(2)
-            .find(|&d| self.traced.contains(&addr.wrapping_add(d as u32)))
+            .find(|&d| {
+                let at = addr.wrapping_add(d as u32);
+                self.traced.contains(&at) || self.known_labels.contains_key(&at)
+            })
             .unwrap_or(len)
     }
 
@@ -1473,6 +1479,35 @@ mod tests {
             "expected quoted string, got {:?}",
             lines[1].text
         );
+    }
+
+    /// A symbol in the middle of a printable run marks where the next
+    /// object starts: `trap #1; bra.s` reads as "NA`\n", and without the
+    /// cut the routine behind the label would be swallowed by the string.
+    #[test]
+    fn test_string_run_stops_at_a_known_label() {
+        let bytes = vec![
+            0x60, 0x00, 0x00, 0x0a, // bra.w -> 0x100c (so a trace exists)
+            0x4E, 0x41, 0x60, 0x0a, // trap #1; bra.s: printable, unreached
+            0x70, 0x00, 0x4E, 0x75, // handler: moveq #0,d0; rts (unreached, labelled)
+            0x4E, 0x75, 0x00, 0x00, // rts <- traced; then the NUL
+        ];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        disasm.add_entry_points([0x1000]);
+        disasm.add_known_labels([(0x1008, "handler".to_string())]);
+        let lines = disasm.disassemble();
+        let at = |a: u32| {
+            lines
+                .iter()
+                .find(|l| l.address == a)
+                .map(|l| l.text.trim().to_string())
+        };
+        assert_eq!(
+            at(0x1008).as_deref(),
+            Some("moveq   #$00000000, d0"),
+            "{lines:?}"
+        );
+        assert_eq!(at(0x100a).as_deref(), Some("rts"));
     }
 
     /// A string run must stop before code the trace proved is real, or it
