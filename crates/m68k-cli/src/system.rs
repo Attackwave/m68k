@@ -54,8 +54,10 @@ const HEADER: (u32, u32) = (0x100, 0x200);
 /// DEMO_END, COIN_SOUND.
 const NEOGEO_HEADER_JUMPS: [u32; 4] = [0x122, 0x128, 0x12E, 0x134];
 
-/// Every defined symbol of an include file: `(name, value, line)`.
-fn equates(source: &str) -> Result<Vec<(String, u32, usize)>, String> {
+/// Every defined symbol of an assembler source: `(name, value, line)`, in
+/// source order. The source is assembled at origin 0, so labels are
+/// offsets and equates are their values.
+pub fn equates(source: &str) -> Result<Vec<(String, u32, usize)>, String> {
     let mut asm = Assembler::new(0);
     asm.assemble(source).map_err(|e| e.message)?;
     let mut found: Vec<(String, u32, usize)> = asm
