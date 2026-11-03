@@ -154,6 +154,18 @@ fn every_corpus_program_is_byte_complete() {
             "self_modifying",
             include_str!("../../../tests/programs/self_modifying.s"),
         ),
+        (
+            "movem_prologue",
+            include_str!("../../../tests/programs/movem_prologue.s"),
+        ),
+        (
+            "outside_image",
+            include_str!("../../../tests/programs/outside_image.s"),
+        ),
+        (
+            "string_table",
+            include_str!("../../../tests/programs/string_table.s"),
+        ),
     ] {
         assert_byte_complete(&run(src, false), name);
         assert_byte_complete(&run(src, true), name);
@@ -379,4 +391,62 @@ fn inline_arguments_after_a_call_are_still_read_as_code() {
 
     // Whatever the classification, no byte may go missing.
     assert_byte_complete(&lines, "inline_data");
+}
+
+/// `movem` register masks are instruction words, in both directions.
+#[test]
+fn movem_masks_stay_instructions_and_the_word_table_stays_data() {
+    let lines = run(
+        include_str!("../../../tests/programs/movem_prologue.s"),
+        false,
+    );
+    assert!(text_at(&lines, 0x100A).starts_with("movem.l d0-d7/a0-a6, -(sp)"));
+    assert!(text_at(&lines, 0x1014).starts_with("movem.l (sp)+, d0-d7/a0-a6"));
+    assert!(text_at(&lines, 0x101E).starts_with("movem.l d2/a2, -(sp)"));
+    assert!(text_at(&lines, 0x101A).starts_with("dc.w"));
+    assert!(text_at(&lines, 0x101C).starts_with("dc.w"));
+}
+
+/// Addresses outside the image stay numbers: no label is invented for a
+/// place that has no bytes, and nothing in the image becomes data.
+#[test]
+fn addresses_outside_the_image_are_numbers_not_labels() {
+    for scan_tables in [false, true] {
+        let lines = run(
+            include_str!("../../../tests/programs/outside_image.s"),
+            scan_tables,
+        );
+        assert!(text_at(&lines, 0x1000).ends_with("$00002000"));
+        assert!(lines.iter().all(|l| !l.text.trim().starts_with("dc.")));
+        // The loop head is the only label.
+        let labelled: Vec<u32> = lines
+            .iter()
+            .filter(|l| l.label.is_some())
+            .map(|l| l.address)
+            .collect();
+        assert_eq!(labelled, [0x1010]);
+    }
+}
+
+/// Finding 6, fixed: a table of pointers to strings is a pointer run, but
+/// its targets are text, so they are not entry points; the table is data
+/// and the strings are listed whole, even where one ends on an odd
+/// address and the next begins right behind it.
+#[test]
+fn string_pointer_table_is_data_and_its_strings_are_not_traced() {
+    let lines = run(include_str!("../../../tests/programs/string_table.s"), true);
+    assert!(text_at(&lines, 0x101A).starts_with("dc.l"));
+    assert!(text_at(&lines, 0x1022).starts_with("dc.l"));
+    assert!(text_at(&lines, 0x1026).contains("\"first\",$00"));
+    assert_eq!(text_at(&lines, 0x102C), "dc.b     \"second\",$00");
+    assert!(text_at(&lines, 0x1033).contains("\"third\",$00"));
+    // Nothing between the table and the end is an instruction.
+    assert!(
+        lines
+            .iter()
+            .filter(|l| l.address >= 0x101A)
+            .all(|l| l.text.trim().starts_with("dc.")),
+        "{:#?}",
+        lines.iter().map(|l| &l.text).collect::<Vec<_>>()
+    );
 }
