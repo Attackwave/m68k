@@ -294,14 +294,17 @@ fn prg_output_is_loaded_by_the_disassembler() {
     let (ok, prg, stderr) = run(asm(), &["-o", "-", "-f", "prg", "-"], src.as_bytes());
     assert!(ok, "{stderr}");
     assert_eq!(&prg[..2], &[0x60, 0x1A]);
-    // text: lea (6) + rts (2); data: 'Hello',0.
+    // text: lea (6) + rts (2); data: 'Hello',0; one 14-byte symbol.
     assert_eq!(&prg[2..6], &8u32.to_be_bytes());
     assert_eq!(&prg[6..10], &6u32.to_be_bytes());
+    assert_eq!(&prg[14..18], &14u32.to_be_bytes());
 
     let (ok, out, stderr) = run(disasm(), &["-a", "$20000", "-"], &prg);
     assert!(ok, "{stderr}");
     let text = String::from_utf8_lossy(&out);
-    assert!(text.contains("00020000:  lea     $00020008, a0"), "{text}");
+    // The symbol table names the data the lea points at.
+    assert!(text.contains("00020000:  lea     msg, a0"), "{text}");
+    assert!(text.contains("msg:"), "{text}");
     // The data segment is data by the header's account, not `pea (a1)`.
     assert!(text.contains("00020008:  dc.w     $4865"), "{text}");
 }
