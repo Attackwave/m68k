@@ -328,12 +328,24 @@ m68k-floppy --bootblock roms/game.adf > bootblock.bin
 as well, which is what the boot sector of an Atari ST (or PC) floppy
 describes; the filesystem is chosen by the boot sector, so a FAT-formatted
 `.adf` is read the same way. Paths may use `/` or `\` and are matched
-without regard to case. FAT12 support is read-only; the writing options
-below apply to AmigaDOS images only.
+without regard to case.
 
 ```bash
 m68k-floppy game.st --list-all
 m68k-floppy game.msa --extract AUTO/BOOT.PRG -o boot.prg
+```
+
+The writing options below work on a `.st` image too: `--format` on a
+path ending in `.st` creates an empty 720 KiB double-sided FAT12 disk
+(non-bootable), and `--add-file`, `--delete-file`, `--make-dir`,
+`--delete-dir` and `--rename` edit whichever filesystem the boot sector
+announces. Names are stored in 8.3 form; `--set-comment` and
+`--set-protection` have no FAT12 counterpart and are refused. An `.msa`
+archive cannot be written back; convert it to `.st` first.
+
+```bash
+m68k-floppy disk.st --format DISK --make-dir AUTO --add-file hello.prg AUTO/HELLO.PRG
+m68k-floppy disk.st --add-file readme.txt README.TXT --delete-file AUTO/HELLO.PRG
 ```
 
 ### AmigaDOS filesystem (OFS/FFS)
