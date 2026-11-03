@@ -18,6 +18,16 @@
 //!     26     2  absflag: non-zero means "already absolute, no relocation"
 //! ```
 //!
+//! The symbol table is in DRI format: 14-byte entries of an 8-byte name
+//! (NUL or space padded), a 16-bit type and a 32-bit value. The type is
+//! a set of flags: `$8000` defined, `$4000` equated (the value is not an
+//! address), `$2000` global, `$1000` register, `$0800` external, `$0400`
+//! data, `$0200` text, `$0100` bss. An entry whose type has `$0048` set
+//! is a GST extended entry: the next 14 bytes continue the name, for up
+//! to 22 characters. Values are offsets from the start of the text
+//! segment whatever the section, since GEMDOS loads the three as one
+//! block.
+//!
 //! The relocation table starts with a longword offset (from the start of
 //! the text segment) of the first relocated longword, 0 when there are
 //! none. Each following byte is a step: 0 ends the table, 1 advances the
@@ -28,6 +38,20 @@ use std::fmt;
 
 pub const PRG_MAGIC: u16 = 0x601A;
 pub const HEADER_LEN: usize = 28;
+
+/// Size of a DRI symbol table entry.
+pub const SYMBOL_ENTRY_LEN: usize = 14;
+/// Symbol type flags.
+pub const SYM_DEFINED: u16 = 0x8000;
+pub const SYM_EQUATED: u16 = 0x4000;
+pub const SYM_GLOBAL: u16 = 0x2000;
+pub const SYM_REGISTER: u16 = 0x1000;
+pub const SYM_EXTERNAL: u16 = 0x0800;
+pub const SYM_DATA: u16 = 0x0400;
+pub const SYM_TEXT: u16 = 0x0200;
+pub const SYM_BSS: u16 = 0x0100;
+/// Set on an entry whose name continues in the following 14 bytes.
+pub const SYM_EXTENDED: u16 = 0x0048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrgError(pub String);
@@ -52,6 +76,10 @@ pub struct TosProgram {
     pub bss_len: u32,
     /// Absolute addresses of every relocated longword, ascending.
     pub relocs: Vec<u32>,
+    /// `(address, name)` of every text, data or bss symbol in the DRI
+    /// symbol table, relocated to `load_base`. Equates, registers and
+    /// externals are left out.
+    pub symbols: Vec<(u32, String)>,
 }
 
 fn long(data: &[u8], at: usize) -> u32 {
@@ -108,8 +136,14 @@ pub fn read_prg(data: &[u8], load_base: u32) -> Result<TosProgram, PrgError> {
     }
     let mut image = data[HEADER_LEN..image_end as usize].to_vec();
 
-    let mut relocs = Vec::new();
     let table = image_end.saturating_add(symbols_len as u64);
+    let symbol_bytes = data
+        .get(image_end as usize..(table as usize).min(data.len()))
+        .unwrap_or(&[]);
+    let program_len = segments.saturating_add(bss_len as u64);
+    let symbols = read_symbols(symbol_bytes, load_base, program_len);
+
+    let mut relocs = Vec::new();
     // A program flagged absolute carries no table; one that is not but
     // ends right after its segments is taken the same way.
     if !absolute && table as usize + 4 <= data.len() {
@@ -163,7 +197,40 @@ pub fn read_prg(data: &[u8], load_base: u32) -> Result<TosProgram, PrgError> {
         data_len,
         bss_len,
         relocs,
+        symbols,
     })
+}
+
+/// The address symbols of a DRI symbol table: those flagged text, data or
+/// bss that are neither equated, registers nor externals, with a value
+/// inside the program's `program_len` bytes. A truncated last entry is
+/// ignored.
+fn read_symbols(table: &[u8], load_base: u32, program_len: u64) -> Vec<(u32, String)> {
+    let mut symbols = Vec::new();
+    let mut entries = table.as_chunks::<SYMBOL_ENTRY_LEN>().0.iter();
+    while let Some(entry) = entries.next() {
+        let kind = u16::from_be_bytes([entry[8], entry[9]]);
+        let value = long(entry, 10);
+        let mut name = entry[..8].to_vec();
+        if kind & SYM_EXTENDED == SYM_EXTENDED
+            && let Some(more) = entries.next()
+        {
+            name.extend_from_slice(more);
+        }
+        let name: String = name
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| b as char)
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+        let names_an_address = kind & (SYM_TEXT | SYM_DATA | SYM_BSS) != 0
+            && kind & (SYM_EQUATED | SYM_REGISTER | SYM_EXTERNAL) == 0;
+        if names_an_address && !name.is_empty() && (value as u64) < program_len {
+            symbols.push((load_base.wrapping_add(value), name));
+        }
+    }
+    symbols
 }
 
 #[cfg(test)]
@@ -221,6 +288,39 @@ mod tests {
         file.extend_from_slice(&[0x4E, 0x75]);
         file.extend_from_slice(&[0, 0, 0, 0]);
         assert_eq!(read_prg(&file, 0).unwrap().relocs, Vec::<u32>::new());
+    }
+
+    #[test]
+    fn symbols_are_read_and_a_truncated_table_is_tolerated() {
+        let mut file = header(4, 0, 4, 0);
+        file[14..18].copy_from_slice(&(5 * SYMBOL_ENTRY_LEN as u32).to_be_bytes());
+        file.extend_from_slice(&[0x4E, 0x71, 0x4E, 0x75]);
+        let entry = |name: &[u8], kind: u16, value: u32| {
+            let mut e = vec![0u8; SYMBOL_ENTRY_LEN];
+            e[..name.len()].copy_from_slice(name);
+            e[8..10].copy_from_slice(&kind.to_be_bytes());
+            e[10..14].copy_from_slice(&value.to_be_bytes());
+            e
+        };
+        file.extend(entry(b"start   ", SYM_DEFINED | SYM_TEXT, 0));
+        file.extend(entry(b"buf", SYM_DEFINED | SYM_BSS, 4));
+        file.extend(entry(b"SIZE", SYM_DEFINED | SYM_EQUATED, 2));
+        file.extend(entry(b"outside", SYM_DEFINED | SYM_TEXT, 8));
+        // An extended entry whose continuation is cut off by the end of
+        // the table, and a table shorter than the header claims.
+        file.extend(entry(b"longname", SYM_DEFINED | SYM_TEXT | SYM_EXTENDED, 2));
+        let prg = read_prg(&file, 0x1000).unwrap();
+        assert_eq!(
+            prg.symbols,
+            vec![
+                (0x1000, "start".to_string()),
+                (0x1004, "buf".to_string()),
+                (0x1002, "longname".to_string()),
+            ]
+        );
+        assert!(prg.relocs.is_empty());
+        file.truncate(file.len() - 3);
+        assert!(read_prg(&file, 0).is_ok());
     }
 
     #[test]
