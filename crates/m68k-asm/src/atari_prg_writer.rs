@@ -1,9 +1,17 @@
 //! Atari ST / TOS program output (`-f prg`).
 //!
 //! Lays the `text`, `data` and `bss` sections out back to back, the way
-//! GEMDOS loads them, and writes the 28-byte header, the two segments and
-//! the relocation table described in [`m68k_core::atari_prg`]. No symbol
-//! table is written.
+//! GEMDOS loads them, and writes the 28-byte header, the two segments, a
+//! DRI symbol table and the relocation table described in
+//! [`m68k_core::atari_prg`].
+//!
+//! # Symbols
+//!
+//! Every label gets an entry flagged with its section; equates, register
+//! names and struct offsets do not, as they are not addresses. A name
+//! longer than 8 characters is written as a GST extended entry, which
+//! holds 22; anything longer is cut to 22, since the format has no room
+//! for more.
 //!
 //! # Relocations
 //!
@@ -19,8 +27,53 @@
 use crate::amiga_hunk_writer::RELOC_PROBE;
 use crate::assembler::Assembler;
 use crate::directives::{Section, SectionKind};
-use m68k_core::atari_prg::{HEADER_LEN, PRG_MAGIC};
+use m68k_core::atari_prg::{
+    HEADER_LEN, PRG_MAGIC, SYM_BSS, SYM_DATA, SYM_DEFINED, SYM_EXTENDED, SYM_GLOBAL, SYM_TEXT,
+    SYMBOL_ENTRY_LEN,
+};
 use m68k_core::errors::AsmError;
+
+/// The longest name a GST extended symbol entry holds.
+const MAX_SYMBOL_NAME: usize = 22;
+
+/// The DRI symbol table of `asm`, whose sections start at `origin`:
+/// one entry per label, with its offset from the start of the text
+/// segment, sorted by offset then name so the output is reproducible.
+fn symbol_table(asm: &Assembler, origin: u32) -> Vec<u8> {
+    let mut symbols: Vec<(u32, &str, u16)> = asm
+        .symbols
+        .iter()
+        .filter(|(_, entry)| entry.defined)
+        .filter_map(|(name, entry)| {
+            let flags = match entry.section.as_deref()? {
+                "text" => SYM_TEXT,
+                "data" => SYM_DATA,
+                "bss" => SYM_BSS,
+                _ => return None,
+            };
+            Some((entry.value.wrapping_sub(origin), name.as_str(), flags))
+        })
+        .collect();
+    symbols.sort_unstable();
+    let mut out = Vec::with_capacity(symbols.len() * SYMBOL_ENTRY_LEN);
+    for (offset, name, flags) in symbols {
+        let name: Vec<u8> = name.bytes().take(MAX_SYMBOL_NAME).collect();
+        let extended = name.len() > 8;
+        let mut kind = SYM_DEFINED | SYM_GLOBAL | flags;
+        if extended {
+            kind |= SYM_EXTENDED;
+        }
+        let mut padded = name;
+        padded.resize(if extended { MAX_SYMBOL_NAME } else { 8 }, 0);
+        out.extend_from_slice(&padded[..8]);
+        out.extend_from_slice(&kind.to_be_bytes());
+        out.extend_from_slice(&offset.to_be_bytes());
+        if extended {
+            out.extend_from_slice(&padded[8..]);
+        }
+    }
+    out
+}
 
 /// The three segments of a TOS program as contiguous byte ranges from the
 /// start of the text segment, `(text, data, bss)` lengths.
@@ -135,16 +188,18 @@ where
         });
     }
 
-    let mut out = Vec::with_capacity(HEADER_LEN + image.len() + relocs.len() + 8);
+    let symbols = symbol_table(&laid, origin);
+    let mut out = Vec::with_capacity(HEADER_LEN + image.len() + symbols.len() + relocs.len() + 8);
     out.extend_from_slice(&PRG_MAGIC.to_be_bytes());
     out.extend_from_slice(&text_len.to_be_bytes());
     out.extend_from_slice(&data_len.to_be_bytes());
     out.extend_from_slice(&bss_len.to_be_bytes());
-    out.extend_from_slice(&0u32.to_be_bytes()); // symbol table length
+    out.extend_from_slice(&(symbols.len() as u32).to_be_bytes());
     out.extend_from_slice(&0u32.to_be_bytes()); // reserved
     out.extend_from_slice(&0u32.to_be_bytes()); // program flags
     out.extend_from_slice(&0u16.to_be_bytes()); // absflag: relocate
     out.extend_from_slice(&image);
+    out.extend_from_slice(&symbols);
 
     match relocs.first() {
         None => out.extend_from_slice(&0u32.to_be_bytes()),
@@ -222,9 +277,33 @@ mod tests {
         let loaded = read_prg(&file, 0x1000).unwrap();
         assert_eq!(loaded.relocs, vec![0x1002, 0x1000 + 606]);
         assert_eq!(&loaded.image[606..610], &(0x1000u32 + 606).to_be_bytes());
-        // 604 bytes apart: two skips of 254 and a step of 96.
-        let table = HEADER_LEN + 610 + 4;
+        // 604 bytes apart: two skips of 254 and a step of 96. One symbol
+        // entry (`far`) sits between the segments and the table.
+        let table = HEADER_LEN + 610 + SYMBOL_ENTRY_LEN + 4;
         assert_eq!(&file[table..], &[1, 1, 96, 0]);
+    }
+
+    #[test]
+    fn labels_are_written_as_dri_symbols_and_read_back() {
+        let src = "start:\tmoveq\t#0,d0\n\trts\n\
+                   a_rather_long_label_name_indeed:\trts\n\
+                   SIZE\tequ\t2\n\
+                   \tsection data\nmessage:\tdc.b\t'Hi',0\n\
+                   \tsection bss\nbuffer:\tds.b\tSIZE\n";
+        let file = prg(src).unwrap();
+        let loaded = read_prg(&file, 0x20000).unwrap();
+        assert_eq!(
+            loaded.symbols,
+            vec![
+                (0x20000, "start".to_string()),
+                (0x20004, "a_rather_long_label_na".to_string()),
+                (0x20006, "message".to_string()),
+                (0x2000A, "buffer".to_string()),
+            ]
+        );
+        // Three short entries and one extended entry of two.
+        assert_eq!(&file[14..18], &(5 * SYMBOL_ENTRY_LEN as u32).to_be_bytes());
+        assert_eq!(loaded.relocs, Vec::<u32>::new());
     }
 
     #[test]
