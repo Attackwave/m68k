@@ -86,17 +86,12 @@ pub fn enc_fpu_arith(
             words.extend(ext_words);
             Ok(words)
         }
-        // FPn,<ea> : FPn source, memory destination (only valid for a handful of ops, e.g. none
-        // of the monadic/dyadic arith ops actually use this direction, but keep symmetry with
-        // FMOVE's EA_DATA_ALT category in case callers route through here).
-        (Operand::FpReg(fps), Some(ea_op)) => {
-            let fmt = size.unwrap_or("w");
-            let (mode, reg, ext_words) = encode_ea(ea_op, fmt, ext_pc, ea::DATA_ALT, cpu)?;
-            let ext = (3 << 13) | (fmt_code(size) << 10) | ((*fps as u16) << 7) | cmd;
-            let mut words = vec![0xF200 | ((mode as u16) << 3) | (reg as u16), ext];
-            words.extend(ext_words);
-            Ok(words)
-        }
+        // FPn,<ea>: opclass 011 is FMOVE to memory and nothing else; its
+        // low bits hold a k-factor, not an opmode, so `fadd fp0,(a0)` has
+        // no encoding.
+        (Operand::FpReg(_), Some(_)) => Err(AsmError::new(
+            "only FMOVE can store an fp register to memory; the destination must be an fp register",
+        )),
         _ => Err(AsmError::new("FPU operand must be an fp register or EA")),
     }
 }
@@ -441,6 +436,21 @@ mod tests {
         let dst = Operand::FpReg(2);
         let words = enc_fpu_arith(0x22, &src, Some(&dst), None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF200, 0x0522]);
+    }
+
+    #[test]
+    fn arithmetic_cannot_store_to_memory() {
+        // `fadd fp0,(a0)` has no encoding: opclass 011 is FMOVE only.
+        let err = enc_fpu_arith(
+            0x22,
+            &Operand::FpReg(0),
+            Some(&Operand::AddrRegIndirect(0)),
+            None,
+            0,
+            "68020",
+        )
+        .unwrap_err();
+        assert!(err.message.contains("only FMOVE"), "{}", err.message);
     }
 
     #[test]
