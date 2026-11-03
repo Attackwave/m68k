@@ -1,0 +1,76 @@
+# Weekly fuzzing campaign. The per-PR `fuzz-smoke` job in ci.yml runs each
+# target for 60 seconds, enough to catch an immediately reachable panic;
+# this runs every target for minutes and keeps the corpus between runs,
+# which is what finds the bugs behind several decisions.
+#
+# Nothing merges on this: a finding shows up as a failed run with the
+# crashing inputs attached as an artifact. Reproduce one with
+# `cargo +nightly fuzz run <target> <artifact file>`.
+name: Fuzz campaign
+
+on:
+  schedule:
+    - cron: '17 3 * * 1'
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes per target
+        default: '10'
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@be39649afda95dbf70f87cce95f68b8d5797b296 # nightly
+        with:
+          toolchain: nightly
+
+      - name: Cache cargo registry
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fuzz/target
+          key: ${{ runner.os }}-cargo-fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
+
+      # The corpus grows with every run; a fresh run restores the newest
+      # one and saves its own under a new key.
+      - name: Restore fuzz corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked
+
+      - name: Fuzz every target
+        env:
+          ASAN_OPTIONS: symbolize=0
+          MINUTES: ${{ github.event.inputs.minutes || '10' }}
+        run: |
+          status=0
+          for target in $(cargo fuzz list); do
+            echo "::group::$target"
+            if ! cargo fuzz run "$target" -- -max_total_time=$((MINUTES * 60)) -timeout=10; then
+              echo "::error::$target found a crash"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit $status
+
+      - name: Attach crashing inputs
+        if: failure()
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts
+          if-no-files-found: ignore
