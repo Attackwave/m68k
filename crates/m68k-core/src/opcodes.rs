@@ -1018,7 +1018,10 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             mask: 0xE1C0,
             value: 0x2040,
             mnemonic: "MOVEA",
-            src_ea: DATA,
+            // Any source, address registers included: with DATA here an
+            // An source fell through to the MOVE pattern and printed as
+            // `move.w a0,a1`, while every other source printed `movea.w`.
+            src_ea: ALL,
             dst_ea: AREG,
             cpu: "68000",
             parser: ParserType::Movea,
