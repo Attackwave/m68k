@@ -1830,6 +1830,12 @@ fn decode_fpu_cpgen(
                 return Ok(("fsincos".into(), operands, target_addr));
             }
 
+            // Opclass 011 is FMOVE FPn,<ea> and nothing else: bits 6-0
+            // are a k-factor (zero for every format but packed), not an
+            // opmode, so `f210 7022` is not an `fadd fp0,(a0)`.
+            if group == 0b011 && cmd != 0 {
+                return Err("FMOVE to memory with a non-zero opmode field".into());
+            }
             let base_mnemonic = fpu_arith_name(cmd)
                 .or_else(|| fpu_short_name(cmd))
                 .ok_or("unknown FPU arithmetic opclass/opmode")?;
@@ -2139,6 +2145,21 @@ mod tests {
         // Reference encoding: fadd d0,fp2 -> f2005122 (no suffix -> word specifier, not extended)
         let inst = decode_one(&[0xF2, 0x00, 0x51, 0x22], "68040");
         assert_eq!(inst.mnemonic, "fadd");
+    }
+
+    #[test]
+    fn opclass_011_with_an_opmode_is_not_an_instruction() {
+        // f210 7022 would be "fadd fp0,(a0)", which does not exist: opclass
+        // 011 is FMOVE to memory, with a k-factor rather than an opmode in
+        // bits 6-0. It falls back to a data word.
+        let mut stream = InstructionStream::new(&[0xF2, 0x10, 0x70, 0x22], 0x1000);
+        assert!(matches!(
+            decode_next(&mut stream, "68040").unwrap().1,
+            DecodeResult::DataWord(_)
+        ));
+        // f210 7000 is a real fmove.w fp0,(a0).
+        let inst = decode_one(&[0xF2, 0x10, 0x70, 0x00], "68040");
+        assert_eq!(inst.mnemonic, "fmove");
     }
 
     #[test]
