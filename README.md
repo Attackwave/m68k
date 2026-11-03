@@ -66,7 +66,10 @@ entry point for control-flow tracing, and the header at `$100` is data
 with its fields labelled (on the Neo Geo the four `JMP` entries in the
 header are entry points as well). For the Atari ST, `trap #1`, `#13` and
 `#14` are annotated with the GEMDOS, BIOS or XBIOS function named by the
-word pushed just before them.
+word pushed just before them. On the Mega Drive an immediate written to
+the VDP control port is explained: `move.w #$8f02,VDP_CTRL` reads
+`; VDP reg 15 AUTOINC = $02`, a longword either sets two registers or
+selects an address (`; VDP VRAM write $c000 (DMA)`).
 
 ```bash
 m68k-disasm --system megadrive game.bin
