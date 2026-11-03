@@ -3149,7 +3149,15 @@ impl Assembler {
 
             // Calculate size for this line
             let size = self.estimate_line_size(line)?;
-            self.pc += size;
+            // The address space is 32 bits; a DS or ORG that runs past
+            // its end must fail here, not wrap silently (or, with overflow
+            // checks on, panic) and put every later label at a low address.
+            self.pc = self.pc.checked_add(size).ok_or_else(|| {
+                AsmError::with_line(
+                    "program runs past the end of the 32-bit address space",
+                    line.line_no,
+                )
+            })?;
         }
 
         Ok(())
