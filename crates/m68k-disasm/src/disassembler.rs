@@ -12,6 +12,10 @@ use crate::decoder::{DecodeResult, decode_next};
 /// The decoder carries the displacement/operand width in the mnemonic so
 /// the assembler can rebuild the exact encoding, so control-flow tests
 /// have to compare against the stem.
+/// What an immediate value written to a particular address means:
+/// `note(value, size in bytes)`, see [`Disassembler::add_write_notes`].
+pub type WriteNote = Box<dyn Fn(u64, u8) -> Option<String>>;
+
 fn mnemonic_stem(mnemonic: &str) -> &str {
     match mnemonic.split_once('.') {
         Some((stem, _)) => stem,
@@ -223,6 +227,10 @@ pub struct Disassembler {
     /// number being the word pushed just before the trap. Supplied by a
     /// caller that knows the operating system (`--system atarist`).
     trap_names: HashMap<(u8, u16), String>,
+    /// What an immediate value written to an address means, for addresses
+    /// whose meaning a caller knows (a video chip's control port). Keyed
+    /// by the absolute destination address.
+    write_notes: HashMap<u32, WriteNote>,
     /// Program counter values observed during a real execution, supplied
     /// by [`Disassembler::add_pc_trace`]. Each is an instruction start
     /// that actually ran, so unlike anything derived from the bytes it
@@ -248,6 +256,7 @@ impl Disassembler {
             entry_points: Vec::new(),
             lvo_library: None,
             trap_names: HashMap::new(),
+            write_notes: HashMap::new(),
             pc_trace: HashSet::new(),
             traced: HashSet::new(),
         }
@@ -330,6 +339,43 @@ impl Disassembler {
     /// the way TOS does (`move.w #9,-(sp); trap #1` is GEMDOS `Cconws`).
     pub fn add_trap_names<I: IntoIterator<Item = ((u8, u16), String)>>(&mut self, names: I) {
         self.trap_names.extend(names);
+    }
+
+    /// Explain immediate values written to an address: `(address, note)`,
+    /// where `note(value, size in bytes)` returns the comment for a
+    /// `move.<size> #value,address`, or `None` when the value says nothing
+    /// worth a comment.
+    pub fn add_write_notes<I: IntoIterator<Item = (u32, WriteNote)>>(&mut self, notes: I) {
+        self.write_notes.extend(notes);
+    }
+
+    /// The comment for an immediate written to an address that has a note.
+    fn write_comment(&self, inst: &crate::decoder::DecodedInstruction) -> Option<String> {
+        if self.write_notes.is_empty() || mnemonic_stem(&inst.mnemonic) != "move" {
+            return None;
+        }
+        let size = match inst.mnemonic.rsplit_once('.')?.1 {
+            "b" => 1,
+            "w" => 2,
+            "l" => 4,
+            _ => return None,
+        };
+        let EAOperand::Immediate(value, _) = inst.operands.first()?.ea.as_ref()? else {
+            return None;
+        };
+        let note = match inst.operands.get(1)?.ea.as_ref()? {
+            EAOperand::AbsoluteLong(addr) => self.write_notes.get(addr),
+            // The short form sign-extends; on 24 address lines that is
+            // the same place as the 24-bit address a caller keys by.
+            EAOperand::AbsoluteShort(addr) => {
+                let se = *addr as i16 as i32 as u32;
+                self.write_notes
+                    .get(&se)
+                    .or_else(|| self.write_notes.get(&(se & 0x00FF_FFFF)))
+            }
+            _ => None,
+        }?;
+        note(*value, size)
     }
 
     /// The function a `trap #n` calls, if the instruction before it pushed
@@ -939,7 +985,8 @@ impl Disassembler {
                     }
                     let comment = self
                         .lvo_comment(&inst, current_library)
-                        .or_else(|| self.trap_comment(&inst, pushed_word));
+                        .or_else(|| self.trap_comment(&inst, pushed_word))
+                        .or_else(|| self.write_comment(&inst));
                     if let Some(loaded) = Self::library_loaded_into_a6(&inst) {
                         current_library = loaded;
                     }
@@ -1656,6 +1703,35 @@ mod tests {
         assert_eq!(comment(0x1008).as_deref(), Some("Pterm0"));
         assert_eq!(comment(0x100E), None);
         assert_eq!(comment(0x1012), None);
+    }
+
+    #[test]
+    fn immediates_written_to_a_noted_address_are_explained() {
+        let bytes = vec![
+            0x33, 0xFC, 0x8F, 0x02, 0x00, 0xC0, 0x00, 0x04, // move.w #$8f02,$c00004
+            0x23, 0xFC, 0x40, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00,
+            0x04, // move.l #$40000000,$c00004
+            0x31, 0xFC, 0x12, 0x34, 0x82, 0x40, // move.w #$1234,$8240.w
+            0x33, 0xFC, 0x00, 0x01, 0x00, 0xC0, 0x00, 0x00, // move.w #1,$c00000 (no note)
+        ];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        let ctrl: WriteNote = Box::new(|value, size| Some(format!("ctrl {size} {value:#x}")));
+        let palette: WriteNote = Box::new(|value, _| (value == 0x1234).then(|| "pal".into()));
+        disasm.add_write_notes([(0xC0_0004, ctrl), (0xFF_8240, palette)]);
+        let lines = disasm.disassemble();
+        let comment = |addr: u32| {
+            lines
+                .iter()
+                .find(|l| l.address == addr)
+                .unwrap()
+                .comment
+                .clone()
+        };
+        assert_eq!(comment(0x1000).as_deref(), Some("ctrl 2 0x8f02"));
+        assert_eq!(comment(0x1008).as_deref(), Some("ctrl 4 0x40000000"));
+        // $8240.w sign-extends to $ffff8240, the 24-bit $ff8240 the note is keyed by.
+        assert_eq!(comment(0x1012).as_deref(), Some("pal"));
+        assert_eq!(comment(0x1018), None);
     }
 
     /// `movea.l $4.w,a6` is ExecBase by definition, so the calls that
