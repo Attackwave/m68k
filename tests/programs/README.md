@@ -26,6 +26,9 @@ visible in ROM measurements: on a ROM nobody knows which answer is right.
 | `word_dispatch.s` | A table of 16-bit *offsets* (data) and a table of `bra` instructions (code), neither containing an address |
 | `inline_data.s` | Arguments stored after the `jsr` that calls the routine, read over the return address |
 | `self_modifying.s` | Code that patches its own immediate, and a byte loaded from inside an opword |
+| `movem_prologue.s` | Register-save prologues and epilogues: `movem` masks that look like table words, next to a word table that holds the same values |
+| `outside_image.s` | Variables reached through absolute addresses beyond the end of the image: numbers that must not become labels |
+| `string_table.s` | A table of pointers to strings: a pointer run whose targets are text, not code, with the strings unpadded behind each other |
 
 Each of the four was assembled against `vasmm68k_mot -Fbin -no-opt` and is
 byte-identical to it, so the addresses named in their header comments are
@@ -96,6 +99,28 @@ The honest fix is for the tracer to model a callee adjusting its own
 return address, not a stricter data heuristic — the bytes are
 indistinguishable from code without that. Recorded as a pinned test so the
 day it improves is visible.
+
+**6. A table of string pointers was traced as code — fixed.** In
+`string_table.s` the three longwords pointing at `"first"`, `"second"`
+and `"third"` are a pointer run, so `--scan-tables` took their targets as
+entry points and decoded the text as `bcs.w` and `moveq`. Two changes:
+
+- A pointer whose target reads as a NUL-terminated string is not an
+  entry point, and its slot is emitted as a `dc.l` pointer. Odd targets
+  now count towards a run (a string may start anywhere) but are never
+  entry points.
+- A string of odd length was always padded to the word boundary, which
+  took the first byte of the string behind it: `"second",0` came out as
+  `"second",$00,"t"` followed by `"hird"`. The pad is now left alone when
+  the next byte begins another string; the following line is a string
+  too, so nothing desynchronizes. On Kickstart 1.3 this joins the
+  `"exec 34.2 (28 Oct 1987)"` banner that used to be split into five
+  junk instructions and a tail — the "reach" numbers in
+  `rom_reach.rs` fell accordingly, because they had counted that junk.
+
+`movem_prologue.s` and `outside_image.s` found nothing: masks stay
+instructions, outside addresses stay numbers. They are kept so that
+stays true.
 
 ## Adding a program
 
