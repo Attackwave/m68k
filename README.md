@@ -33,6 +33,8 @@ m68k-disasm <binary-file> [options]
 - `-r`, `--raw`: Include raw instruction hexadecimal bytes in the output.
 - `-c`, `--cpu`: Target CPU limit for decoding (`68000`, `68010`, `68020`, `68030`, `68040`, `68060`). Default is `68000`.
 - `--system <megadrive|neogeo|atarist>`: name the machine's hardware registers, system variables and OS entry points, and apply its cartridge layout (see below).
+- `--symbols <file>`: name addresses from a symbol file (`address name` or `name = address` per line, see below). Repeatable.
+- `--equates <file.i>`: name addresses from an assembler include file: every `EQU` and label in it whose value lies outside the image becomes a label (`--system` is this with the machine's own includes). Repeatable.
 
 The disassembly is always written to standard output; the address column is
 always included. Redirect or pipe stdout to capture it:
@@ -84,13 +86,14 @@ follows control flow from the start of the text segment.
 
 ### Symbol File Format
 
-The custom symbol file should map absolute addresses to symbol names, one per line. Blank lines and lines starting with `#` or `;` are ignored.
+The file given to `--symbols` maps absolute addresses to symbol names, one per line, either as `address name` or as `name = address` (the form `m68k-asm --sym` writes, so an assembler's symbol table can be fed straight back). Blank lines and lines starting with `#` or `;` are ignored.
 
 ```text
 # custom_symbols.txt
 $00001000 main_entry
 $00002054 interrupt_handler
 4500      my_data_offset
+draw_line = $00002100
 ```
 
 ### Library usage
