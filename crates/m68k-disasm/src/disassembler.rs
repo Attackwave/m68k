@@ -257,9 +257,30 @@ pub struct Disassembler {
     /// [`Disassembler::disassemble`]. Empty when the caller supplied
     /// neither, which reduces both passes to a linear scan.
     traced: HashSet<u32>,
+    /// Comments a caller attaches to addresses (analysis notes kept
+    /// across runs). They replace whatever comment the line would have
+    /// carried, because the caller wrote them with that line in view.
+    comments: HashMap<u32, String>,
+    /// The PC trace is complete: only recorded addresses are code,
+    /// nothing is walked from them, and every other address is data.
+    trace_only: bool,
 }
 
 impl Disassembler {
+    /// Attach comments to addresses; see the `comments` field.
+    pub fn add_comments<I: IntoIterator<Item = (u32, String)>>(&mut self, comments: I) {
+        self.comments.extend(comments);
+    }
+
+    /// Treat the PC trace as complete: only recorded addresses are code.
+    /// This is the right setting for a trace from an emulator that logged
+    /// every executed instruction, where walking on from the last sample
+    /// of a routine would run past a call that never returns into the
+    /// data behind it. With a sparse trace it hides code.
+    pub fn set_trace_only(&mut self, trace_only: bool) {
+        self.trace_only = trace_only;
+    }
+
     pub fn new(data: Vec<u8>, origin: u32) -> Self {
         Self {
             data,
@@ -274,6 +295,8 @@ impl Disassembler {
             write_notes: HashMap::new(),
             pc_trace: HashSet::new(),
             traced: HashSet::new(),
+            comments: HashMap::new(),
+            trace_only: false,
         }
     }
 
@@ -654,13 +677,23 @@ impl Disassembler {
     /// the error and resume two bytes past the failure point, mirroring
     /// the CLI's prior inline behavior.
     pub fn disassemble(&mut self) -> Vec<DisassembledLine> {
-        self.traced = self.trace_reachable_code();
+        self.traced = if self.trace_only {
+            HashSet::new()
+        } else {
+            self.trace_reachable_code()
+        };
         // Recorded PCs are instruction starts by observation, so they hold
         // even where the walk above declined to follow (an undecodable
         // word, a target it could not resolve).
         self.traced.extend(self.pc_trace.iter().copied());
         self.pass1_discover_labels();
-        self.pass2_format()
+        let mut lines = self.pass2_format();
+        for line in &mut lines {
+            if let Some(comment) = self.comments.get(&line.address) {
+                line.comment = Some(comment.clone());
+            }
+        }
+        lines
     }
 
     /// Follow control flow from every entry point, returning the set of
@@ -849,6 +882,13 @@ impl Disassembler {
                     return Ok(Err(DataKind::Text));
                 }
             }
+        }
+
+        // With a complete trace, an address it never recorded was never
+        // executed: data, whatever its bytes would decode as.
+        if self.trace_only && !self.traced.contains(&addr) {
+            stream.seek(stream.offset + 2);
+            return Ok(Err(DataKind::Word));
         }
 
         let start_offset = stream.offset;
@@ -1687,6 +1727,34 @@ mod tests {
     /// A trace alone, with no entry points, must be enough to switch on
     /// tracing — otherwise `-t` without `--entry` would silently do
     /// nothing.
+    /// With `set_trace_only`, nothing is walked from a recorded PC and
+    /// unrecorded addresses are data: the `rts` after the traced `nop` is
+    /// not in the trace, so it is a word, as is everything after it.
+    #[test]
+    fn test_trace_only_makes_unrecorded_addresses_data() {
+        let bytes = vec![0x4E, 0x71, 0x4E, 0x75, 0x4E, 0x71, 0x4E, 0x75];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        disasm.add_pc_trace([0x1000, 0x1004]);
+        disasm.set_trace_only(true);
+        let texts: Vec<String> = disasm
+            .disassemble()
+            .iter()
+            .map(|l| l.text.split_whitespace().next().unwrap().to_string())
+            .collect();
+        assert_eq!(texts, ["nop", "dc.w", "nop", "dc.w"]);
+    }
+
+    /// A caller's comment replaces the generated one on that line.
+    #[test]
+    fn test_caller_comments_are_attached_to_their_lines() {
+        let bytes = vec![0x4E, 0x71, 0x4E, 0x75];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        disasm.add_comments([(0x1002, "back to the caller".to_string())]);
+        let lines = disasm.disassemble();
+        assert_eq!(lines[0].comment, None);
+        assert_eq!(lines[1].comment.as_deref(), Some("back to the caller"));
+    }
+
     #[test]
     fn test_pc_trace_alone_enables_tracing() {
         let mut bytes = vec![0x4E, 0x75];

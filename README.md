@@ -36,9 +36,11 @@ m68k-disasm <binary-file> [options]
 - `--system <megadrive|neogeo|atarist>`: name the machine's hardware registers, system variables and OS entry points, and apply its cartridge layout (see below).
 - `--symbols <file>`: name addresses from a symbol file (`address name` or `name = address` per line, see below). Repeatable.
 - `--equates <file.i>`: name addresses from an assembler include file: every `EQU` and label in it whose value lies outside the image becomes a label (`--system` is this with the machine's own includes). Repeatable.
+- `--project <file>`: analysis notes for this image, kept across runs: entry points, data ranges, pointers, labels and comments, one directive per line (see below). Repeatable.
 - `-e`, `--entry <addr>`: follow control flow from this address (repeatable). Only code reachable from the entry points is proven to be code; everything else falls back to the linear decode, with strings, pointers and tables recognised where the bytes look like them. Hunk executables, TOS programs and `--system` cartridge images supply their own entry points.
 - `--scan-tables`: also treat runs of in-image longword pointers as entry points, which recovers code reached only through jump tables.
 - `-t`, `--pc-trace <file>`: program counter values recorded while the image actually ran, one per line (decimal or `$hex`). Every one is a proven instruction start, which settles computed jumps and jump tables that no static analysis can follow (see below). Values outside the image are ignored.
+- `--trace-only`: treat the PC trace as complete. Only recorded addresses are code, nothing is walked on from them, everything else is data. Right for a trace from an emulator that logged every executed instruction; with a sparse trace it hides code.
 - `--lvo <library>`: annotate `jsr -$xx(a6)` calls with AmigaOS routine names (`exec`, `dos`, `graphics`, `intuition`, `gadtools`, `utility`, `asl`, `layers`, `diskfont`).
 
 The disassembly is always written to standard output; the address column is
@@ -116,6 +118,25 @@ follows control flow from the start of the text segment.
 ### Symbol File Format
 
 The file given to `--symbols` maps absolute addresses to symbol names, one per line, either as `address name` or as `name = address` (the form `m68k-asm --sym` writes, so an assembler's symbol table can be fed straight back). Blank lines and lines starting with `#` or `;` are ignored.
+
+Reverse engineering is iterative: what one run reveals (a jump-table
+target, a block that is really data, what a routine does) has to go into
+the next run. `--project` takes a file of such notes, one directive per
+line, so they accumulate instead of being retyped as flags:
+
+```
+; notes on game.bin
+entry   $1200               ; reached through jmp (a0), invisible to tracing
+data    $2000 $2100         ; [start, end): a lookup table
+pointer $2100               ; one longword address
+label   $1200 draw_sprite
+comment $1200 called once per frame
+```
+
+`entry`, `data` and `pointer` do what `--entry`, a container's data
+ranges and its relocations do; `label` is a `--symbols` line; `comment`
+replaces whatever comment the line at that address would otherwise
+carry.
 
 ```text
 # custom_symbols.txt
