@@ -103,6 +103,19 @@ struct Args {
     /// Repeatable
     #[arg(long = "equates", value_name = "FILE")]
     equates: Vec<PathBuf>,
+
+    /// Analysis notes for this image, kept across runs. One directive per
+    /// line: `entry ADDR`, `data START END` (end exclusive), `pointer
+    /// ADDR`, `label ADDR NAME`, `comment ADDR TEXT`; `#` and `;` start
+    /// comments. Repeatable.
+    #[arg(long = "project", value_name = "FILE")]
+    projects: Vec<PathBuf>,
+
+    /// Treat the PC trace as complete: only recorded addresses are code,
+    /// nothing is walked on from them, everything else is data. For a
+    /// trace from an emulator that logged every executed instruction.
+    #[arg(long = "trace-only", requires = "pc_trace")]
+    trace_only: bool,
 }
 
 fn parse_address(s: &str) -> Result<u32, String> {
@@ -143,6 +156,53 @@ fn parse_symbol_file(text: &str) -> Result<Vec<(u32, String)>, (usize, String)> 
         }
     }
     Ok(labels)
+}
+
+/// What a project file declares about an image.
+#[derive(Default)]
+struct Project {
+    entries: Vec<u32>,
+    data_ranges: Vec<(u32, u32)>,
+    pointers: Vec<u32>,
+    labels: Vec<(u32, String)>,
+    comments: Vec<(u32, String)>,
+}
+
+/// Parses analysis notes: one directive per line, see `--project`. On a
+/// bad line returns its number and text.
+fn parse_project_file(text: &str) -> Result<Project, (usize, String)> {
+    let mut project = Project::default();
+    for (index, raw) in text.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        let bad = || (index + 1, line.to_string());
+        let mut words = line.splitn(3, char::is_whitespace).map(str::trim);
+        let keyword = words.next().unwrap_or_default();
+        let first = words
+            .next()
+            .and_then(|w| parse_address(w).ok())
+            .ok_or_else(bad)?;
+        let rest = words.next().unwrap_or_default();
+        match keyword {
+            "entry" if rest.is_empty() => project.entries.push(first),
+            "pointer" if rest.is_empty() => project.pointers.push(first),
+            "data" => {
+                let end = parse_address(rest)
+                    .ok()
+                    .filter(|&e| e > first)
+                    .ok_or_else(bad)?;
+                project.data_ranges.push((first, end));
+            }
+            "label" if !rest.is_empty() && !rest.contains(char::is_whitespace) => {
+                project.labels.push((first, rest.to_string()));
+            }
+            "comment" if !rest.is_empty() => project.comments.push((first, rest.to_string())),
+            _ => return Err(bad()),
+        }
+    }
+    Ok(project)
 }
 
 /// `-` means stdin, as documented in the README. Everything else is a
@@ -325,6 +385,25 @@ fn run(args: Args) -> Result<(), String> {
         })?;
         disasm.set_lvo_library(library);
     }
+    for path in &args.projects {
+        let text = fs::read_to_string(path)
+            .map_err(|e| format!("cannot read '{}': {}", path.display(), e))?;
+        let project = parse_project_file(&text).map_err(|(line, text)| {
+            format!(
+                "{}:{}: expected 'entry ADDR', 'data START END', 'pointer ADDR', \
+                 'label ADDR NAME' or 'comment ADDR TEXT', got: {}",
+                path.display(),
+                line,
+                text
+            )
+        })?;
+        disasm.add_entry_points(project.entries);
+        disasm.add_data_ranges(project.data_ranges);
+        disasm.add_pointer_sites(project.pointers);
+        disasm.add_known_labels(project.labels);
+        disasm.add_comments(project.comments);
+    }
+    disasm.set_trace_only(args.trace_only);
     disasm.set_cpu(&args.cpu);
 
     let mut out = std::io::stdout().lock();
