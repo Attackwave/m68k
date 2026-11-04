@@ -34,8 +34,5 @@ fn every_example_assembles_against_the_system_includes() {
             found += 1;
         }
     }
-    assert!(
-        found >= 3,
-        "expected the three system examples, found {found}"
-    );
+    assert!(found >= 3, "expected the system examples, found {found}");
 }
