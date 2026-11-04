@@ -20,12 +20,10 @@ fn disassemble(args: &[&str], image: &[u8]) -> Result<String, String> {
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to run m68k-disasm");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(image)
-        .expect("failed to write stdin");
+    // An invocation the argument parser rejects exits before reading
+    // stdin; the write then fails with a broken pipe, which is not what
+    // such a test is about.
+    let _ = child.stdin.take().unwrap().write_all(image);
     let out = child.wait_with_output().unwrap();
     if out.status.success() {
         Ok(String::from_utf8(out.stdout).unwrap())
