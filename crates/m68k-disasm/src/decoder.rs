@@ -2067,7 +2067,9 @@ mod ea_validation_tests {
         assert_eq!(decode_one(&[0x1F, 0x48, 0xE7, 0xC0]), "dc.w");
         // The word and long forms on An are real instructions.
         assert_eq!(decode_one(&[0x5F, 0x48]), "subq.w");
-        assert_eq!(decode_one(&[0x30, 0x48]), "move.w");
+        assert_eq!(decode_one(&[0x30, 0x48]), "movea.w");
+        assert_eq!(decode_one(&[0x20, 0x48]), "movea.l");
+        assert_eq!(decode_one(&[0x30, 0x40]), "movea.w");
     }
 
     #[test]
