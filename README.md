@@ -423,6 +423,12 @@ branch to an odd address, an empty MOVEM list, a write to a PC-relative
 operand) are data. The same ignored test exists for this property:
 `M68K_ROM=tmp/<rom> cargo test -p m68k-cli --test rom_roundtrip -- --ignored --nocapture`.
 
+The Amiga example (`examples/amiga/hello.s`) is also run as a Hunk
+executable under vamos from amitools, which implements LoadSeg() and the
+dos.library calls the program makes on a 68k core; it has to print its
+line. Ignored as well, since vamos must be installed:
+`cargo test -p m68k-cli --test vamos_examples -- --ignored --nocapture`.
+
 Golden-vector tests (`crates/m68k-asm/tests/golden_*.rs`) check encoder,
 decoder, float, expression, and token behavior against fixed reference
 output in `tests/golden/vectors.json`.
