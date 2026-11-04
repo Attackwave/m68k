@@ -633,6 +633,85 @@ impl Disassembler {
         self.add_pointer_sites(string_pointers);
     }
 
+    /// Seed entry points from tables of word offsets.
+    ///
+    /// The other shape of a jump table: `lea table(pc),a0` followed by
+    /// `adda.w (a0,d0.w),a0` and `jmp (a0)`, the table holding 16-bit
+    /// offsets from its own start. Nothing in such a table looks like an
+    /// address, so [`Disassembler::seed_entry_points_from_pointer_tables`]
+    /// cannot see it, and the `jmp (a0)` ends control-flow tracing.
+    ///
+    /// Guarded harder than the pointer scan, because almost any two bytes
+    /// are a plausible offset: a table is only looked for where code
+    /// reached from the entry points takes a PC-relative address with
+    /// `lea` or `pea` (that is where a table lives — a string, a pointer
+    /// table, or this), and it counts only while every word leads to an
+    /// even address inside the image, outside the table itself, at which
+    /// an instruction decodes. At least [`MIN_POINTER_TABLE`] such words
+    /// are needed. The targets become entry points and the table data.
+    pub fn seed_entry_points_from_offset_tables(&mut self) {
+        let reached = self.trace_reachable_code();
+        let mut anchors: Vec<u32> = Vec::new();
+        for &pc in &reached {
+            let Some(offset) = self.offset_of(pc) else {
+                continue;
+            };
+            let mut stream = InstructionStream::new(&self.data, self.origin);
+            stream.seek(offset);
+            if let Ok((_, DecodeResult::Instruction(inst))) = decode_next(&mut stream, &self.cpu)
+                && matches!(mnemonic_stem(&inst.mnemonic), "lea" | "pea")
+                && let Some(&EAOperand::PcDisp(_, target)) =
+                    inst.operands.first().and_then(|op| op.ea.as_ref())
+                && target.is_multiple_of(2)
+                && !reached.contains(&target)
+            {
+                anchors.push(target);
+            }
+        }
+        anchors.sort_unstable();
+        anchors.dedup();
+
+        let mut entries: Vec<u32> = Vec::new();
+        let mut tables: Vec<(u32, u32)> = Vec::new();
+        for table in anchors {
+            let mut targets: Vec<u32> = Vec::new();
+            let mut at = table;
+            while let Some(offset) = self.offset_of(at)
+                && offset + 2 <= self.data.len()
+                && (at == table || !self.known_labels.contains_key(&at))
+            {
+                let word = i16::from_be_bytes([self.data[offset], self.data[offset + 1]]);
+                let target = table.wrapping_add(word as i32 as u32);
+                let Some(target_offset) = self.offset_of(target) else {
+                    break;
+                };
+                if !target.is_multiple_of(2) || reached.contains(&at) {
+                    break;
+                }
+                let mut stream = InstructionStream::new(&self.data, self.origin);
+                stream.seek(target_offset);
+                if !matches!(
+                    decode_next(&mut stream, &self.cpu),
+                    Ok((_, DecodeResult::Instruction(_)))
+                ) {
+                    break;
+                }
+                targets.push(target);
+                at += 2;
+            }
+            let end = at;
+            if targets.len() < MIN_POINTER_TABLE || targets.iter().any(|&t| t >= table && t < end) {
+                continue;
+            }
+            tables.push((table, end));
+            entries.extend(targets);
+        }
+        entries.sort_unstable();
+        entries.dedup();
+        self.entry_points.extend(entries);
+        self.add_data_ranges(tables);
+    }
+
     /// True if `addr` falls inside any range passed to
     /// [`Disassembler::add_data_ranges`].
     fn is_data_address(&self, addr: u32) -> bool {
@@ -1753,6 +1832,47 @@ mod tests {
         let lines = disasm.disassemble();
         assert_eq!(lines[0].comment, None);
         assert_eq!(lines[1].comment.as_deref(), Some("back to the caller"));
+    }
+
+    /// `lea table(pc),a0; adda.w (a0,d0.w),a0; jmp (a0)` with a table of
+    /// three word offsets: the targets become code and the table data.
+    #[test]
+    fn test_offset_tables_seed_their_targets() {
+        let bytes = vec![
+            0x41, 0xFA, 0x00, 0x08, // lea $100a(pc),a0
+            0xD0, 0xF0, 0x00, 0x00, // adda.w (a0,d0.w),a0
+            0x4E, 0xD0, // jmp (a0)
+            0x00, 0x06, 0x00, 0x08, 0x00, 0x0A, // offsets -> $1010, $1012, $1014
+            0x4E, 0x71, // nop
+            0x4E, 0x75, // rts
+            0x4E, 0x71, // nop
+        ];
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        disasm.add_entry_points([0x1000]);
+        disasm.seed_entry_points_from_offset_tables();
+        let lines = disasm.disassemble();
+        let at = |a: u32| {
+            lines
+                .iter()
+                .find(|l| l.address == a)
+                .map(|l| l.text.split_whitespace().next().unwrap().to_string())
+        };
+        assert_eq!(at(0x100a).as_deref(), Some("dc.w"), "{lines:?}");
+        assert_eq!(at(0x100e).as_deref(), Some("dc.w"));
+        assert_eq!(at(0x1012).as_deref(), Some("rts"));
+        assert_eq!(at(0x1014).as_deref(), Some("nop"));
+    }
+
+    /// A `lea` at a string is the common case; its words must not pass
+    /// as offsets. "Hello, world" leads to odd or out-of-image addresses.
+    #[test]
+    fn test_strings_are_not_offset_tables() {
+        let mut bytes = vec![0x41, 0xFA, 0x00, 0x04, 0x4E, 0x75]; // lea $1006(pc),a0; rts
+        bytes.extend_from_slice(b"Hello, world\0\0");
+        let mut disasm = Disassembler::new(bytes, 0x1000);
+        disasm.add_entry_points([0x1000]);
+        disasm.seed_entry_points_from_offset_tables();
+        assert_eq!(disasm.entry_points, vec![0x1000]);
     }
 
     #[test]

@@ -57,10 +57,12 @@ struct Args {
     #[arg(short = 'e', long = "entry", value_name = "ADDR")]
     entries: Vec<String>,
 
-    /// Also treat runs of in-image longword pointers as entry points.
-    /// Recovers code reached through jump tables (`jmp (a6)`), which
-    /// control-flow tracing alone cannot follow. Heuristic: a run of
-    /// plausible-looking longwords need not be a real table.
+    /// Also treat runs of in-image longword pointers as entry points,
+    /// and tables of word offsets that reached code takes the address of
+    /// with `lea`/`pea`. Recovers code reached through jump tables
+    /// (`jmp (a6)`, `adda.w (a0,d0.w),a0; jmp (a0)`), which control-flow
+    /// tracing alone cannot follow. Heuristic: a run of plausible-looking
+    /// words need not be a real table.
     #[arg(long = "scan-tables")]
     scan_tables: bool,
 
@@ -350,6 +352,7 @@ fn run(args: Args) -> Result<(), String> {
     disasm.add_entry_points(extra_entries);
     if args.scan_tables {
         disasm.seed_entry_points_from_pointer_tables();
+        disasm.seed_entry_points_from_offset_tables();
     }
     if let Some(path) = &args.pc_trace {
         let text = fs::read_to_string(path)
