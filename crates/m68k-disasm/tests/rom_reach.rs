@@ -28,8 +28,11 @@ use m68k_disasm::disassembler::Disassembler;
 /// rather than by its end address left everything after it decoding at
 /// odd addresses. The listing now reassembles to the ROM byte for byte
 /// (`rom_roundtrip` in m68k-cli).
-const BASELINE_256K: (usize, usize, usize) = (79746, 73846, 74113);
-const BASELINE_512K: (usize, usize, usize) = (165823, 153475, 155526);
+///
+/// Table-scan figures raised when word-offset tables anchored by `lea`
+/// in reached code started seeding entry points as well.
+const BASELINE_256K: (usize, usize, usize) = (79746, 73846, 74173);
+const BASELINE_512K: (usize, usize, usize) = (165823, 153475, 155687);
 
 fn instructions(mut disasm: Disassembler) -> usize {
     disasm
@@ -65,6 +68,7 @@ fn kickstart_reach_does_not_regress() {
     let mut scanned = Disassembler::new(image, origin);
     scanned.add_entry_points([reset]);
     scanned.seed_entry_points_from_pointer_tables();
+    scanned.seed_entry_points_from_offset_tables();
     let scanned = instructions(scanned);
 
     eprintln!("{path}: linear {linear}, traced {traced}, traced+tables {scanned}");
