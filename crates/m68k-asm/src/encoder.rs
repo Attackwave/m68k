@@ -142,11 +142,6 @@ pub(crate) fn fpu_cc(cond: &str) -> Option<u16> {
     })
 }
 
-/// Result of encoding a single instruction.
-pub struct EncodedInstruction {
-    pub words: Vec<u16>,
-}
-
 /// Encode a single instruction given mnemonic, size, operands, current PC, and CPU.
 pub fn encode_instruction(
     mnemonic: &str,

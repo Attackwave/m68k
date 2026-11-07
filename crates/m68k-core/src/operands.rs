@@ -96,14 +96,6 @@ pub enum BitfieldSpec {
 }
 
 impl Operand {
-    pub fn is_data_reg(&self) -> bool {
-        matches!(self, Operand::DataReg(_))
-    }
-
-    pub fn is_addr_reg(&self) -> bool {
-        matches!(self, Operand::AddrReg(_))
-    }
-
     pub fn reg_num(&self) -> Option<u8> {
         match self {
             Operand::DataReg(n) | Operand::AddrReg(n) => Some(*n),
