@@ -1,5 +1,5 @@
 //! Shared primitives used by both the m68k assembler and disassembler:
-//! tokenizing, effective-address category constraints, the opcode table,
+//! source-line splitting, effective-address category constraints, the opcode table,
 //! and error types.
 //!
 //! This crate has no dependency on `m68k-asm` or `m68k-disasm` — it exists

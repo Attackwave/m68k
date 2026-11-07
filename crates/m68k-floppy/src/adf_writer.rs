@@ -13,10 +13,6 @@ pub const DD_TRACKS: usize = 80;
 pub const DD_SECTORS_PER_TRACK: usize = 11;
 pub const DD_SIZE: usize = DD_TRACKS * SIDES * DD_SECTORS_PER_TRACK * SECTOR_SIZE;
 
-/// High-density ADF: 80 tracks, 2 sides, 22 sectors/track.
-pub const HD_SECTORS_PER_TRACK: usize = 22;
-pub const HD_SIZE: usize = DD_TRACKS * SIDES * HD_SECTORS_PER_TRACK * SECTOR_SIZE;
-
 /// Build a raw, unformatted ADF image of the given size, filled with
 /// `fill_byte` (conventionally 0x00). This produces a disk with no
 /// filesystem structure at all — callers that want a mountable AmigaDOS
