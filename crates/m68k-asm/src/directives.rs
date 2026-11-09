@@ -434,8 +434,16 @@ pub fn handle_set(
         .as_ref()
         .ok_or_else(|| AsmError::with_line("SET requires a label", line_no))?;
 
-    // SET allows redefinition
+    // SET may give its own symbols a new value, but not a label or an EQU
+    // constant: `n equ 1` / `n set 2` silently changed every later use.
+    if symbols.get(name).is_some_and(|e| e.defined) && !symbols.is_set(name) {
+        return Err(AsmError::with_line(
+            format!("symbol '{name}' already defined"),
+            line_no,
+        ));
+    }
     symbols.force_set(name, value as u32, Some(line_no));
+    symbols.mark_set(name);
 
     Ok(DirectiveResult::none())
 }

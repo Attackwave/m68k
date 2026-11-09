@@ -94,6 +94,8 @@ pub struct SymbolTable {
     /// parser answers 0 so pass 1 can size forward references; pass 2
     /// takes this to report text that is not an expression at all.
     displacement_error: std::cell::RefCell<Option<String>>,
+    /// Names defined by SET, the only ones SET may give a new value.
+    set_names: std::collections::HashSet<String>,
 }
 
 impl SymbolTable {
@@ -217,6 +219,16 @@ impl SymbolTable {
     }
 
     /// Force-set a symbol value (allows redefinition, used by SET directive).
+    /// Record that `name` is a SET symbol.
+    pub(crate) fn mark_set(&mut self, name: &str) {
+        self.set_names.insert(name.to_string());
+    }
+
+    /// Whether `name` was defined by SET.
+    pub(crate) fn is_set(&self, name: &str) -> bool {
+        self.set_names.contains(name)
+    }
+
     pub fn force_set(&mut self, name: &str, value: u32, line_no: Option<usize>) {
         self.symbols.insert(
             name.to_string(),
@@ -557,7 +569,7 @@ fn parse_operand_text(
     // The indexed form with a displacement too wide for the brief
     // format's 8-bit field: the 68020 full format carries it as a 16- or
     // 32-bit base displacement. The encoder refuses it below 68020.
-    if let Some((an, xn, disp, scale, xn_is_long)) =
+    if let Some((an, xn, disp, scale, xn_is_long, bd_forced)) =
         indexed_with_wide_displacement(paren_text, symbols, current_pc)
     {
         return Ok(Operand::MemoryIndirect(Box::new(MemoryIndirectOperand {
@@ -570,6 +582,8 @@ fn parse_operand_text(
             outer_disp: None,
             is_postindexed: false,
             is_indirect: false,
+            bd_forced,
+            ..Default::default()
         })));
     }
 
@@ -579,7 +593,7 @@ fn parse_operand_text(
     // to emit — `MemoryIndirectOperand::base_reg` is an `Option` precisely
     // for it — but no parser produced one, so the reference assembled
     // `move.l ($1000,d0.w*8),d1` and we rejected it.
-    if let Some((xn, disp, scale, xn_is_long)) =
+    if let Some((xn, disp, scale, xn_is_long, bd_forced)) =
         parse_parens_disp_index_no_base(paren_text, symbols, current_pc)
     {
         return Ok(Operand::MemoryIndirect(Box::new(MemoryIndirectOperand {
@@ -592,6 +606,8 @@ fn parse_operand_text(
             outer_disp: None,
             is_postindexed: false,
             is_indirect: false,
+            bd_forced,
+            ..Default::default()
         })));
     }
 
@@ -1147,7 +1163,7 @@ fn parse_parens_disp_index_no_base(
     text: &str,
     symbols: &SymbolTable,
     pc: u32,
-) -> Option<(u8, i32, u8, bool)> {
+) -> Option<(u8, i32, u8, bool, Option<bool>)> {
     let trimmed = text.trim();
     let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?;
     let parts: Vec<&str> = inner.split(',').collect();
@@ -1185,8 +1201,9 @@ fn parse_parens_disp_index_no_base(
     {
         return None;
     }
+    let (disp_str, forced) = split_displacement_size(disp_str);
     let disp = evaluate_displacement(disp_str, symbols, pc);
-    Some((xn, disp, scale, is_long))
+    Some((xn, disp, scale, is_long, forced))
 }
 
 fn parse_parens_disp_reg_index(
@@ -1207,6 +1224,10 @@ fn parse_parens_disp_reg_index(
             n if n >= 3 => (parts[0].trim(), parts[1].trim(), parts[2].trim()),
             _ => return None,
         };
+        // A sized displacement selects the full format.
+        if split_displacement_size(disp_str).1.is_some() {
+            return None;
+        }
 
         if let Some(Operand::AddrReg(an)) = parse_register(an_str) {
             let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
@@ -1240,7 +1261,7 @@ fn indexed_with_wide_displacement(
     text: &str,
     symbols: &SymbolTable,
     pc: u32,
-) -> Option<(u8, u8, i32, u8, bool)> {
+) -> Option<(u8, u8, i32, u8, bool, Option<bool>)> {
     let trimmed = text.trim();
     let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?;
     let parts: Vec<&str> = inner.split(',').collect();
@@ -1252,8 +1273,12 @@ fn indexed_with_wide_displacement(
     };
     let (xn_name, scale, is_long) = parse_index_reg_and_scale(parts[2].trim());
     let xn = index_reg_num(&parse_register(&xn_name)?)?;
-    let disp = evaluate_displacement(parts[0].trim(), symbols, pc);
-    (!(-128..=127).contains(&disp)).then_some((an, xn, disp, scale, is_long))
+    // `.W`/`.L` on the displacement asks for the full format's 16- or
+    // 32-bit base displacement even when the value fits the brief form.
+    let (disp_text, forced) = split_displacement_size(parts[0].trim());
+    let disp = evaluate_displacement(disp_text, symbols, pc);
+    (forced.is_some() || !(-128..=127).contains(&disp))
+        .then_some((an, xn, disp, scale, is_long, forced))
 }
 
 /// Parse 68020+ memory indirect / full format EA syntax:
@@ -1319,6 +1344,7 @@ fn parse_memory_indirect(
     let mut base_reg: Option<u8> = None;
     let mut base_is_pc = false;
     let mut base_disp: Option<i32> = None;
+    let mut bd_forced = None;
     let mut index_reg: Option<u8> = None;
     let mut index_long = false;
     let mut index_scale: u8 = 1;
@@ -1350,13 +1376,16 @@ fn parse_memory_indirect(
             continue;
         }
         // Anything else is the base displacement expression.
+        let (part, forced) = split_displacement_size(part);
         let value = evaluate_expr_str(part, symbols, current_pc)?;
         base_disp = Some(to_32bit(value)?);
+        bd_forced = forced;
     }
 
     // Post-indexed form has the index register after the bracket (and
     // optionally a scale/size), pre-indexed form has it inside the bracket.
     let mut outer_disp: Option<i32> = None;
+    let mut od_forced = None;
     let is_postindexed = index_reg.is_none() && !after_bracket.is_empty();
 
     if !after_bracket.is_empty() {
@@ -1379,8 +1408,10 @@ fn parse_memory_indirect(
                 index_scale = scale;
                 continue;
             }
+            let (part, forced) = split_displacement_size(part);
             let value = evaluate_expr_str(part, symbols, current_pc)?;
             outer_disp = Some(to_32bit(value)?);
+            od_forced = forced;
         }
     }
 
@@ -1395,6 +1426,8 @@ fn parse_memory_indirect(
         is_postindexed,
         // Reached only from the bracketed syntax.
         is_indirect: true,
+        bd_forced,
+        od_forced,
     }))
 }
 
@@ -4657,6 +4690,11 @@ impl Assembler {
             }
         }
 
+        if let Some(size) = size {
+            check_size_suffix(mnemonic, size, dst.as_ref())
+                .map_err(|msg| AsmError::with_line(msg, line.line_no))?;
+        }
+
         // The branch paths below re-parse their target and never reach the
         // encoder's error, so an undefined target assembled to a branch to
         // address 0 with exit status 0.
@@ -5817,6 +5855,56 @@ fn jump_table_lines(lines: &[ParsedLine]) -> std::collections::HashSet<usize> {
 
 fn is_pc_relaxable(mnemonic: &str) -> bool {
     matches!(mnemonic, "jsr" | "jmp" | "lea" | "pea")
+}
+
+/// Reject a size suffix the instruction does not have. The encoders
+/// below ignored or coerced it: `movem.b` assembled as `movem.w`,
+/// `ext.b` as `ext.w`, `bset.l #1,(a0)` as the byte form.
+fn check_size_suffix(mnemonic: &str, size: &str, dst: Option<&Operand>) -> Result<(), String> {
+    let m = mnemonic.to_ascii_lowercase();
+    let size = size.to_ascii_lowercase();
+    let is_scc = m.strip_prefix('s').is_some_and(|cc| {
+        matches!(
+            cc,
+            "t" | "f"
+                | "hi"
+                | "ls"
+                | "cc"
+                | "cs"
+                | "hs"
+                | "lo"
+                | "ne"
+                | "eq"
+                | "vc"
+                | "vs"
+                | "pl"
+                | "mi"
+                | "ge"
+                | "lt"
+                | "gt"
+                | "le"
+        )
+    });
+    let allowed: &[&str] = match m.as_str() {
+        "movem" | "adda" | "suba" | "cmpa" | "movea" | "ext" => &["w", "l"],
+        "extb" | "moveq" | "lea" | "pea" | "exg" => &["l"],
+        "tas" | "nbcd" => &["b"],
+        "swap" => &["w"],
+        // Bit operations are long on a data register and byte in memory.
+        "bset" | "bclr" | "bchg" | "btst" => match dst {
+            Some(Operand::DataReg(_)) => &["l"],
+            _ => &["b"],
+        },
+        _ if is_scc => &["b"],
+        _ if is_branch_mnemonic(&m) && is_dbcc_mnemonic(&m) => &["w"],
+        _ if is_branch_mnemonic(&m) => &["s", "b", "w", "l"],
+        _ => return Ok(()),
+    };
+    if allowed.contains(&size.as_str()) {
+        Ok(())
+    } else {
+        Err(format!("{m} has no .{size} form"))
+    }
 }
 
 fn is_branch_mnemonic(mnemonic: &str) -> bool {
@@ -8218,6 +8306,82 @@ n   SET 10
     }
 
     #[test]
+    fn sized_full_format_displacements() {
+        let cases: &[(&str, &[u8])] = &[
+            (
+                " move.l ($10.w,a0,d0.w),d1\n",
+                &[0x22, 0x30, 0x01, 0x20, 0x00, 0x10],
+            ),
+            (
+                " move.l ($10.l,a0,d0.w),d1\n",
+                &[0x22, 0x30, 0x01, 0x30, 0x00, 0x00, 0x00, 0x10],
+            ),
+            (
+                " move.l ($10.w,d0.w),d1\n",
+                &[0x22, 0x30, 0x01, 0xA0, 0x00, 0x10],
+            ),
+            (
+                " move.l ([$10.l,a0]),d1\n",
+                &[0x22, 0x30, 0x01, 0x71, 0x00, 0x00, 0x00, 0x10],
+            ),
+            (
+                " move.l ([4,a0],$20.l),d1\n",
+                &[0x22, 0x30, 0x01, 0x63, 0x00, 0x04, 0x00, 0x00, 0x00, 0x20],
+            ),
+        ];
+        for (src, expected) in cases {
+            assert_eq!(assemble_source_with_cpu(src, "68020"), *expected, "{src}");
+        }
+    }
+
+    #[test]
+    fn set_cannot_redefine_labels_or_equ() {
+        for src in [
+            " n equ 1\nn set 2\n dc.w n\n",
+            "lab: dc.w 0\nlab set 5\n dc.w lab\n",
+        ] {
+            assert!(Assembler::new(0).assemble(src).is_err(), "{src}");
+        }
+        assert_eq!(
+            assemble_source_with_cpu(" n set 1\nn set 2\n dc.w n\n", "68000"),
+            [0x00, 0x02]
+        );
+    }
+
+    #[test]
+    fn size_suffixes_the_instruction_lacks_are_rejected() {
+        for src in [
+            "movem.b d0,-(a7)",
+            "adda.b d0,a0",
+            "ext.b d0",
+            "bset.l #1,(a0)",
+            "bset.b #1,d0",
+            "tas.l (a0)",
+            "nbcd.w d0",
+            "seq.w d0",
+            "moveq.w #1,d0",
+            "lea.w (a0),a1",
+            "dbra.l d0,*",
+            "bsr.x *",
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu("68020");
+            assert!(asm.assemble(&format!(" {src}\n")).is_err(), "{src}");
+        }
+        for src in [
+            "movem.l d0,-(a7)",
+            "bset.b #1,(a0)",
+            "bset.l #1,d0",
+            "dbra.w d0,*",
+            "bra.s *+4\n nop",
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu("68020");
+            assert!(asm.assemble(&format!(" {src}\n")).is_ok(), "{src}");
+        }
+    }
+
+    #[test]
     fn second_audit_rejections() {
         for (src, cpu) in [
             (" move.l $100000004,d1\n", "68000"),
@@ -8235,6 +8399,7 @@ n   SET 10
             (" pmove tc,t(pc)\nt: nop\n", "68030"),
             (" pmove t(pc),tc\nt: nop\n", "68030"),
             (" pflush #1,#1,t(pc)\nt: nop\n", "68030"),
+            (" ptestr #1,(a0),#0,a1\n", "68030"),
         ] {
             let mut asm = Assembler::new(0);
             asm.set_cpu(cpu);
