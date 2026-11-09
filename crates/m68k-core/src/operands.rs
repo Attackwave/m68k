@@ -30,10 +30,15 @@ pub enum Operand {
     /// Like [`Operand::PcRelativeDisp`], the second field holds the full
     /// *target address*, not the encoded displacement — the parser cannot
     /// subtract the PC because it only sees the operand text. The encoder
-    /// narrows it against the extension word's address.
-    PcRelativeIndex(u8, i32, u8, bool),
+    /// narrows it against the extension word's address. `None` is
+    /// `(PC,Xn)`, displacement 0.
+    PcRelativeIndex(u8, Option<i32>, u8, bool),
     /// Immediate: #expr
     Immediate(i64),
+    /// Immediate data already laid out as extension words: the FPU's
+    /// single, double, extended and packed constants, which do not fit an
+    /// integer.
+    ImmediateWords(Vec<u16>),
     /// Memory reference (general expression)
     Memory(i64),
     /// Address only (for branch targets, etc.)

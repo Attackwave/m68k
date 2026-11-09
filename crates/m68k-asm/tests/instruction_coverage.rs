@@ -186,7 +186,7 @@ const EXT_68010_68020: &[Case] = &[
     // 68010
     c("MOVEC VBR,D0", "68010"),
     c("MOVEC D0,VBR", "68010"),
-    c("MOVEC CACR,D0", "68010"),
+    c("MOVEC CACR,D0", "68020"),
     c("RTD #8", "68010"),
     c("BKPT #3", "68010"),
     c("MOVES.B D3,(A2)+", "68010"),

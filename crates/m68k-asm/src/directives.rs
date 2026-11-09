@@ -946,7 +946,19 @@ pub fn parse_simple_expr(text: &str, symbols: &SymbolTable, pc: u32) -> Result<i
     // Tokenize the expression
     let tokens = tokenize_expr(text, pc)?;
     let mut pos = 0;
-    parse_expr_or(&tokens, &mut pos, symbols)
+    let value = parse_expr_or(&tokens, &mut pos, symbols)?;
+    // Anything left over is a syntax error: `1+2)` used to evaluate to 3
+    // and `1.5` to 1 without a word.
+    if pos < tokens.len() {
+        return Err(format!("unexpected text in expression: {text}"));
+    }
+    Ok(value)
+}
+
+/// Expressions are evaluated in 64 bits; a result outside that range is an
+/// error rather than a silently wrapped value.
+fn overflow() -> String {
+    "arithmetic overflow in expression".to_string()
 }
 
 #[derive(Debug, Clone)]
@@ -1052,8 +1064,18 @@ fn tokenize_expr(text: &str, pc: u32) -> Result<Vec<ExprToken>, String> {
             continue;
         }
 
-        // Binary: %1010
-        if ch == '%' && i + 1 < chars.len() && (chars[i + 1] == '0' || chars[i + 1] == '1') {
+        // Binary: %1010 — only where an operand is expected. After an
+        // operand, `%` is the modulo operator: `x%10` is x mod 10, not x
+        // followed by the binary literal %10.
+        let expects_operand = matches!(
+            tokens.last(),
+            None | Some(ExprToken::Op(_) | ExprToken::LParen | ExprToken::Comma)
+        );
+        if ch == '%'
+            && expects_operand
+            && i + 1 < chars.len()
+            && (chars[i + 1] == '0' || chars[i + 1] == '1')
+        {
             let start = i + 1;
             i += 1;
             while i < chars.len() && (chars[i] == '0' || chars[i] == '1') {
@@ -1178,7 +1200,7 @@ fn tokenize_expr(text: &str, pc: u32) -> Result<Vec<ExprToken>, String> {
         }
 
         // Single-char operators (exclude ( ) which are handled separately)
-        if "+-*/&|^~=<>!".contains(ch) {
+        if "+-*/%&|^~=<>!".contains(ch) {
             tokens.push(ExprToken::Op(ch.to_string()));
             i += 1;
             continue;
@@ -1410,13 +1432,19 @@ fn parse_expr_shift(
                 "<<" => {
                     *pos += 1;
                     let right = parse_expr_add(tokens, pos, symbols)?;
-                    left = left.wrapping_shl(right as u32);
+                    left = u32::try_from(right)
+                        .ok()
+                        .and_then(|r| left.checked_shl(r))
+                        .ok_or_else(|| format!("shift count {right} out of range"))?;
                     continue;
                 }
                 ">>" => {
                     *pos += 1;
                     let right = parse_expr_add(tokens, pos, symbols)?;
-                    left = left.wrapping_shr(right as u32);
+                    left = u32::try_from(right)
+                        .ok()
+                        .and_then(|r| left.checked_shr(r))
+                        .ok_or_else(|| format!("shift count {right} out of range"))?;
                     continue;
                 }
                 _ => {}
@@ -1443,13 +1471,13 @@ fn parse_expr_add(
                 "+" => {
                     *pos += 1;
                     let right = parse_expr_mul(tokens, pos, symbols)?;
-                    left = left.wrapping_add(right);
+                    left = left.checked_add(right).ok_or_else(overflow)?;
                     continue;
                 }
                 "-" => {
                     *pos += 1;
                     let right = parse_expr_mul(tokens, pos, symbols)?;
-                    left = left.wrapping_sub(right);
+                    left = left.checked_sub(right).ok_or_else(overflow)?;
                     continue;
                 }
                 _ => {}
@@ -1476,7 +1504,7 @@ fn parse_expr_mul(
                 "*" => {
                     *pos += 1;
                     let right = parse_expr_unary(tokens, pos, symbols)?;
-                    left = left.wrapping_mul(right);
+                    left = left.checked_mul(right).ok_or_else(overflow)?;
                     continue;
                 }
                 "/" => {
@@ -1485,7 +1513,7 @@ fn parse_expr_mul(
                     if right == 0 {
                         return Err("division by zero".to_string());
                     }
-                    left = left.wrapping_div(right);
+                    left = left.checked_div(right).ok_or_else(overflow)?;
                     continue;
                 }
                 "%" => {
@@ -1494,7 +1522,7 @@ fn parse_expr_mul(
                     if right == 0 {
                         return Err("modulo by zero".to_string());
                     }
-                    left = left.wrapping_rem(right);
+                    left = left.checked_rem(right).ok_or_else(overflow)?;
                     continue;
                 }
                 _ => {}

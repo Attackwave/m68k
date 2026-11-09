@@ -687,6 +687,7 @@ fn parse_operand_text(
             "ITT1" => Some(0x005),
             "DTT0" => Some(0x006),
             "DTT1" => Some(0x007),
+            "BUSCR" => Some(0x008),
             "USP" => Some(0x800),
             "VBR" => Some(0x801),
             "CAAR" => Some(0x802),
@@ -695,6 +696,7 @@ fn parse_operand_text(
             "MMUSR" => Some(0x805),
             "URP" => Some(0x806),
             "SRP" => Some(0x807),
+            "PCR" => Some(0x808),
             _ => None,
         }
     };
@@ -1066,33 +1068,27 @@ fn parse_parens_disp_pc(text: &str, symbols: &SymbolTable, pc: u32) -> Option<(i
 /// Returns (Xn, target address, scale, is_long). The second element is the
 /// full target address as written, *not* the encoded displacement: the PC
 /// is not known here, so `encode_ea` performs the subtraction (same split
-/// as the non-indexed `(d,PC)` form).
+/// as the non-indexed `(d,PC)` form). It is `None` for `(PC,Xn)`, which
+/// names no target.
 fn parse_parens_disp_pc_index(
     text: &str,
     symbols: &SymbolTable,
     pc: u32,
-) -> Option<(u8, i32, u8, bool)> {
-    let trimmed = text.trim();
-    if trimmed.starts_with('(') && trimmed.ends_with(')') {
-        let inner = &trimmed[1..trimmed.len() - 1];
-        let parts: Vec<&str> = inner.split(',').collect();
-        if parts.len() == 3 {
-            let disp_str = parts[0].trim();
-            let pc_str = parts[1].trim().to_uppercase();
-            let xn_full = parts[2].trim();
-
-            if pc_str == "PC" {
-                let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
-                if let Some(reg) = parse_register(&xn_name)
-                    && let Some(reg_num) = index_reg_num(&reg)
-                {
-                    let target = evaluate_pc_target(disp_str, symbols, pc);
-                    return Some((reg_num, target, scale, is_long));
-                }
-            }
-        }
-    }
-    None
+) -> Option<(u8, Option<i32>, u8, bool)> {
+    let inner = text.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    // `(PC,Xn)` has no target at all: displacement 0 from the extension
+    // word. It used to fall through to the suppressed-base parser, which
+    // read `PC` as a symbol worth 0 and encoded an absolute `(0,Xn)`.
+    let (disp_str, xn_full) = match parts.as_slice() {
+        [pc_str, xn] if pc_str.eq_ignore_ascii_case("pc") => (None, *xn),
+        [disp, pc_str, xn] if pc_str.eq_ignore_ascii_case("pc") => (Some(*disp), *xn),
+        _ => return None,
+    };
+    let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
+    let reg_num = index_reg_num(&parse_register(&xn_name)?)?;
+    let target = disp_str.map(|d| evaluate_pc_target(d, symbols, pc));
+    Some((reg_num, target, scale, is_long))
 }
 
 /// Parse (d8,An,Xn*scale) - base register with index register.
@@ -1120,8 +1116,11 @@ fn parse_parens_disp_index_no_base(
         // (bd,ZAn,Xn) — explicit base suppression
         3 => {
             let mid = parts[1].trim().to_uppercase();
-            let suppressed = mid == "ZPC"
-                || (mid.starts_with("ZA") && mid.len() == 3 && mid.as_bytes()[2].is_ascii_digit());
+            // ZPC is not handled: it is the PC-relative mode (7/3) with the
+            // base suppressed, but this path encodes mode 6, an alterable
+            // An-relative form. Refusing it beats assembling another EA.
+            let suppressed =
+                mid.starts_with("ZA") && mid.len() == 3 && mid.as_bytes()[2].is_ascii_digit();
             if !suppressed {
                 return None;
             }
@@ -1137,7 +1136,11 @@ fn parse_parens_disp_index_no_base(
     let xn = index_reg_num(&reg)?;
     // A bare `(An,Xn)` has already been handled by the caller above; here a
     // two-part form only qualifies when the first field is not a register.
-    if parts.len() == 2 && parse_register(disp_str).is_some() {
+    if parts.len() == 2
+        && (parse_register(disp_str).is_some()
+            || disp_str.eq_ignore_ascii_case("pc")
+            || disp_str.eq_ignore_ascii_case("zpc"))
+    {
         return None;
     }
     let disp = evaluate_displacement(disp_str, symbols, pc);
@@ -1378,11 +1381,9 @@ fn parse_index_reg_size_scale(text: &str) -> Option<(String, String, u8)> {
     let text = text.trim();
     let (reg_part, scale) = if let Some(pos) = text.find('*') {
         let scale_str = text[pos + 1..].trim();
-        let scale = scale_str.parse::<u8>().unwrap_or(1);
-        let scale = match scale {
-            2 | 4 | 8 => scale,
-            _ => 1,
-        };
+        // Passed on as written (0 if not a number) so the encoder rejects
+        // an invalid scale; mapping it to 1 silently dropped `*16` or `*3`.
+        let scale = scale_str.parse::<u8>().unwrap_or(0);
         (&text[..pos], scale)
     } else {
         (text, 1)
@@ -1421,11 +1422,9 @@ fn parse_index_reg_and_scale(text: &str) -> (String, u8, bool) {
     // Split on '*' to get scale
     let (reg_part, scale) = if let Some(pos) = text.find('*') {
         let scale_str = text[pos + 1..].trim();
-        let scale = scale_str.parse::<u8>().unwrap_or(1);
-        let scale = match scale {
-            2 | 4 | 8 => scale,
-            _ => 1,
-        };
+        // Passed on as written (0 if not a number) so the encoder rejects
+        // an invalid scale; mapping it to 1 silently dropped `*16` or `*3`.
+        let scale = scale_str.parse::<u8>().unwrap_or(0);
         (&text[..pos], scale)
     } else {
         (text, 1)
@@ -1953,8 +1952,10 @@ pub struct Assembler {
     /// does the same for a `MOVEM` list. Verified against the reference:
     /// the aliased and spelled-out forms assemble to identical bytes.
     pub register_aliases: HashMap<String, String>,
-    /// Files already spliced in, so each is included only once.
-    included_files: std::collections::HashSet<PathBuf>,
+    /// Files already spliced in, and whether only inside a conditional.
+    included_files: std::collections::HashMap<PathBuf, bool>,
+    /// Conditional blocks open at the current point of INCLUDE expansion.
+    include_conditional_depth: usize,
     /// Absolute path of every included file, keyed by the name
     /// [`SourceOrigin::file`] carries (the name as written in `INCLUDE`).
     /// Debug info needs a path a debugger can open; diagnostics keep the
@@ -2096,7 +2097,8 @@ impl Assembler {
             source_map: Vec::new(),
             conditional_results: HashMap::new(),
             register_aliases: HashMap::new(),
-            included_files: std::collections::HashSet::new(),
+            included_files: std::collections::HashMap::new(),
+            include_conditional_depth: 0,
             include_paths_resolved: HashMap::new(),
             file_overlays: HashMap::new(),
             dependencies: Vec::new(),
@@ -2493,6 +2495,7 @@ impl Assembler {
     /// body or a REPT/IRP/IRPC body can hold a nested REPT or a macro call.
     fn macro_preprocess_pass(&mut self, source: &str) -> (String, bool) {
         let mut any_macro_invoked = false;
+        let mut consts = SymbolTable::new();
         let mut output = Vec::new();
         let lines: Vec<&str> = source.lines().collect();
         let mut i = 0;
@@ -2519,6 +2522,14 @@ impl Assembler {
             let raw = lines[i];
             // Check for MACRO definition via proper parsing
             let (lbl1, mnemonic1, _, operands1) = split_line(raw);
+            // Constants defined so far, for REPT counts: pass 1 has not run
+            // yet, so `n EQU 3 / REPT n` needs its own small table.
+            if let Some(name) = &lbl1
+                && matches!(mnemonic1.as_str(), "equ" | "set" | "=")
+                && let Ok(v) = evaluate_expr_str(&operands1.join(","), &consts, 0)
+            {
+                consts.force_set(name, v as u32, None);
+            }
             if mnemonic1 == "macro"
                 && let Some(mname) = lbl1
             {
@@ -2580,33 +2591,23 @@ impl Assembler {
             // --- REPT: repeat block N times ---
             if mnemonic1 == "rept" && !operands1.is_empty() {
                 let repeat_line = i;
-                let count: usize = match operands1[0].parse() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        // A malformed hex count used to `unwrap_or(0)` here,
-                        // which expanded the block zero times and dropped its
-                        // body without a word — `REPT $ZZ` silently assembled
-                        // to nothing while the reference assembler rejects it.
-                        // Passing the line through is not enough either: `rept`
-                        // is a known name in `is_directive_name`, so it lands in
-                        // a no-op arm and the body would be emitted once,
-                        // unguarded. Report it instead.
-                        match operands1[0]
-                            .strip_prefix('$')
-                            .and_then(|hex| usize::from_str_radix(hex, 16).ok())
-                        {
-                            Some(n) => n,
-                            None => {
-                                self.errors.error(
-                                    format!("invalid REPT count: '{}'", operands1[0]),
-                                    Some(i + 1),
-                                );
-                                output.push(raw.to_string());
-                                trace.push((i, None));
-                                i += 1;
-                                continue;
-                            }
-                        }
+                // Any constant expression over symbols defined above. A
+                // malformed count is reported, not taken as zero: the body
+                // would otherwise vanish or be emitted once, unguarded.
+                let count = match evaluate_expr_str(&operands1[0], &consts, 0)
+                    .ok()
+                    .and_then(|n| usize::try_from(n).ok())
+                {
+                    Some(n) => n,
+                    None => {
+                        self.errors.error(
+                            format!("invalid REPT count: '{}'", operands1[0]),
+                            Some(i + 1),
+                        );
+                        output.push(raw.to_string());
+                        trace.push((i, None));
+                        i += 1;
+                        continue;
                     }
                 };
 
@@ -2876,6 +2877,7 @@ impl Assembler {
         // macros, constants and structures the rest of the source uses,
         // so it has to be in place before macro expansion and parsing.
         self.included_files.clear();
+        self.include_conditional_depth = 0;
         self.dependencies.clear();
         self.source_map.clear();
         let included = self.expand_includes(source, 0, None)?;
@@ -2891,7 +2893,17 @@ impl Assembler {
         self.relax_branches(&parsed)?;
 
         // Pass 2: Encode instructions with resolved symbols
-        self.pass2(&parsed)
+        self.pass2(&parsed)?;
+
+        // Errors found while expanding macros and REPT blocks are only
+        // collected; without this the run still reported success.
+        match self.errors.errors.pop() {
+            Some(d) => Err(match d.line_no {
+                Some(line) => AsmError::with_line(d.message, line),
+                None => AsmError::new(d.message),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Everything the last [`Self::assemble`] reported, in source order,
@@ -2935,6 +2947,7 @@ impl Assembler {
     /// Test/diagnostic hook: run include + macro expansion only.
     pub fn debug_expand(&mut self, source: &str) -> Result<String, AsmError> {
         self.included_files.clear();
+        self.include_conditional_depth = 0;
         self.source_map.clear();
         let included = self.expand_includes(source, 0, None)?;
         Ok(self.macro_preprocess(&included))
@@ -2999,6 +3012,15 @@ impl Assembler {
                 macro_name: None,
             };
             let (_, mnemonic, size, operands) = split_line(raw);
+            match mnemonic.as_str() {
+                "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef" | "ifndef"
+                | "ifd" | "ifnd" => self.include_conditional_depth += 1,
+                "endc" | "endif" => {
+                    self.include_conditional_depth =
+                        self.include_conditional_depth.saturating_sub(1)
+                }
+                _ => {}
+            }
             if mnemonic == "incdir" {
                 // Register the search path and keep the line: pass 1 sees it
                 // again as a no-op, and dropping it here would change line
@@ -3038,11 +3060,18 @@ impl Assembler {
             let path = resolve_include_path_in(&filename, &self.source_root, &self.include_paths)
                 .map_err(|e| here(e.message, &current_file, idx + 1))?;
 
-            // Already pulled in? Drop the directive and move on.
+            // Already pulled in? Drop the directive and move on. But
+            // conditionals are not evaluated yet, so a file pulled in only
+            // inside an `IF` may never have been assembled: an unconditional
+            // INCLUDE of it is kept. (Header guards keep the repeat
+            // harmless when the earlier one was assembled after all.)
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if !self.included_files.insert(canonical) {
-                continue;
+            let conditional = self.include_conditional_depth > 0;
+            match self.included_files.get(&canonical) {
+                Some(&was_conditional) if !was_conditional || conditional => continue,
+                _ => {}
             }
+            self.included_files.insert(canonical, conditional);
             self.dependencies.push(path.clone());
             // Not the canonical path: on Windows that carries a `\\?\`
             // prefix no editor uses, so a debugger could not match it.
@@ -3356,13 +3385,11 @@ impl Assembler {
                 line_no,
             ));
         }
-        // CNOP offset,align → aligns to (PC + offset) % align == 0
-        let target = self.pc + offset;
-        Ok(if target.is_multiple_of(alignment) {
-            0
-        } else {
-            alignment - (target % alignment)
-        })
+        // CNOP offset,align moves to the next address that is `offset`
+        // past a multiple of `align`: PC ≡ offset (mod align). It used to
+        // pad until PC + offset was a multiple instead, so `cnop 2,8` at 0
+        // went to 6 rather than 2.
+        Ok(offset.wrapping_sub(self.pc) & (alignment - 1))
     }
 
     fn estimate_directive_size(
@@ -3718,20 +3745,28 @@ impl Assembler {
                 other => other,
             }
         };
-        let src = if !operand_texts.is_empty() {
+        let mut src = if !operand_texts.is_empty() {
             parse_operand_text(&operand_texts[0], &self.symbols, self.pc)
                 .ok()
                 .map(widen_forward_ref)
         } else {
             None
         };
-        let dst = if operand_texts.len() > 1 {
+        let mut dst = if operand_texts.len() > 1 {
             parse_operand_text(&operand_texts[1], &self.symbols, self.pc)
                 .ok()
                 .map(widen_forward_ref)
         } else {
             None
         };
+        // An FPU constant's size depends only on its format, so a forward
+        // reference in it still sizes correctly.
+        for (text, slot) in operand_texts.iter().zip([&mut src, &mut dst]) {
+            if let Some(op) = fpu_immediate(mnemonic, size, text, &self.symbols, self.pc) {
+                let words = size.and_then(fpu_immediate_words).unwrap_or(0);
+                *slot = Some(op.unwrap_or(Operand::ImmediateWords(vec![0; words])));
+            }
+        }
 
         // Use optimistic encoding (will be refined in pass 2)
         let mnemonic_upper = mnemonic.to_uppercase();
@@ -4051,7 +4086,7 @@ impl Assembler {
             BranchSize::Short
         } else if (-32768..=32767).contains(&disp) {
             BranchSize::Word
-        } else if self.cpu == "68000" {
+        } else if crate::ea_encode::cpu_level(&self.cpu) < 2 {
             // 68000 has no 32-bit branch displacement form; encode_bra/
             // encode_bsr/enc_bcc's word-form fallback will surface this
             // as an out-of-range error in pass 2 (matching the previous
@@ -4407,8 +4442,22 @@ impl Assembler {
                 None
             }
         };
-        let src = operand_texts.first().and_then(|t| parse_operand(t));
-        let dst = operand_texts.get(1).and_then(|t| parse_operand(t));
+        let mut src = operand_texts.first().and_then(|t| parse_operand(t));
+        let mut dst = operand_texts.get(1).and_then(|t| parse_operand(t));
+        for (text, slot) in operand_texts.iter().zip([&mut src, &mut dst]) {
+            if let Some(op) = fpu_immediate(mnemonic, size, text, &self.symbols, pc) {
+                *slot = Some(op.map_err(|e| AsmError::with_line(e.message, line.line_no))?);
+            }
+        }
+
+        // The branch paths below re-parse their target and never reach the
+        // encoder's error, so an undefined target assembled to a branch to
+        // address 0 with exit status 0.
+        if (is_branch_mnemonic(mnemonic) || is_pc_relaxable(mnemonic))
+            && let Some(e) = operand_error.take()
+        {
+            return Err(AsmError::with_line(e.message, line.line_no));
+        }
 
         if is_pc_relaxable(mnemonic)
             && let Some(hint) = self.branch_for_line(line.line_no).map(|b| b.size_hint)
@@ -4461,7 +4510,7 @@ impl Assembler {
                     // Reference encoding: `pflush (a0)` -> F508.
                     let reg_op = parse_operand_text(&operand_texts[0], &self.symbols, pc)
                         .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                    let w = crate::enc_mmu::enc_mmu_single_reg(0xF508, &reg_op, &self.cpu)
+                    let w = crate::enc_mmu::enc_mmu_single_reg(0xF508, &reg_op, "68040", &self.cpu)
                         .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
                     self.push_instruction(AssembledInstruction {
                         pc,
@@ -4479,17 +4528,8 @@ impl Assembler {
                         line.line_no,
                     ));
                 }
-                let fc = match parse_operand_text(&operand_texts[0], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-                {
-                    Operand::Immediate(v) => v,
-                    _ => {
-                        return Err(AsmError::with_line(
-                            "PFLUSH's first operand (#fc) must be immediate".to_string(),
-                            line.line_no,
-                        ));
-                    }
-                };
+                let fc = mmu_fc_field(&operand_texts[0], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
                 let mask = match parse_operand_text(&operand_texts[1], &self.symbols, pc)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?
                 {
@@ -4521,17 +4561,8 @@ impl Assembler {
                         line.line_no,
                     ));
                 }
-                let fc = match parse_operand_text(&operand_texts[0], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-                {
-                    Operand::Immediate(v) => v,
-                    _ => {
-                        return Err(AsmError::with_line(
-                            format!("{}'s first operand (FC) must be immediate", mnemonic_upper),
-                            line.line_no,
-                        ));
-                    }
-                };
+                let fc = mmu_fc_field(&operand_texts[0], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
                 let ea = parse_operand_text(&operand_texts[1], &self.symbols, pc)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
                 let level = match parse_operand_text(&operand_texts[2], &self.symbols, pc)
@@ -5704,6 +5735,79 @@ fn dbcc_condition(mnemonic: &str) -> Result<String, AsmError> {
     Ok(cond.to_string())
 }
 
+/// The 5-bit function-code field of a 68030 PFLUSH/PTEST operand: `SFC`
+/// (`00000`), `DFC` (`00001`), `Dn` (`01RRR`) or `#0`-`#7` (`10XXX`).
+/// SFC and DFC parse as MOVEC control register numbers 0 and 1, which used
+/// to be taken as the immediates `#0`/`#1`.
+fn mmu_fc_field(text: &str, symbols: &SymbolTable, pc: u32) -> Result<u16, AsmError> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("sfc") {
+        return Ok(0b00_000);
+    }
+    if text.eq_ignore_ascii_case("dfc") {
+        return Ok(0b00_001);
+    }
+    match parse_operand_text(text, symbols, pc)? {
+        Operand::DataReg(n) => Ok(0b01_000 | n as u16),
+        Operand::Immediate(v) if text.starts_with('#') => crate::enc_mmu::fc_immediate(v),
+        _ => Err(AsmError::new("function code must be #0-#7, Dn, SFC or DFC")),
+    }
+}
+
+/// Number of extension words an FPU immediate of `size` occupies.
+fn fpu_immediate_words(size: &str) -> Option<usize> {
+    match size.to_ascii_lowercase().as_str() {
+        "s" => Some(2),
+        "d" => Some(4),
+        "x" | "p" => Some(6),
+        _ => None,
+    }
+}
+
+/// An FPU instruction's `#` operand of size `.s/.d/.x/.p`, encoded in that
+/// format. `None` when the instruction or operand is not such a constant.
+///
+/// A `$` hex literal gives the raw bits; anything else is a number: a
+/// decimal literal such as `1.5`, or an integer expression whose value is
+/// converted (`#1` is 1.0). The integer path used to emit one truncated
+/// word for all four sizes, shortening the instruction.
+fn fpu_immediate(
+    mnemonic: &str,
+    size: Option<&str>,
+    text: &str,
+    symbols: &SymbolTable,
+    pc: u32,
+) -> Option<Result<Operand, AsmError>> {
+    let size = size?.to_ascii_lowercase();
+    fpu_immediate_words(&size)?;
+    if !mnemonic.to_ascii_lowercase().starts_with('f') {
+        return None;
+    }
+    let body = text.trim().strip_prefix('#')?.trim();
+    let raw_hex = |digits: &str| match size.as_str() {
+        "s" => u32::from_str_radix(digits, 16)
+            .ok()
+            .map(|v| vec![(v >> 16) as u16, v as u16]),
+        "d" => u64::from_str_radix(digits, 16)
+            .ok()
+            .map(|v| (0..4).rev().map(|i| (v >> (i * 16)) as u16).collect()),
+        _ => None,
+    };
+    if let Some(words) = body.strip_prefix('$').and_then(raw_hex) {
+        return Some(Ok(Operand::ImmediateWords(words)));
+    }
+    let literal =
+        if body.parse::<f64>().is_ok() || (size != "s" && size != "d" && body.starts_with('$')) {
+            body.to_string()
+        } else {
+            match evaluate_expr_str(body, symbols, pc) {
+                Ok(v) => v.to_string(),
+                Err(e) => return Some(Err(e)),
+            }
+        };
+    Some(parse_float_value(&literal, &size, 0).map(Operand::ImmediateWords))
+}
+
 /// Parse a float value string and encode it in the requested format.
 fn parse_float_value(text: &str, format: &str, line_no: usize) -> Result<Vec<u16>, AsmError> {
     let text = text.trim();
@@ -5855,15 +5959,16 @@ fn packed_decimal_words(text: &str, line_no: usize) -> Result<Vec<u16>, AsmError
         None => (rest, ""),
     };
 
-    let (exp_sign, exp_digits) = if let Some(e) = exp_part.strip_prefix('-') {
-        (1u16, e)
-    } else {
-        (0u16, exp_part.strip_prefix('+').unwrap_or(exp_part))
-    };
-    let explicit_exp: i32 = if exp_digits.is_empty() {
+    // The sign is part of the parse; it combines with the normalisation
+    // shift below, so the written sign alone does not decide the result's.
+    let explicit_exp: i32 = if exp_part.is_empty() {
         0
     } else {
-        exp_digits.parse().map_err(|_| invalid())?
+        exp_part
+            .strip_prefix('+')
+            .unwrap_or(exp_part)
+            .parse()
+            .map_err(|_| invalid())?
     };
 
     let (int_part, frac_part) = match mantissa_part.find('.') {
@@ -5902,11 +6007,8 @@ fn packed_decimal_words(text: &str, line_no: usize) -> Result<Vec<u16>, AsmError
     let is_zero = digits.iter().all(|&d| d == 0);
     let normalized_exp = if is_zero { 0 } else { effective_point - 1 };
     let total_exp = explicit_exp + normalized_exp;
-    let (exp_sign, exp_mag) = if total_exp < 0 {
-        (1u16, (-total_exp) as u32)
-    } else {
-        (exp_sign, total_exp as u32)
-    };
+    let exp_sign = u16::from(total_exp < 0);
+    let exp_mag = total_exp.unsigned_abs();
     if exp_mag > 999 {
         return Err(AsmError::with_line(
             format!("DC.P exponent out of range (-999..=999): {}", text),
@@ -5918,7 +6020,9 @@ fn packed_decimal_words(text: &str, line_no: usize) -> Result<Vec<u16>, AsmError
     digits.resize(17, 0);
 
     let bcd_exp = ((exp_mag / 100) % 10) << 8 | ((exp_mag / 10) % 10) << 4 | (exp_mag % 10);
-    let word0 = (mantissa_sign << 15) | (exp_sign << 12) | (bcd_exp as u16);
+    // SM in bit 15, SE in bit 14; bits 13-12 (YY) are only set for
+    // infinities and NaNs.
+    let word0 = (mantissa_sign << 15) | (exp_sign << 14) | (bcd_exp as u16);
 
     let word1 = digits[0] as u16;
     let mut words = vec![word0, word1];
@@ -6370,26 +6474,26 @@ start:
         let st = SymbolTable::new();
         assert!(matches!(
             parse_parens_disp_pc_index("($10,PC,D0)", &st, 0),
-            Some((0, 16, _, false))
+            Some((0, Some(16), _, false))
         ));
         assert!(matches!(
             parse_parens_disp_pc_index("(0,PC,D1)", &st, 0),
-            Some((1, 0, _, false))
+            Some((1, Some(0), _, false))
         ));
         // An index register that is an *address* register is reported as
         // 8 + n, the numbering the brief-format extension word uses to
         // derive its D/A bit — so A2 is 10, not 2 (which would be D2).
         assert!(matches!(
             parse_parens_disp_pc_index("($20,PC,A2)", &st, 0),
-            Some((10, 32, _, false))
+            Some((10, Some(32), _, false))
         ));
         assert!(matches!(
             parse_parens_disp_pc_index("($10,PC,D3.W)", &st, 0),
-            Some((3, 16, _, false))
+            Some((3, Some(16), _, false))
         ));
         assert!(matches!(
             parse_parens_disp_pc_index("($10,PC,D3.L)", &st, 0),
-            Some((3, 16, _, true))
+            Some((3, Some(16), _, true))
         ));
         assert!(parse_parens_disp_pc_index("(A0)", &st, 0).is_none());
         assert!(parse_parens_disp_pc_index("($10,PC)", &st, 0).is_none());
@@ -7306,6 +7410,42 @@ after:
     }
 
     #[test]
+    fn dc_p_exponent_sign_is_bit_14_and_follows_the_normalised_value() {
+        let word0 = |lit: &str| {
+            let mut asm = Assembler::new(0);
+            asm.assemble(&format!(" dc.p {lit}\n")).unwrap();
+            asm.code[0].words[0]
+        };
+        assert_eq!(word0("1e-5"), 0x4005);
+        assert_eq!(word0("100e-1"), 0x0001); // 1.0e1
+        assert_eq!(word0("0.05"), 0x4002); // 5.0e-2
+        assert_eq!(word0("-12.5e3"), 0x8004);
+    }
+
+    #[test]
+    fn fpu_immediates_are_encoded_in_their_format() {
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68030");
+        asm.assemble(
+            " fmove.s #1.5,fp0\n fmove.s #$3fc00000,fp1\n fmove.d #1,fp2\n fcmp.s #x,fp0\nx equ 3\n",
+        )
+        .unwrap();
+        let ext: Vec<&[u16]> = asm.code.iter().map(|i| &i.words[2..]).collect();
+        assert_eq!(ext[0], [0x3FC0, 0x0000]);
+        assert_eq!(ext[1], [0x3FC0, 0x0000]);
+        assert_eq!(ext[2], [0x3FF0, 0, 0, 0]);
+        assert_eq!(ext[3], [0x4040, 0x0000]);
+    }
+
+    #[test]
+    fn branch_to_an_undefined_label_is_an_error() {
+        for src in [" bra.w nosuch\n", " bsr nosuch\n", " dbra d0,nosuch\n"] {
+            let mut asm = Assembler::new(0x1000);
+            assert!(asm.assemble(src).is_err(), "{src}");
+        }
+    }
+
+    #[test]
     fn test_dc_p_simple_integer() {
         // DC.P 123: mantissa sign 0, exponent 0 (2 is the normalized
         // exponent for 3 significant digits "123" -> 1.23 x 10^2), 17
@@ -8115,6 +8255,119 @@ mymexc MACRO
     }
 
     #[test]
+    fn expressions_reject_leftovers_and_know_modulo() {
+        let eval = |src: &str| {
+            let mut asm = Assembler::new(0);
+            asm.assemble(src).ok()?;
+            Some(asm.code.last()?.words.clone())
+        };
+        assert_eq!(eval(" dc.l 1+2)\n"), None);
+        assert_eq!(eval("x equ 7\n dc.w x%10\n"), Some(vec![7]));
+        assert_eq!(eval(" dc.w 7%%11\n"), Some(vec![1])); // 7 mod %11
+        assert_eq!(eval(" dc.w (1+2)*%11\n"), Some(vec![9]));
+    }
+
+    #[test]
+    fn invalid_operands_are_errors_not_silently_changed() {
+        for (src, cpu) in [
+            (" lsl.l (a0)\n", "68000"),
+            (" movem.l d0,(a0)+\n", "68000"),
+            (" movem.l -(a0),d0\n", "68000"),
+            (" movem.l d0,x(pc)\nx: nop\n", "68000"),
+            (" tst.w #5\n", "68000"),
+            (" tst.w #5\n", "68010"),
+            (" add.w #-40000,d0\n", "68000"),
+            (" move.l #$123456789,d0\n", "68000"),
+            (" stop #$10000\n", "68000"),
+            (" andi.b #$100,ccr\n", "68000"),
+            (" move.l (a0,d0.w*16),d1\n", "68020"),
+            (" bfset (a0){32:1}\n", "68020"),
+            (" bfset (a0){1:33}\n", "68020"),
+            (" link.l a6,#0\n", "68010"),
+            (" extb.l d0\n", "68010"),
+            (" muls.l d0,d1\n", "68010"),
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu(cpu);
+            assert!(asm.assemble(src).is_err(), "{cpu}: {src}");
+        }
+        assert_eq!(
+            assemble_source_with_cpu(" tst.w #5\n", "68020"),
+            [0x4A, 0x7C, 0, 5]
+        );
+        assert_eq!(
+            assemble_source_with_cpu(" tst.l a0\n", "68020"),
+            [0x4A, 0x88]
+        );
+    }
+
+    #[test]
+    fn cpu_specific_registers_and_mmu_fields_are_checked() {
+        assert_eq!(
+            assemble_source_with_cpu(" pflush sfc,#3\n", "68030"),
+            [0xF0, 0x00, 0x30, 0x60]
+        );
+        assert_eq!(
+            assemble_source_with_cpu(" pflush d1,#0\n", "68030"),
+            [0xF0, 0x00, 0x30, 0x09]
+        );
+        for (src, cpu) in [
+            (" ptestr #1,(a0),#8\n", "68030"),
+            (" pflush #8,#0\n", "68030"),
+            (" movec cacr,d0\n", "68010"),
+            (" movec urp,d0\n", "68020"),
+            (" movec pcr,d0\n", "68040"),
+            (" pflushn (a0)\n", "68030"),
+            (" plpar (a0)\n", "68040"),
+            (" fmove.x fp0,d0\n", "68030"),
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu(cpu);
+            assert!(asm.assemble(src).is_err(), "{cpu}: {src}");
+        }
+        assert_eq!(
+            assemble_source_with_cpu(" movec pcr,d0\n", "68060"),
+            [0x4E, 0x7A, 0x08, 0x08]
+        );
+    }
+
+    #[test]
+    fn bit_numbers_overflow_and_zpc_are_rejected() {
+        for (src, cpu) in [
+            (" btst #1,#5\n", "68000"),
+            (" btst #9,(a0)\n", "68000"),
+            (" bset #32,d0\n", "68000"),
+            (" dc.l 1<<64\n", "68000"),
+            (" dc.l $7fffffffffffffff*2\n", "68000"),
+            (" jmp (zpc,d0.w)\n", "68020"),
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu(cpu);
+            assert!(asm.assemble(src).is_err(), "{cpu}: {src}");
+        }
+        assert_eq!(
+            assemble_source_with_cpu(" btst d1,#5\n", "68000"),
+            [0x03, 0x3C, 0, 5]
+        );
+    }
+
+    #[test]
+    fn test_source_cas2_long() {
+        // Size field bits 10-9 = 11 for long: 0000 1110 1111 1100.
+        let bytes = assemble_source_with_cpu("    CAS2.L D0:D1,D2:D3,(A0):(A1)\n", "68020");
+        assert_eq!(bytes, vec![0x0E, 0xFC, 0x80, 0x80, 0x90, 0xC1]);
+    }
+
+    #[test]
+    fn pc_index_without_displacement_is_pc_relative() {
+        let bytes = assemble_source_with_cpu(" jmp (pc,d0.w)\n", "68020");
+        assert_eq!(bytes, vec![0x4E, 0xFB, 0x00, 0x00]);
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68020");
+        assert!(asm.assemble(" move.l d1,(pc,d0.w)\n").is_err());
+    }
+
+    #[test]
     fn test_source_cas_followed_by_label_size_estimate() {
         // Regression check: pass-1 size estimation for CAS (a pre-existing 3-operand
         // instruction not routed through encode_instruction) falls back to a fixed 2-byte
@@ -8513,6 +8766,48 @@ later: DC.W 0
             b"ABCD"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn include_inside_a_false_if_does_not_drop_a_later_include() {
+        let dir = std::env::temp_dir().join(format!("m68k-incif-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("c.s"), " dc.w $1234\n").unwrap();
+        let mut asm = Assembler::new(0);
+        asm.set_source_root(dir.clone());
+        let bytes = asm
+            .assemble_bytes(" if 0\n include \"c.s\"\n endc\n include \"c.s\"\n dc.w $5678\n")
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(bytes, [0x12, 0x34, 0x56, 0x78]);
+    }
+
+    #[test]
+    fn rept_count_is_an_expression_and_nested_rept_repeats() {
+        let nops = |src: &str| {
+            let mut asm = Assembler::new(0);
+            asm.assemble(src).unwrap();
+            asm.code.len()
+        };
+        assert_eq!(nops("n equ 3\n rept n\n nop\n endr\n"), 3);
+        assert_eq!(nops(" rept 1+2\n nop\n endr\n"), 3);
+        assert_eq!(nops(" rept 2\n rept 3\n nop\n endr\n endr\n"), 6);
+        let mut asm = Assembler::new(0);
+        assert!(asm.assemble(" rept $zz\n nop\n endr\n").is_err());
+        let mut asm = Assembler::new(0);
+        assert!(asm.assemble("m macro\n m\n m\n endm\n m\n").is_err());
+    }
+
+    #[test]
+    fn cnop_moves_to_offset_past_the_alignment() {
+        let label = |src: &str| {
+            let mut asm = Assembler::new(0);
+            asm.assemble(src).unwrap();
+            asm.symbols.resolve("l").unwrap()
+        };
+        assert_eq!(label(" cnop 2,8\nl: dc.w 0\n"), 2);
+        assert_eq!(label(" dc.w 0\n cnop 0,4\nl: dc.w 0\n"), 4);
+        assert_eq!(label(" dc.l 0,0\n dc.w 0\n cnop 2,4\nl: dc.w 0\n"), 10);
     }
 
     #[test]

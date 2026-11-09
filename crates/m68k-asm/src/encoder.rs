@@ -3,7 +3,7 @@
 use m68k_core::errors::AsmError;
 use m68k_core::operands::Operand;
 
-use crate::enc_bitfield::{enc_bfinv, enc_bitfield};
+use crate::enc_bitfield::enc_bitfield;
 use crate::enc_flow::*;
 use crate::enc_fpu::*;
 use crate::enc_logic::*;
@@ -142,6 +142,29 @@ pub(crate) fn fpu_cc(cond: &str) -> Option<u16> {
     })
 }
 
+/// A 16-bit immediate field (signed or unsigned spelling). Casting with
+/// `as u16` silently kept the low half of `#$10000`.
+fn imm_word(v: i64, what: &str) -> Result<u16, AsmError> {
+    if (-0x8000..=0xFFFF).contains(&v) {
+        Ok(v as u16)
+    } else {
+        Err(AsmError::new(format!(
+            "{what} immediate {v} does not fit 16 bits"
+        )))
+    }
+}
+
+/// An 8-bit immediate (the CCR forms), in the low byte of its word.
+fn imm_byte(v: i64, what: &str) -> Result<u16, AsmError> {
+    if (-0x80..=0xFF).contains(&v) {
+        Ok(v as u16 & 0xFF)
+    } else {
+        Err(AsmError::new(format!(
+            "{what} immediate {v} does not fit 8 bits"
+        )))
+    }
+}
+
 /// Encode a single instruction given mnemonic, size, operands, current PC, and CPU.
 pub fn encode_instruction(
     mnemonic: &str,
@@ -161,7 +184,7 @@ pub fn encode_instruction(
         "RESET" => enc_reset(),
         "STOP" => {
             if let Some(Operand::Immediate(v)) = src {
-                enc_stop(*v as u16)
+                enc_stop(imm_word(*v, "STOP")?)
             } else {
                 Err(AsmError::new("STOP requires immediate operand"))
             }
@@ -321,7 +344,7 @@ pub fn encode_instruction(
         // RTD
         "RTD" => {
             if let Some(Operand::Immediate(disp)) = src {
-                enc_rtd(*disp as u16)
+                enc_rtd(imm_word(*disp, "RTD")?)
             } else {
                 Err(AsmError::new("RTD requires immediate displacement"))
             }
@@ -591,8 +614,10 @@ pub fn encode_instruction(
                 // word-sized and by one. With only one operand the parser
                 // delivers it as `src`, so matching on `dst` alone missed
                 // it and produced "Shift requires destination operand".
-                (Some(d), None) | (None, Some(d)) => enc_shift_mem(&mn, d, "w", pc + 4, cpu),
-                (Some(_), Some(d)) => enc_shift_mem(&mn, d, "w", pc + 4, cpu),
+                // The written size is passed on, so `lsl.l (a0)` is
+                // rejected instead of silently becoming `.w`.
+                (Some(d), None) | (None, Some(d)) => enc_shift_mem(&mn, d, sz, pc + 4, cpu),
+                (Some(_), Some(d)) => enc_shift_mem(&mn, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("Shift requires destination operand")),
             }
         }
@@ -695,12 +720,12 @@ pub fn encode_instruction(
             if let (Some(Operand::Immediate(v)), Some(d0)) = (src, dst)
                 && is_special(d0, "SR")
             {
-                return Ok(vec![0x46FC, *v as u16]);
+                return Ok(vec![0x46FC, imm_word(*v, "SR")?]);
             }
             if let (Some(Operand::Immediate(v)), Some(d0)) = (src, dst)
                 && is_special(d0, "CCR")
             {
-                return Ok(vec![0x44FC, *v as u16]);
+                return Ok(vec![0x44FC, imm_word(*v, "CCR")?]);
             }
             // MOVE.L An, USP -> from USP (0x4E60 | An)
             // Assembler convention: MOVE An,USP = move from USP to An
@@ -841,10 +866,10 @@ pub fn encode_instruction(
                 // -1 marks CCR and -2 marks SR (see parse_operand_text);
                 // matching any immediate meant both used the same opcode.
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "CCR") => {
-                    enc_andi_ccr_sr(*v as u16, false)
+                    enc_andi_ccr_sr(imm_byte(*v, "CCR")?, false)
                 }
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "SR") => {
-                    enc_andi_ccr_sr(*v as u16, true)
+                    enc_andi_ccr_sr(imm_word(*v, "SR")?, true)
                 }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_andi(*v, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("ANDI requires immediate and destination")),
@@ -854,10 +879,10 @@ pub fn encode_instruction(
             let sz = size.unwrap_or("w");
             match (src, dst) {
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "CCR") => {
-                    enc_ori_ccr_sr(*v as u16, false)
+                    enc_ori_ccr_sr(imm_byte(*v, "CCR")?, false)
                 }
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "SR") => {
-                    enc_ori_ccr_sr(*v as u16, true)
+                    enc_ori_ccr_sr(imm_word(*v, "SR")?, true)
                 }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_ori(*v, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("ORI requires immediate and destination")),
@@ -867,10 +892,10 @@ pub fn encode_instruction(
             let sz = size.unwrap_or("w");
             match (src, dst) {
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "CCR") => {
-                    enc_eori_ccr_sr(*v as u16, false)
+                    enc_eori_ccr_sr(imm_byte(*v, "CCR")?, false)
                 }
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "SR") => {
-                    enc_eori_ccr_sr(*v as u16, true)
+                    enc_eori_ccr_sr(imm_word(*v, "SR")?, true)
                 }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_eori(*v, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("EORI requires immediate and destination")),
@@ -980,7 +1005,7 @@ pub fn encode_instruction(
 
         // MOVE to/from SR/CCR/USP
         "MOVEC" => match (src, dst) {
-            (Some(s), Some(d)) => crate::enc_flow::enc_movec(s, d),
+            (Some(s), Some(d)) => crate::enc_flow::enc_movec(s, d, cpu),
             _ => Err(AsmError::new("MOVEC requires two operands")),
         },
 
@@ -1076,14 +1101,6 @@ pub fn encode_instruction(
             }
             _ => Err(AsmError::new("BFINS requires Dn,ea{offset:width}")),
         },
-        // BFINV (non-standard bitfield invert)
-        "BFINV" => match src {
-            Some(bf @ Operand::Bitfield(..)) => enc_bfinv(bf, pc + 6, cpu),
-            _ => Err(AsmError::new(
-                "BFINV requires bitfield operand: ea{offset:width}",
-            )),
-        },
-
         // FPU arithmetic instructions (68020/68881+): FADD, FSQRT, FSIN, FCMP, FTST, ...
         _ if fpu_arith_cmd(mnemonic).is_some() => {
             let cmd = fpu_arith_cmd(mnemonic).unwrap();
@@ -1242,15 +1259,15 @@ pub fn encode_instruction(
         // bits 4-3, register in bits 2-0). The previous 0xF518 didn't match
         // any of that family's four opmodes.
         "PFLUSHN" => match src.or(dst) {
-            Some(d) => enc_mmu_single_reg(0xF500, d, cpu),
+            Some(d) => enc_mmu_single_reg(0xF500, d, "68040", cpu),
             _ => Err(AsmError::new("PFLUSHN requires An or (An)")),
         },
         "PLPAW" => match src.or(dst) {
-            Some(d) => enc_mmu_single_reg(0xF588, d, cpu),
+            Some(d) => enc_mmu_single_reg(0xF588, d, "68060", cpu),
             _ => Err(AsmError::new("PLPAW requires An or (An)")),
         },
         "PLPAR" => match src.or(dst) {
-            Some(d) => enc_mmu_single_reg(0xF5C8, d, cpu),
+            Some(d) => enc_mmu_single_reg(0xF5C8, d, "68060", cpu),
             _ => Err(AsmError::new("PLPAR requires An or (An)")),
         },
 
@@ -1324,7 +1341,7 @@ pub fn encode_instruction(
         // encode_instruction_ex instead.
         "PFLUSH" => match (src, dst) {
             (Some(Operand::Immediate(fc)), Some(Operand::Immediate(mask))) => {
-                enc_pflush_no_ea(*fc, *mask, cpu)
+                enc_pflush_no_ea(crate::enc_mmu::fc_immediate(*fc)?, *mask, cpu)
             }
             _ => Err(AsmError::new("PFLUSH requires #fc,#mask or #fc,#mask,<ea>")),
         },
@@ -1358,11 +1375,17 @@ pub fn encode_instruction_ex(
     if mnemonic == "PFLUSH" {
         return match (src, dst, extra) {
             (Some(Operand::Immediate(fc)), Some(Operand::Immediate(mask)), Some(ea_op)) => {
-                enc_pflush(*fc, *mask, ea_op, pc + 6, cpu)
+                enc_pflush(
+                    crate::enc_mmu::fc_immediate(*fc)?,
+                    *mask,
+                    ea_op,
+                    pc + 6,
+                    cpu,
+                )
             }
             // Two operands: the no-EA form.
             (Some(Operand::Immediate(fc)), Some(Operand::Immediate(mask)), None) => {
-                enc_pflush_no_ea(*fc, *mask, cpu)
+                enc_pflush_no_ea(crate::enc_mmu::fc_immediate(*fc)?, *mask, cpu)
             }
             _ => Err(AsmError::new("PFLUSH requires #fc,#mask or #fc,#mask,<ea>")),
         };
@@ -1554,17 +1577,6 @@ mod tests {
         );
         let words = encode_instruction("BFSET", None, Some(&bf), None, 0, "68020").unwrap();
         assert_eq!(words_to_bytes(&words), "eed00000");
-    }
-
-    #[test]
-    fn test_bfinv_reference_bytes() {
-        let bf = Operand::Bitfield(
-            Box::new(Operand::AddrRegIndirect(0)),
-            Box::new(BitfieldSpec::Immediate(0)),
-            Box::new(BitfieldSpec::Immediate(8)),
-        );
-        let words = encode_instruction("BFINV", None, Some(&bf), None, 0, "68020").unwrap();
-        assert_eq!(words_to_bytes(&words), "efd00028");
     }
 
     #[test]

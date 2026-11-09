@@ -10,8 +10,9 @@ use m68k_asm::atari_prg_writer::generate_prg;
 use m68k_asm::directives::SectionKind;
 use m68k_asm::ieee695::generate_ieee695_sections;
 use m68k_asm::output::{
-    MAX_IMAGE_SIZE, OutputFormat, apply_megadrive_checksum, binary_span, generate_binary_from,
-    generate_elf_sections, generate_intel_hex, generate_srecord, next_power_of_two, pad_image,
+    MAX_IMAGE_SIZE, OutputFormat, apply_megadrive_checksum, binary_span, first_overlap,
+    generate_binary_from, generate_elf_sections, generate_intel_hex, generate_srecord,
+    next_power_of_two, pad_image,
 };
 
 #[derive(Parser, Debug)]
@@ -508,6 +509,16 @@ fn run(args: Args) -> Result<(), String> {
         .map_err(|e| format!("cannot write depfile '{}': {}", dep_path.display(), e))?;
     }
 
+    if matches!(
+        args.format,
+        OutputFormatArg::Binary | OutputFormatArg::Srecord | OutputFormatArg::IntelHex
+    ) && let Some(addr) = first_overlap(&asm.code)
+    {
+        return Err(format!(
+            "code overlaps at ${addr:X}: sections or ORG blocks share addresses in a flat \
+             image; give each section its own ORG or use a relocatable format"
+        ));
+    }
     if (args.pad.is_some() || args.checksum.is_some()) && args.format != OutputFormatArg::Binary {
         return Err("--pad and --checksum apply to binary output only (-f binary)".into());
     }

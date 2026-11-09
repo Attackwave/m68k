@@ -189,8 +189,9 @@ pub fn enc_movem_rm(
         reg_mask
     };
 
-    let allowed =
-        AREG_IND | APOSTINC | APREDEC | AREG_DISP | AINDEXED | ABSW | ABSL | PCDISP | PCINDEXED;
+    // Register to memory: control alterable or predecrement. `(An)+` and
+    // PC-relative destinations do not exist for this direction.
+    let allowed = AREG_IND | APREDEC | AREG_DISP | AINDEXED | ABSW | ABSL;
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, allowed, cpu)?;
 
     if dst_mode < 2 {
@@ -213,8 +214,9 @@ pub fn enc_movem_mr(
     pc: u32,
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
-    let allowed =
-        AREG_IND | APOSTINC | APREDEC | AREG_DISP | AINDEXED | ABSW | ABSL | PCDISP | PCINDEXED;
+    // Memory to register: control or postincrement; `-(An)` is not a
+    // valid source.
+    let allowed = AREG_IND | APOSTINC | AREG_DISP | AINDEXED | ABSW | ABSL | PCDISP | PCINDEXED;
     let (src_mode, src_reg, src_ext) = encode_ea(src, size, pc, allowed, cpu)?;
 
     if src_mode < 2 {

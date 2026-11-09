@@ -154,7 +154,13 @@ pub fn enc_clr(dst: &Operand, size: &str, pc: u32, cpu: &str) -> Result<Vec<u16>
 /// Encode TST instruction.
 pub fn enc_tst(dst: &Operand, size: &str, pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
     let sz = size_code(size)?;
-    let allowed = DATA | DREG;
+    // 68000/68010 test only data-alterable operands; the 68020 added An
+    // (word and long), PC-relative and immediate.
+    let allowed = if crate::ea_encode::cpu_level(cpu) < 2 {
+        DATA_ALT
+    } else {
+        ALL
+    };
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, allowed, cpu)?;
     let mut words = vec![0x4A00 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16)];
     words.extend(dst_ext);
@@ -351,11 +357,23 @@ pub fn enc_bit_imm(
     // See enc_bit_reg above: BTST's memory operand is read-only (DATA),
     // BSET/BCLR/BCHG's is read-modify-write (DATA_ALT). Previously `ALL`
     // (0xFFFF) bypassed validation entirely for every memory form.
+    // The static form's extension word holds the bit number, so it has
+    // no room for an immediate operand as well: `btst #1,#5` is only
+    // valid with the bit number in a register.
     let allowed = if is_data || mnemonic == "btst" {
-        DATA
+        DATA & !IMM
     } else {
         DATA_ALT
     };
+    // The CPU takes the bit number modulo 32 (register) or 8 (memory), so
+    // a larger one tests a different bit than the one written.
+    let limit = if is_data { 32 } else { 8 };
+    if bit >= limit {
+        return Err(AsmError::new(format!(
+            "bit number {bit} is out of range 0..{} for this operand",
+            limit - 1
+        )));
+    }
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, allowed, cpu)?;
     let mut words = vec![base | ((dst_mode as u16) << 3) | (dst_reg as u16), bit];
     words.extend(dst_ext);
@@ -438,7 +456,7 @@ pub fn enc_cas2(
 
     let base: u16 = match size_code {
         1 => 0x0CFC,
-        3 => 0x0DFC,
+        3 => 0x0EFC,
         _ => unreachable!(),
     };
     let dc1_reg = match dc1 {

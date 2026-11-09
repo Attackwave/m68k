@@ -81,7 +81,7 @@ pub fn enc_bcc_sized(
     } else if (-32768..=32767).contains(&disp) {
         let op = 0x6000 | ((cc as u16) << 8);
         Ok(vec![op, (disp & 0xFFFF) as u16])
-    } else if cpu == "68000" {
+    } else if crate::ea_encode::cpu_level(cpu) < 2 {
         // The 32-bit long-displacement form below is 68020+ only. Without
         // this check, a Bcc target more than 32KB away on `--cpu 68000`
         // silently emitted the 68020 encoding instead of an error.
@@ -255,7 +255,7 @@ pub fn enc_link(reg: u8, displacement: i32, size: &str, cpu: &str) -> Result<Vec
             Ok(vec![op, (displacement & 0xFFFF) as u16])
         }
         "l" => {
-            if cpu == "68000" {
+            if crate::ea_encode::cpu_level(cpu) < 2 {
                 return Err(AsmError::new("LINK.L requires 68020 or later"));
             }
             // LINK.L has its own base opcode (0x4808), unrelated to LINK.W's
@@ -296,7 +296,34 @@ pub fn enc_rtd(displacement: u16) -> Result<Vec<u16>, AsmError> {
 /// with no diagnostic. Address registers were rejected outright, though
 /// `movec a0,vbr` and `movec a7,usp` are both valid and appear in real
 /// code.
-pub fn enc_movec(src: &Operand, dst: &Operand) -> Result<Vec<u16>, AsmError> {
+/// Lowest CPU level (68010 = 1 … 68060 = 5) that has MOVEC control
+/// register `cr`, or `None` for a code no 68k defines.
+fn movec_min_level(cr: u16) -> Option<u8> {
+    Some(match cr {
+        0x000 | 0x001 | 0x800 | 0x801 => 1, // SFC DFC USP VBR
+        0x002 | 0x802 | 0x803 | 0x804 => 2, // CACR CAAR MSP ISP
+        0x003..=0x007 | 0x805..=0x807 => 4, // TC ITTx DTTx MMUSR URP SRP
+        0x008 | 0x808 => 5,                 // BUSCR PCR
+        _ => return None,
+    })
+}
+
+pub fn enc_movec(src: &Operand, dst: &Operand, cpu: &str) -> Result<Vec<u16>, AsmError> {
+    // A control register the selected CPU lacks makes MOVEC trap as an
+    // illegal instruction, so it is an error here, not working output.
+    let check = |cr: i64| -> Result<u16, AsmError> {
+        let code = u16::try_from(cr)
+            .ok()
+            .filter(|c| movec_min_level(*c).is_some())
+            .ok_or_else(|| AsmError::new(format!("unknown MOVEC control register ${cr:X}")))?;
+        let min = movec_min_level(code).unwrap_or(1);
+        if crate::ea_encode::cpu_level(cpu) < min {
+            return Err(AsmError::new(format!(
+                "MOVEC control register ${code:03X} is not available on the {cpu}"
+            )));
+        }
+        Ok(code)
+    };
     fn reg_field(op: &Operand) -> Option<u16> {
         match op {
             Operand::DataReg(n) => Some((*n as u16) << 12),
@@ -309,14 +336,14 @@ pub fn enc_movec(src: &Operand, dst: &Operand) -> Result<Vec<u16>, AsmError> {
     if let Operand::Immediate(cr) = dst
         && let Some(reg) = reg_field(src)
     {
-        return Ok(vec![0x4E7B, ((*cr as u16) & 0xFFF) | reg]);
+        return Ok(vec![0x4E7B, check(*cr)? | reg]);
     }
 
     // MOVEC Cr,Rn — control register to general register.
     if let Operand::Immediate(cr) = src
         && let Some(reg) = reg_field(dst)
     {
-        return Ok(vec![0x4E7A, ((*cr as u16) & 0xFFF) | reg]);
+        return Ok(vec![0x4E7A, check(*cr)? | reg]);
     }
 
     Err(AsmError::new("MOVEC requires Rn,CR or CR,Rn operands"))
@@ -483,7 +510,7 @@ pub fn enc_negx(dst: &Operand, size: &str, pc: u32, cpu: &str) -> Result<Vec<u16
 
 /// Encode EXT.B instruction (68020+, opcode 0x49C0 | reg).
 pub fn enc_extb(reg: u8, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    if cpu == "68000" {
+    if crate::ea_encode::cpu_level(cpu) < 2 {
         return Err(AsmError::new("EXTB requires 68020 or later"));
     }
     Ok(vec![0x49C0 | (reg as u16)])
@@ -504,7 +531,7 @@ pub fn enc_scc(cond: &str, dst: &Operand, pc: u32, cpu: &str) -> Result<Vec<u16>
 /// 0 operands: TRAPcc (implicit, word-sized trap)
 /// 1 operand: TRAPcc #imm (word or long)
 pub fn enc_trapcc(cond: &str, imm: Option<(i64, &str)>, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    if cpu == "68000" {
+    if crate::ea_encode::cpu_level(cpu) < 2 {
         return Err(AsmError::new("TRAPcc requires 68020 or later"));
     }
     let cc = cond_code(cond)?;
@@ -1248,6 +1275,7 @@ mod tests {
         let words = enc_movec(
             &Operand::Immediate(0x801), // VBR
             &Operand::DataReg(0),       // D0
+            "68020",
         )
         .unwrap();
         assert_eq!(words, vec![0x4E7A, 0x0801]);
@@ -1258,6 +1286,7 @@ mod tests {
         let words = enc_movec(
             &Operand::DataReg(0),       // D0
             &Operand::Immediate(0x002), // CACR
+            "68020",
         )
         .unwrap();
         assert_eq!(words, vec![0x4E7B, 0x0002]);
@@ -1505,20 +1534,20 @@ mod tests {
         // register, with no diagnostic.
         let vbr = Operand::Immediate(0x801);
         assert_eq!(
-            enc_movec(&Operand::DataReg(1), &vbr).unwrap(),
+            enc_movec(&Operand::DataReg(1), &vbr, "68010").unwrap(),
             vec![0x4E7B, 0x1801]
         );
         assert_eq!(
-            enc_movec(&vbr, &Operand::DataReg(1)).unwrap(),
+            enc_movec(&vbr, &Operand::DataReg(1), "68010").unwrap(),
             vec![0x4E7A, 0x1801]
         );
         // Address registers set bit 15; these were rejected outright.
         assert_eq!(
-            enc_movec(&Operand::AddrReg(0), &vbr).unwrap(),
+            enc_movec(&Operand::AddrReg(0), &vbr, "68010").unwrap(),
             vec![0x4E7B, 0x8801]
         );
         assert_eq!(
-            enc_movec(&Operand::Immediate(0x800), &Operand::AddrReg(7)).unwrap(),
+            enc_movec(&Operand::Immediate(0x800), &Operand::AddrReg(7), "68010").unwrap(),
             vec![0x4E7A, 0xF800]
         );
     }

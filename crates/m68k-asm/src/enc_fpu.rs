@@ -52,6 +52,17 @@ fn fmt_code(size: Option<&str>) -> u16 {
     }
 }
 
+/// EA categories for an FPU memory operand of format `fmt`: a data
+/// register holds only the byte, word, long and single formats, so `.d`,
+/// `.x` and `.p` cannot name one.
+fn fpu_ea(fmt: &str, categories: u16) -> u16 {
+    if matches!(fmt.to_ascii_lowercase().as_str(), "d" | "x" | "p") {
+        categories & !ea::DREG
+    } else {
+        categories
+    }
+}
+
 /// Encode a monadic/dyadic FPU arithmetic instruction (FADD, FSQRT, FSIN, FCMP, FTST, ...).
 ///
 /// `cmd` is the 7-bit opclass/opmode field (extension word bits 6-0).
@@ -80,7 +91,7 @@ pub fn enc_fpu_arith(
         // <ea>,FPn : memory/register source, FPn destination.
         (ea_op, Some(Operand::FpReg(fpd))) => {
             let fmt = size.unwrap_or("w");
-            let (mode, reg, ext_words) = encode_ea(ea_op, fmt, ext_pc, ea::DATA, cpu)?;
+            let (mode, reg, ext_words) = encode_ea(ea_op, fmt, ext_pc, fpu_ea(fmt, ea::DATA), cpu)?;
             let ext = (2 << 13) | (fmt_code(size) << 10) | ((*fpd as u16) << 7) | cmd;
             let mut words = vec![0xF200 | ((mode as u16) << 3) | (reg as u16), ext];
             words.extend(ext_words);
@@ -135,7 +146,7 @@ pub fn enc_fmove(
         }
         (ea_op, Operand::FpReg(fpd)) => {
             let fmt = size.unwrap_or("w");
-            let (mode, reg, ext_words) = encode_ea(ea_op, fmt, ext_pc, ea::DATA, cpu)?;
+            let (mode, reg, ext_words) = encode_ea(ea_op, fmt, ext_pc, fpu_ea(fmt, ea::DATA), cpu)?;
             let ext = (2 << 13) | (fmt_code(size) << 10) | ((*fpd as u16) << 7);
             let mut words = vec![0xF200 | ((mode as u16) << 3) | (reg as u16), ext];
             words.extend(ext_words);
@@ -143,7 +154,8 @@ pub fn enc_fmove(
         }
         (Operand::FpReg(fps), ea_op) => {
             let fmt = size.unwrap_or("w");
-            let (mode, reg, ext_words) = encode_ea(ea_op, fmt, ext_pc, ea::DATA_ALT, cpu)?;
+            let (mode, reg, ext_words) =
+                encode_ea(ea_op, fmt, ext_pc, fpu_ea(fmt, ea::DATA_ALT), cpu)?;
             // Static k-factor uses the same format code as any other .P
             // move (3); dynamic k-factor uses a distinct format code (7)
             // instead of a bit within the k-factor field itself — that
@@ -457,8 +469,12 @@ mod tests {
     fn test_fadd_ea_to_reg_reference_bytes() {
         let src = Operand::DataReg(0);
         let dst = Operand::FpReg(2);
-        let words = enc_fpu_arith(0x22, &src, Some(&dst), Some("x"), 0, "68020").unwrap();
-        assert_eq!(words, vec![0xF200, 0x4922]);
+        let words = enc_fpu_arith(0x22, &src, Some(&dst), Some("l"), 0, "68020").unwrap();
+        assert_eq!(words, vec![0xF200, 0x4122]);
+        // A data register holds no extended, double or packed value.
+        for fmt in ["x", "d", "p"] {
+            assert!(enc_fpu_arith(0x22, &src, Some(&dst), Some(fmt), 0, "68020").is_err());
+        }
     }
 
     #[test]

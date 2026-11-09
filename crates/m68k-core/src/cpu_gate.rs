@@ -88,8 +88,9 @@ pub fn min_cpu_for_mnemonic(mnemonic: &str) -> Option<MinCpu> {
         "MOVEC" | "MOVES" | "RTD" | "BKPT" => MinCpu::Mc68010,
 
         // 68020+: bitfield instructions.
-        "BFTST" | "BFCHG" | "BFCLR" | "BFSET" | "BFEXTU" | "BFEXTS" | "BFFFO" | "BFINS"
-        | "BFINV" => MinCpu::Mc68020,
+        "BFTST" | "BFCHG" | "BFCLR" | "BFSET" | "BFEXTU" | "BFEXTS" | "BFFFO" | "BFINS" => {
+            MinCpu::Mc68020
+        }
 
         // 68020+: CAS/CAS2, CHK2/CMP2, CALLM/RTM, PACK/UNPK, TRAPcc,
         // extended MUL/DIV forms. (LINK.L, EXTB.L and long Bcc/BSR

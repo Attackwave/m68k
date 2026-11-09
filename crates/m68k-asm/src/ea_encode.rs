@@ -130,7 +130,7 @@ pub fn encode_ea(
             // verified against reference encodings -no-opt` at org 0:
             // `lea (6,pc,d1.w),a0` @0 -> 0x41FB 0x1004 (6 - 2 = 4),
             // `lea (0,pc,d1.w),a0` @4 -> 0x41FB 0x10FA (0 - 6 = -6).
-            let disp = (*target).wrapping_sub(ext_pc as i32 - 2);
+            let disp = target.map_or(0, |t| t.wrapping_sub(ext_pc as i32 - 2));
             if !(-128..=127).contains(&disp) {
                 return Err(AsmError::new(
                     "PC-relative indexed displacement out of range (brief format is 8-bit)",
@@ -145,6 +145,11 @@ pub fn encode_ea(
             let words = encode_immediate(*val, size)?;
             check_ea(mode, reg, allowed)?;
             Ok((mode, reg, words))
+        }
+        Operand::ImmediateWords(words) => {
+            let (mode, reg) = (7, 4);
+            check_ea(mode, reg, allowed)?;
+            Ok((mode, reg, words.clone()))
         }
         Operand::Bitfield(..) => Err(AsmError::new(
             "bitfield operand cannot be used as a plain EA",
@@ -183,7 +188,7 @@ pub fn encode_ea(
     }
 }
 
-fn cpu_level(cpu: &str) -> u8 {
+pub(crate) fn cpu_level(cpu: &str) -> u8 {
     match cpu {
         "68000" => 0,
         "68010" => 1,
@@ -236,19 +241,22 @@ fn encode_immediate(value: i64, size: &str) -> Result<Vec<u16>, AsmError> {
             Ok(vec![(value & 0xFF) as u16])
         }
         "w" => {
-            if value < 0 {
-                Ok(vec![to_word((value & 0xFFFF) as i32)])
-            } else if value > 65535 {
-                Err(AsmError::new("word immediate out of range"))
-            } else {
-                Ok(vec![to_word(value as i32)])
+            if !(-0x8000..=0xFFFF).contains(&value) {
+                return Err(AsmError::new("word immediate out of range"));
             }
+            Ok(vec![(value & 0xFFFF) as u16])
         }
-        "l" => Ok(vec![
-            to_word((value >> 16) as i32),
-            to_word((value & 0xFFFF) as i32),
-        ]),
-        _ => Ok(vec![to_word(value as i32)]),
+        "l" => {
+            if !(-0x8000_0000..=0xFFFF_FFFF).contains(&value) {
+                return Err(AsmError::new("long immediate out of range"));
+            }
+            Ok(vec![(value >> 16) as u16, value as u16])
+        }
+        // FPU .s/.d/.x/.p constants arrive as `ImmediateWords`; an integer
+        // here would be emitted as a single truncated word.
+        other => Err(AsmError::new(format!(
+            "immediate of size .{other} must be a floating-point constant"
+        ))),
     }
 }
 
@@ -259,14 +267,14 @@ fn encode_brief_index(
     scale: u8,
     cpu_level: u8,
 ) -> Result<u16, AsmError> {
-    if scale > 1 && cpu_level < 2 {
-        return Err(AsmError::new("index scale > 1 requires CPU >= 68020"));
-    }
     let is_areg = xreg >= 8;
     let xn = if is_areg { xreg - 8 } else { xreg };
     let long = if xsize == "l" { 1 } else { 0 };
     if ![1, 2, 4, 8].contains(&scale) {
-        return Err(AsmError::new("invalid index scale"));
+        return Err(AsmError::new("invalid index scale (1, 2, 4 or 8)"));
+    }
+    if scale > 1 && cpu_level < 2 {
+        return Err(AsmError::new("index scale > 1 requires CPU >= 68020"));
     }
     let scale_log2 = scale.trailing_zeros() as u8;
     if !(-128..=127).contains(&disp) {
