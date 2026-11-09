@@ -1032,7 +1032,13 @@ impl<W: Write> Session<W> {
 }
 
 fn is_stop(packet: &str) -> bool {
-    packet.starts_with('S') || packet.starts_with('T')
+    // `S`/`T` followed by the two-digit signal number. A bare prefix test
+    // also caught the standard `qOffsets` reply `Text=…;Data=…`.
+    let b = packet.as_bytes();
+    matches!(b.first(), Some(b'S' | b'T'))
+        && b.len() >= 3
+        && b[1].is_ascii_hexdigit()
+        && b[2].is_ascii_hexdigit()
 }
 
 /// `O` + hex text is console output; a bare `OK` is a reply.
@@ -1080,6 +1086,14 @@ fn base64(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn only_signal_packets_are_stops() {
+        assert!(is_stop("S05"));
+        assert!(is_stop("T05thread:01;"));
+        assert!(!is_stop("Text=1000;Data=1000;Bss=1000"));
+        assert!(!is_stop("T"));
+    }
 
     #[test]
     fn memory_replies_are_decoded_strictly() {

@@ -75,6 +75,15 @@ impl Layout {
                 "FAT12 layout leaves no room for a data area",
             ));
         }
+        // FAT12 numbers at most 4084 data clusters; more means FAT16, and
+        // reading its FAT as 12-bit entries (or writing past 0xFF7, the
+        // bad-cluster marker) corrupts the volume.
+        let cluster_count = (total_sectors - data_start) / sectors_per_cluster;
+        if cluster_count > 4084 {
+            return Err(FloppyError::new(format!(
+                "{cluster_count} clusters: a FAT16 volume, not FAT12"
+            )));
+        }
         Ok(Self {
             sectors_per_track,
             sides,
@@ -86,7 +95,7 @@ impl Layout {
             root_sectors,
             data_start,
             total_sectors,
-            cluster_count: (total_sectors - data_start) / sectors_per_cluster,
+            cluster_count,
         })
     }
 

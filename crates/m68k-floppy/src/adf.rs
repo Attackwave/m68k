@@ -65,6 +65,10 @@ impl AdfBackend {
 }
 
 impl FloppyImageReader for AdfBackend {
+    fn sectors_per_track(&self) -> u32 {
+        self.sectors_per_track
+    }
+
     fn read_sector(&mut self, track: u32, side: u32, sector: u32) -> Result<Vec<u8>, FloppyError> {
         if track >= self.tracks {
             return Err(FloppyError::new(format!(

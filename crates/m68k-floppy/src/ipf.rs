@@ -198,7 +198,12 @@ impl NativeIpfBackend {
         let Ok(decoded) = decoder.decode_track(Some(raw_track), Some(side)) else {
             return;
         };
-        for sector in decoded {
+        // A sector whose MFM checksums fail is not returned: its data (or
+        // even its sector number) is corrupt.
+        for sector in decoded
+            .into_iter()
+            .filter(|s| s.header_checksum_ok && s.data_checksum_ok)
+        {
             self.decoded_sectors
                 .insert((track, side, sector.sector), sector.data);
         }
@@ -223,7 +228,7 @@ impl FloppyImageReader for NativeIpfBackend {
 
         self.decoded_sectors.get(&key).cloned().ok_or_else(|| {
             FloppyError::new(format!(
-                "Sector {} not found on track {}, side {}",
+                "Sector {} not found on track {}, side {} (missing, or its checksum failed)",
                 sector, track, side
             ))
         })

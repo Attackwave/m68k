@@ -579,12 +579,7 @@ impl<'a> AmigaFsWriter<'a> {
             Some((d, n)) => (d, n),
             None => ("", trimmed),
         };
-        if name.len() > 30 {
-            return Err(FloppyError::new(format!(
-                "name {:?} exceeds the 30-character AmigaDOS limit",
-                name
-            )));
-        }
+        check_amiga_name(name)?;
         let dir = self
             .resolve(dir_path)?
             .ok_or_else(|| FloppyError::new(format!("directory {:?} does not exist", dir_path)))?;
@@ -773,17 +768,33 @@ impl<'a> AmigaFsWriter<'a> {
                 let slot = BLOCK_TABLE_ENTRIES - 1 - i;
                 let b = read_u32(self.image, off + OFF_TABLE + slot * 4);
                 if b != 0 {
-                    blocks.push(b);
+                    blocks.push(self.check_data_block(b)?);
                 }
             }
             let next = read_u32(self.image, off + OFF_EXTENSION);
             if next == 0 {
                 break;
             }
-            blocks.push(next);
+            blocks.push(self.check_data_block(next)?);
             current = next;
         }
         Ok(blocks)
+    }
+
+    /// A block a file claims, before it is freed: a corrupt table pointing
+    /// at the bootblock, the root or a bitmap page would otherwise mark
+    /// that block free, and the next allocation would overwrite it.
+    fn check_data_block(&self, block: u32) -> Result<u32, FloppyError> {
+        if block < 2
+            || block >= self.total_blocks
+            || block == self.root_block
+            || self.bitmap.pages.contains(&block)
+        {
+            return Err(FloppyError::new(format!(
+                "file claims block {block}, which belongs to the volume structure"
+            )));
+        }
+        Ok(block)
     }
 
     fn delete_file_at(&mut self, dir_block: u32, header: u32) -> Result<(), FloppyError> {
@@ -974,18 +985,30 @@ impl<'a> AmigaFsWriter<'a> {
 
     /// Set the volume name in the root block.
     pub fn set_volume_name(&mut self, name: &str) -> Result<(), FloppyError> {
-        if name.len() > 30 {
-            return Err(FloppyError::new(format!(
-                "volume name is {} bytes, the on-disk field holds 30",
-                name.len()
-            )));
-        }
+        check_amiga_name(name)?;
         let root = self.root_block;
         let off = self.check_block(root)?;
         write_bcpl_string(self.image, off + OFF_NAME, name, 30);
         fix_block_checksum(self.image, root, OFF_CHECKSUM);
         Ok(())
     }
+}
+
+/// AmigaDOS names hold at most 30 bytes and no `:` or `/` (the device and
+/// path separators) or control characters; such a name could not be
+/// typed or resolved on the Amiga.
+pub fn check_amiga_name(name: &str) -> Result<(), FloppyError> {
+    if name.is_empty() || name.len() > 30 {
+        return Err(FloppyError::new(format!(
+            "name {name:?} must be 1 to 30 bytes long"
+        )));
+    }
+    if name.chars().any(|c| c == ':' || c == '/' || c.is_control()) {
+        return Err(FloppyError::new(format!(
+            "name {name:?} contains ':', '/' or a control character"
+        )));
+    }
+    Ok(())
 }
 
 /// Current time in AmigaDOS form: days since 1978-01-01, minutes past

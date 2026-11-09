@@ -143,12 +143,14 @@ fn format_empty_disk(size: usize, ffs: bool, disk_name: &str) -> Result<Vec<u8>,
     }
     let root_block_num = total_blocks / 2;
 
-    // Bootblock: "DOS" + flags byte (bit0 = FFS), zeroed boot code, root
-    // block pointer, checksum computed last.
+    crate::amigados_write::check_amiga_name(disk_name)?;
+    // Bootblock: "DOS" + flags byte (bit0 = FFS), zeroed boot code and the
+    // root block pointer. The checksum stays 0, as after a plain Format: a
+    // valid one marks the disk bootable, and Kickstart would jump into the
+    // zeroed boot code. Installing boot code sets it.
     image[0..3].copy_from_slice(b"DOS");
     image[3] = if ffs { 1 } else { 0 };
     image[8..12].copy_from_slice(&root_block_num.to_be_bytes());
-    fix_bootblock_checksum(&mut image)?;
 
     // Bitmap blocks go directly after the root block, matching where real
     // AmigaDOS disks put them (Cybernetix.adf: root 880, bitmap 892 — the
@@ -359,10 +361,29 @@ mod tests {
     }
 
     #[test]
+    fn hd_disk_is_read_with_22_sectors_per_track() {
+        // 80 tracks x 2 sides x 22 sectors.
+        let mut image = format_empty_disk(3520 * SECTOR_SIZE, false, "HD").unwrap();
+        crate::amigados_write::AmigaFsWriter::mount(&mut image)
+            .unwrap()
+            .write_file("T.TXT", b"hd data")
+            .unwrap();
+        let path = std::env::temp_dir().join(format!("m68k-hd-{}.adf", std::process::id()));
+        std::fs::write(&path, &image).unwrap();
+        let mut adf = crate::adf::AdfBackend::open(&path).unwrap();
+        let data = AmigaFs::mount(&mut adf, 80).and_then(|mut fs| fs.read_file_at_path("T.TXT"));
+        std::fs::remove_file(&path).ok();
+        assert_eq!(data.unwrap(), b"hd data");
+    }
+
+    #[test]
     fn test_format_empty_ofs_disk_is_mountable_and_empty() {
         let image = format_empty_ofs_disk("MyDisk").unwrap();
         assert_eq!(image.len(), DD_SIZE);
-        assert!(verify_bootblock_checksum(&image).unwrap());
+        // Formatted, not installed: no boot code, so not marked bootable.
+        assert!(!verify_bootblock_checksum(&image).unwrap());
+        assert!(format_empty_ofs_disk("a:b").is_err());
+        assert!(format_empty_ofs_disk(&"x".repeat(31)).is_err());
 
         let mut reader = MemImage { data: image };
         let mut fs = AmigaFs::mount(&mut reader, DD_TRACKS as u32).unwrap();
