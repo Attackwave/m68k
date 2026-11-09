@@ -369,7 +369,7 @@ fn run(args: Args) -> Result<(), String> {
         let kept = disasm.pc_trace_len();
         if kept == 0 && before > 0 {
             return Err(format!(
-                "none of the {} PC values in '{}' fall inside the image \
+                "none of the {} PC values in '{}' is an even address inside the image \
                  (${:08x}..${:08x}) — wrong trace, or wrong --address?",
                 before,
                 path.display(),
@@ -414,7 +414,17 @@ fn run(args: Args) -> Result<(), String> {
         if args.source {
             writeln!(out, "        org     ${:x}", base_addr)?;
         }
-        for line in disasm.disassemble() {
+        let mut lines = disasm.disassemble();
+        if args.source {
+            // Lines the assembler would rebuild differently become DC.B
+            // of their bytes, so the source reassembles to the input.
+            match m68k_cli::roundtrip::make_reassemblable(&mut lines, base_addr, &args.cpu) {
+                Ok(0) => {}
+                Ok(n) => eprintln!("note: {n} line(s) emitted as DC.B to keep the bytes exact"),
+                Err(e) => eprintln!("warning: {e}"),
+            }
+        }
+        for line in lines {
             if line.is_error {
                 eprintln!("{}", line.text);
                 continue;

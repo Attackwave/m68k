@@ -218,6 +218,50 @@ pub struct DisassembledLine {
     pub comment: Option<String>,
 }
 
+/// `name` as a label the assembler reads back as the same symbol.
+fn label_name(name: &str) -> String {
+    let mut out: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let lower = out.to_ascii_lowercase();
+    let register = matches!(
+        lower.as_str(),
+        "sp" | "ssp"
+            | "usp"
+            | "pc"
+            | "zpc"
+            | "sr"
+            | "ccr"
+            | "vbr"
+            | "sfc"
+            | "dfc"
+            | "cacr"
+            | "caar"
+            | "msp"
+            | "isp"
+            | "fpcr"
+            | "fpsr"
+            | "fpiar"
+    ) || (lower.len() == 2
+        && matches!(lower.as_bytes()[0], b'd' | b'a')
+        && (b'0'..=b'7').contains(&lower.as_bytes()[1]))
+        || (lower.len() == 3
+            && lower.starts_with("fp")
+            && (b'0'..=b'7').contains(&lower.as_bytes()[2]));
+    // A leading `.` would make it a local label of the one before it.
+    if out.is_empty() || out.starts_with(|c: char| c.is_ascii_digit() || c == '.') || register {
+        out.insert(0, '_');
+    }
+    out
+}
+
 /// Orchestrates the two-pass disassembly of an m68k binary: pass 1 scans
 /// the whole input to discover branch/jump targets and assign label names,
 /// pass 2 decodes again and formats each instruction, substituting
@@ -309,8 +353,26 @@ impl Disassembler {
     /// runs. These take priority over auto-generated `label<N>` names at
     /// the same address, and are shown even if pass 1 finds no branch/jump
     /// referencing that address.
+    ///
+    /// Names come from symbol tables, project files and equates, so they are
+    /// made into labels the assembler accepts: characters outside an
+    /// identifier become `_`, a name that reads as a register or starts with
+    /// a digit or `.` gets a prefix, and a name already given to another
+    /// address gets the address appended. `label 8 d0` used to turn
+    /// `jsr $8` into `jsr d0`.
     pub fn add_known_labels<I: IntoIterator<Item = (u32, String)>>(&mut self, labels: I) {
-        self.known_labels.extend(labels);
+        for (addr, name) in labels {
+            let mut name = label_name(&name);
+            // Two addresses with one name would define the label twice.
+            if self
+                .known_labels
+                .iter()
+                .any(|(a, n)| *a != addr && *n == name)
+            {
+                name = format!("{name}_{addr:x}");
+            }
+            self.known_labels.insert(addr, name);
+        }
     }
 
     /// Mark half-open `[start, end)` address ranges as data rather than
@@ -2069,6 +2131,19 @@ mod tests {
             lines.iter().find(|l| l.address == 0x1004).unwrap().comment,
             None
         );
+    }
+
+    #[test]
+    fn external_names_become_assemblable_labels() {
+        assert_eq!(label_name("d0"), "_d0");
+        assert_eq!(label_name("SP"), "_SP");
+        assert_eq!(label_name("1abc"), "_1abc");
+        assert_eq!(label_name(".text"), "_.text");
+        assert_eq!(label_name("@main"), "_main");
+        assert_eq!(label_name("fine_name"), "fine_name");
+        let mut d = Disassembler::new(vec![0x4E, 0x71, 0x4E, 0x71], 0);
+        d.add_known_labels([(0, "x".to_string()), (2, "x".to_string())]);
+        assert_eq!(d.known_labels[&2], "x_2");
     }
 
     #[test]
