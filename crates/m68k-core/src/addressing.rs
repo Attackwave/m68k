@@ -400,6 +400,15 @@ pub fn decode_full_ea(
     let bd_code = (ext_word >> 4) & 0x3;
     let i_i_s = ext_word & 0x07;
 
+    // Reserved combinations (PRM table 2-2): bit 3 set, base displacement
+    // size 00, I/IS 100, and the postindexed I/IS 5-7 with the index
+    // suppressed. They are no addressing mode at all.
+    if ext_word & 0x0008 != 0 || bd_code == 0 || i_i_s == 4 || (is_suppress && i_i_s >= 4) {
+        return Err(format!(
+            "reserved full-format extension word ${ext_word:04x}"
+        ));
+    }
+
     let base_reg = if !bs {
         if is_pc {
             Some("pc".to_string())

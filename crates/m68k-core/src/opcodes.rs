@@ -74,6 +74,7 @@ pub enum ParserType {
     MulLong,
     DivLong,
     Cas,
+    Cas2,
     Chk2Cmp2,
     Trapcc,
     Rtm,
@@ -205,7 +206,9 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             mask: 0xF100,
             value: 0xD000,
             mnemonic: "ADD",
-            src_ea: DATA,
+            // An is a valid source for the word and long forms; the parser
+            // refuses byte access to it.
+            src_ea: DATA | AREG,
             dst_ea: DREG,
             cpu: "68000",
             parser: ParserType::EaReg,
@@ -236,7 +239,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0xE1C0,
             mnemonic: "ASL",
             src_ea: 0,
-            dst_ea: MEMORY,
+            dst_ea: ALTERABLE_MEMORY,
             cpu: "68000",
             parser: ParserType::ShiftMem,
             fixed_size: None,
@@ -246,7 +249,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0xE0C0,
             mnemonic: "ASR",
             src_ea: 0,
-            dst_ea: MEMORY,
+            dst_ea: ALTERABLE_MEMORY,
             cpu: "68000",
             parser: ParserType::ShiftMem,
             fixed_size: None,
@@ -256,7 +259,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0xE3C0,
             mnemonic: "LSL",
             src_ea: 0,
-            dst_ea: MEMORY,
+            dst_ea: ALTERABLE_MEMORY,
             cpu: "68000",
             parser: ParserType::ShiftMem,
             fixed_size: None,
@@ -266,7 +269,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0xE2C0,
             mnemonic: "LSR",
             src_ea: 0,
-            dst_ea: MEMORY,
+            dst_ea: ALTERABLE_MEMORY,
             cpu: "68000",
             parser: ParserType::ShiftMem,
             fixed_size: None,
@@ -276,7 +279,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0xE7C0,
             mnemonic: "ROL",
             src_ea: 0,
-            dst_ea: MEMORY,
+            dst_ea: ALTERABLE_MEMORY,
             cpu: "68000",
             parser: ParserType::ShiftMem,
             fixed_size: None,
@@ -286,7 +289,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0xE6C0,
             mnemonic: "ROR",
             src_ea: 0,
-            dst_ea: MEMORY,
+            dst_ea: ALTERABLE_MEMORY,
             cpu: "68000",
             parser: ParserType::ShiftMem,
             fixed_size: None,
@@ -296,7 +299,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0xE5C0,
             mnemonic: "ROXL",
             src_ea: 0,
-            dst_ea: MEMORY,
+            dst_ea: ALTERABLE_MEMORY,
             cpu: "68000",
             parser: ParserType::ShiftMem,
             fixed_size: None,
@@ -306,7 +309,7 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0xE4C0,
             mnemonic: "ROXR",
             src_ea: 0,
-            dst_ea: MEMORY,
+            dst_ea: ALTERABLE_MEMORY,
             cpu: "68000",
             parser: ParserType::ShiftMem,
             fixed_size: None,
@@ -537,7 +540,9 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             mask: 0xF100,
             value: 0xB000,
             mnemonic: "CMP",
-            src_ea: DATA,
+            // An is a valid source for the word and long forms; the parser
+            // refuses byte access to it.
+            src_ea: DATA | AREG,
             dst_ea: DREG,
             cpu: "68000",
             parser: ParserType::Cmp,
@@ -916,7 +921,8 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             // only meaningful for the Line/Page forms). Verified against
             // reference output for all eight scope/unit
             // combinations. Placeholder mnemonic; CacheOp040 overrides it.
-            mask: 0xFC00,
+            // Bits 9-8 are zero: a wider mask also swallowed MOVE16 (F6xx).
+            mask: 0xFF00,
             value: 0xF400,
             mnemonic: "CACHE",
             src_ea: 0,
@@ -1451,7 +1457,9 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             mask: 0xF100,
             value: 0x9000,
             mnemonic: "SUB",
-            src_ea: DATA,
+            // An is a valid source for the word and long forms; the parser
+            // refuses byte access to it.
+            src_ea: DATA | AREG,
             dst_ea: DREG,
             cpu: "68000",
             parser: ParserType::EaReg,
@@ -1506,6 +1514,18 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             dst_ea: 0,
             cpu: "68020",
             parser: ParserType::DivLong,
+            fixed_size: None,
+        },
+        // CAS2.W/L: 0x0CFC/0x0EFC, the CAS opword with the immediate EA
+        // field, followed by two register extension words.
+        OpcodePattern {
+            mask: 0xFDFF,
+            value: 0x0CFC,
+            mnemonic: "CAS2",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68020",
+            parser: ParserType::Cas2,
             fixed_size: None,
         },
         // CAS.B/W/L: bases 0x0AC0/0x0CC0/0x0EC0 (size in opword bits
@@ -1594,9 +1614,10 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             fixed_size: None,
         },
         OpcodePattern {
-            // MOVE16 (68040+): 0xF620 | reg for the (An)+,(An)+ form.
-            mask: 0xFFE0,
-            value: 0xF620,
+            // MOVE16 (68040+): 0xF620 | Ax for (Ax)+,(Ay)+, and 0xF600-0xF61F
+            // for the four forms with an absolute long address.
+            mask: 0xFFC0,
+            value: 0xF600,
             mnemonic: "MOVE16",
             src_ea: 0,
             dst_ea: 0,

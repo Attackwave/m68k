@@ -365,6 +365,9 @@ fn parse_operands(
             let src_mode = ((op >> 3) & 0x7) as u8;
             let src_reg = (op & 0x7) as u8;
             let dst_reg = ((op >> 9) & 0x7) as u8;
+            if src_mode == 1 && size == "b" {
+                return Err("byte access to an address register".into());
+            }
             let src = decode_ea(src_mode, src_reg, size, stream, inst_pc, cpu)?;
             let dst = EAOperand::DataReg(dst_reg);
             operands.push(DecodedOperand::from_ea(src));
@@ -524,6 +527,12 @@ fn parse_operands(
                 let d16 = sign_extend_16(stream.read_word()?);
                 ((ext_pc as i32).wrapping_add(d16) as u32, "w")
             } else if disp == -1 {
+                // The 32-bit displacement is a 68020 addition; before it,
+                // $FF is an odd 8-bit displacement, so this word is no
+                // valid branch at all.
+                if cpu_level(cpu) < 2 {
+                    return Err("Bcc.L requires a 68020".into());
+                }
                 let ext_pc = stream.current_pc();
                 let d32 = stream.read_long()? as i32;
                 ((ext_pc as i32).wrapping_add(d32) as u32, "l")
@@ -982,6 +991,9 @@ fn parse_operands(
             let src_mode = ((op >> 3) & 0x7) as u8;
             let src_reg = (op & 0x7) as u8;
             let dst_reg = ((op >> 9) & 0x7) as u8;
+            if src_mode == 1 && size == "b" {
+                return Err("byte access to an address register".into());
+            }
             let src = decode_ea(src_mode, src_reg, size, stream, inst_pc, cpu)?;
             let dst = EAOperand::DataReg(dst_reg);
             operands.push(DecodedOperand::from_ea(src));
@@ -1154,6 +1166,10 @@ fn parse_operands(
                 _ => return Err("invalid size for CAS".into()),
             };
             let ext = stream.read_word()?;
+            // Only Du (bits 8-6) and Dc (bits 2-0) may be set.
+            if ext & !0x01C7 != 0 {
+                return Err("CAS extension word has reserved bits set".into());
+            }
             let du = (ext >> 6) & 0x7;
             let dc = ext & 0x7;
             let mode = ((op >> 3) & 0x7) as u8;
@@ -1163,6 +1179,36 @@ fn parse_operands(
             operands.push(DecodedOperand::special(format!("d{}", du)));
             operands.push(DecodedOperand::from_ea(ea));
             Ok((format!("cas.{}", size), operands, target_addr))
+        }
+        ParserType::Cas2 => {
+            // Two extension words, each: Rn type (bit 15) and number
+            // (14-12), Du (8-6), Dc (2-0); every other bit is zero.
+            let size = if op & 0x0200 != 0 { "l" } else { "w" };
+            let ext1 = stream.read_word()?;
+            let ext2 = stream.read_word()?;
+            if (ext1 | ext2) & 0x0E38 != 0 {
+                return Err("CAS2 extension word has reserved bits set".into());
+            }
+            let rn = |e: u16| {
+                let kind = if e & 0x8000 != 0 { 'a' } else { 'd' };
+                format!("({kind}{})", (e >> 12) & 0x7)
+            };
+            operands.push(DecodedOperand::special(format!(
+                "d{}:d{}",
+                ext1 & 7,
+                ext2 & 7
+            )));
+            operands.push(DecodedOperand::special(format!(
+                "d{}:d{}",
+                (ext1 >> 6) & 7,
+                (ext2 >> 6) & 7
+            )));
+            operands.push(DecodedOperand::special(format!(
+                "{}:{}",
+                rn(ext1),
+                rn(ext2)
+            )));
+            Ok((format!("cas2.{size}"), operands, target_addr))
         }
         ParserType::Chk2Cmp2 => {
             // CHK2/CMP2 (68020+): size in opword bits 10-9, ext word
@@ -1248,11 +1294,36 @@ fn parse_operands(
         ParserType::Move16 => {
             // MOVE16 (68040+), postincrement-pair form: 0xF620 | Ax,
             // followed by a word whose bits 14-12 hold Ay.
-            let ax = op & 0x7;
-            let ext = stream.read_word()?;
-            let ay = (ext >> 12) & 0x7;
-            operands.push(DecodedOperand::from_ea(EAOperand::PostInc(ax as u8)));
-            operands.push(DecodedOperand::from_ea(EAOperand::PostInc(ay as u8)));
+            let ax = (op & 0x7) as u8;
+            if op & 0x20 != 0 {
+                if op & 0x18 != 0 {
+                    return Err("invalid MOVE16 opword".into());
+                }
+                // Extension word: 1, Ay in bits 14-12, the rest zero.
+                let ext = stream.read_word()?;
+                if ext & 0x8FFF != 0x8000 {
+                    return Err("invalid MOVE16 extension word".into());
+                }
+                let ay = ((ext >> 12) & 0x7) as u8;
+                operands.push(DecodedOperand::from_ea(EAOperand::PostInc(ax)));
+                operands.push(DecodedOperand::from_ea(EAOperand::PostInc(ay)));
+            } else {
+                // Opmode (bits 4-3): 00 (Ay)+,abs  01 abs,(Ay)+
+                // 10 (Ay),abs  11 abs,(Ay).
+                let abs = EAOperand::AbsoluteLong(stream.read_long()?);
+                let reg = if op & 0x10 != 0 {
+                    EAOperand::AddrIndirect(ax)
+                } else {
+                    EAOperand::PostInc(ax)
+                };
+                let (src, dst) = if op & 0x08 != 0 {
+                    (abs, reg)
+                } else {
+                    (reg, abs)
+                };
+                operands.push(DecodedOperand::from_ea(src));
+                operands.push(DecodedOperand::from_ea(dst));
+            }
             Ok((name, operands, target_addr))
         }
         ParserType::PSaveRestore => {
@@ -1274,7 +1345,7 @@ fn parse_operands(
             let cr = ext & 0xFFF;
             let reg = ((ext >> 12) & 0x7) as u8;
             let is_addr_reg = (ext >> 15) & 1 != 0;
-            let cr_name = control_reg_name(cr);
+            let cr_name = control_reg_name(cr)?;
             operands.push(DecodedOperand::special(cr_name));
             operands.push(DecodedOperand::from_ea(if is_addr_reg {
                 EAOperand::AddrReg(reg)
@@ -1288,7 +1359,7 @@ fn parse_operands(
             let cr = ext & 0xFFF;
             let reg = ((ext >> 12) & 0x7) as u8;
             let is_addr_reg = (ext >> 15) & 1 != 0;
-            let cr_name = control_reg_name(cr);
+            let cr_name = control_reg_name(cr)?;
             operands.push(DecodedOperand::from_ea(if is_addr_reg {
                 EAOperand::AddrReg(reg)
             } else {
@@ -1340,9 +1411,19 @@ fn parse_operands(
             let ext = stream.read_word()?;
             let ea_mode = ((op >> 3) & 0x7) as u8;
             let ea_reg = (op & 0x7) as u8;
+            let sub = (op >> 8) & 0x7;
+            // Dn or a control mode; the modifying forms (BFCHG/BFCLR/
+            // BFSET/BFINS, even sub-opcodes from 2 on) cannot write PC-relative.
+            let category = if sub >= 2 && sub.is_multiple_of(2) {
+                m68k_core::ea_categories::ea::DREG | m68k_core::ea_categories::ea::CONTROL_ALT
+            } else {
+                m68k_core::ea_categories::ea::DREG | m68k_core::ea_categories::ea::CONTROL
+            };
+            if !m68k_core::ea_categories::ea_matches(ea_mode, ea_reg, category) {
+                return Err("addressing mode not allowed for a bitfield".into());
+            }
             let ea = decode_ea(ea_mode, ea_reg, "b", stream, inst_pc, cpu)?;
 
-            let sub = (op >> 8) & 0x7;
             let (mnemonic, has_dst_reg, dst_reg_is_source) = match sub {
                 0 => ("bftst", false, false),
                 1 => ("bfextu", true, false),
@@ -1543,7 +1624,7 @@ fn parse_operands(
         }
         ParserType::Fpu => decode_fpu_cpgen(op, stream, inst_pc, cpu, target_addr),
         ParserType::FpuScc => {
-            let cc = stream.read_word()? & 0x3F;
+            let cc = fpu_condition_word(stream.read_word()?)?;
             let mnemonic = format!("fs{}", fpu_cc_name(cc)?);
             let ea_mode = ((op >> 3) & 0x7) as u8;
             let ea_reg = (op & 0x7) as u8;
@@ -1553,7 +1634,7 @@ fn parse_operands(
         }
         ParserType::FpuDbcc => {
             let reg = (op & 0x7) as u8;
-            let cc = stream.read_word()? & 0x3F;
+            let cc = fpu_condition_word(stream.read_word()?)?;
             // Displacement is relative to the PC after the condition word (opword + cc
             // word), not after the opword alone - verified against reference output for
             // `fdbeq d0,$1010` at pc=$1000: pc_after_ext=$1004, disp=$0c, target=$1010.
@@ -1568,7 +1649,7 @@ fn parse_operands(
         }
         ParserType::FpuTrapcc => {
             let mode = op & 0x7;
-            let cc = stream.read_word()? & 0x3F;
+            let cc = fpu_condition_word(stream.read_word()?)?;
             let base_mnemonic = format!("ftrap{}", fpu_cc_name(cc)?);
             let mnemonic = match mode {
                 2 => {
@@ -1588,8 +1669,13 @@ fn parse_operands(
         }
         ParserType::FpuBcc => {
             let size_bit = (op >> 6) & 1;
-            let cc = op & 0x1F;
-            let mnemonic = format!("fb{}", fpu_cc_name(cc)?);
+            // The condition field is six bits; $20-$3F are reserved, and
+            // masking to five bits decoded them as valid conditions.
+            let cc = op & 0x3F;
+            // The 32-bit form needs its suffix, or it reassembles as the
+            // 16-bit one, two bytes shorter.
+            let suffix = if size_bit == 1 { ".l" } else { "" };
+            let mnemonic = format!("fb{}{suffix}", fpu_cc_name(cc)?);
             let ext_pc = stream.current_pc();
             let target = if size_bit == 1 {
                 let d32 = stream.read_long()? as i32;
@@ -1605,6 +1691,13 @@ fn parse_operands(
         ParserType::FpuSave => {
             let ea_mode = ((op >> 3) & 0x7) as u8;
             let ea_reg = (op & 0x7) as u8;
+            if !m68k_core::ea_categories::ea_matches(
+                ea_mode,
+                ea_reg,
+                m68k_core::ea_categories::ea::CONTROL_ALT | m68k_core::ea_categories::ea::APREDEC,
+            ) {
+                return Err("addressing mode not allowed for FSAVE".into());
+            }
             let ea = decode_ea(ea_mode, ea_reg, "b", stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(ea));
             Ok(("fsave".into(), operands, target_addr))
@@ -1612,6 +1705,13 @@ fn parse_operands(
         ParserType::FpuRestore => {
             let ea_mode = ((op >> 3) & 0x7) as u8;
             let ea_reg = (op & 0x7) as u8;
+            if !m68k_core::ea_categories::ea_matches(
+                ea_mode,
+                ea_reg,
+                m68k_core::ea_categories::ea::CONTROL | m68k_core::ea_categories::ea::APOSTINC,
+            ) {
+                return Err("addressing mode not allowed for FRESTORE".into());
+            }
             let ea = decode_ea(ea_mode, ea_reg, "b", stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(ea));
             Ok(("frestore".into(), operands, target_addr))
@@ -1619,9 +1719,23 @@ fn parse_operands(
     }
 }
 
+/// The condition of an FScc/FDBcc/FTRAPcc extension word, whose bits 15-6
+/// must be zero: masking them off decoded words the CPU rejects.
+fn fpu_condition_word(word: u16) -> Result<u16, String> {
+    if word & !0x3F != 0 {
+        return Err(format!(
+            "FPU condition word ${word:04x} has reserved bits set"
+        ));
+    }
+    Ok(word)
+}
+
 /// FPU condition-code mnemonic suffix (lowercase) for a 6-bit (0-31) condition value.
 fn fpu_cc_name(cc: u16) -> Result<&'static str, String> {
-    Ok(match cc & 0x1F {
+    if cc > 0x1F {
+        return Err(format!("reserved FPU condition ${cc:02x}"));
+    }
+    Ok(match cc {
         0x00 => "f",
         0x01 => "eq",
         0x02 => "ogt",
@@ -1927,8 +2041,10 @@ fn decode_fpu_cpgen(
 /// operand, though not a real register mnemonic) for the reserved/unknown
 /// range, so re-encoding a value this table doesn't recognize can still
 /// round-trip instead of producing unparseable output.
-fn control_reg_name(cr: u16) -> String {
-    match cr {
+/// MOVEC control register name; `Err` for a code no 68k defines, which
+/// traps as an illegal instruction and has no assembler spelling.
+fn control_reg_name(cr: u16) -> Result<String, String> {
+    Ok(match cr {
         0x000 => "sfc",
         0x001 => "dfc",
         0x002 => "cacr",
@@ -1937,6 +2053,7 @@ fn control_reg_name(cr: u16) -> String {
         0x005 => "itt1",
         0x006 => "dtt0",
         0x007 => "dtt1",
+        0x008 => "buscr",
         0x800 => "usp",
         0x801 => "vbr",
         0x802 => "caar",
@@ -1945,9 +2062,10 @@ fn control_reg_name(cr: u16) -> String {
         0x805 => "mmusr",
         0x806 => "urp",
         0x807 => "srp",
-        _ => return format!("${:x}", cr),
+        0x808 => "pcr",
+        _ => return Err(format!("unknown MOVEC control register ${cr:03x}")),
     }
-    .to_string()
+    .to_string())
 }
 
 fn read_immediate(size: &str, stream: &mut InstructionStream) -> Result<EAOperand, String> {
@@ -2036,6 +2154,40 @@ mod ea_validation_tests {
     /// `"dc.w"` when the bytes did not resolve to an instruction at all.
     fn decode_one(bytes: &[u8]) -> String {
         decode_one_on(bytes, "68020")
+    }
+
+    #[test]
+    fn invalid_encodings_are_data_and_missing_ones_decode() {
+        let data = [
+            (&[0x66, 0xFF, 0, 0, 0, 2][..], "68000"), // Bcc.L before the 68020
+            (&[0xF2, 0xA0, 0x00, 0x02], "68040"),     // reserved FBcc condition
+            (&[0xF2, 0x50, 0x4E, 0x71], "68040"),     // FScc word with bits 15-6 set
+            (&[0xD0, 0x30, 0x01, 0x00], "68020"),     // full format, BD size 00
+            (&[0xD0, 0x30, 0x01, 0x14], "68020"),     // full format, I/IS 100
+            (&[0x4E, 0x7A, 0x08, 0x09], "68060"),     // unknown MOVEC register
+            (&[0xD0, 0x08], "68000"),                 // add.b a0,d0
+            (&[0xE0, 0xFA, 0x00, 0x02], "68000"),     // asr d16(pc)
+            (&[0xE8, 0xD8, 0x08, 0x08], "68020"),     // bftst (a0)+
+            (&[0xF3, 0x18], "68040"),                 // fsave (a0)+
+            (&[0xF3, 0x60], "68040"),                 // frestore -(a0)
+        ];
+        for (bytes, cpu) in data {
+            let m = decode_one_on(bytes, cpu);
+            assert!(
+                m == "dc.w" || m.starts_with("error"),
+                "{bytes:02x?} {cpu}: {m}"
+            );
+        }
+        for (bytes, cpu, want) in [
+            (&[0xD0, 0x88][..], "68000", "add.l"),
+            (&[0xB0, 0x88], "68000", "cmp.l"),
+            (&[0xF2, 0xC1, 0, 0, 0, 0x0E], "68040", "fbeq.l"),
+            (&[0x0E, 0xFC, 0x80, 0x80, 0x90, 0xC1], "68020", "cas2.l"),
+            (&[0xF6, 0x08, 0, 0, 0x12, 0x34], "68040", "move16"),
+            (&[0xF4, 0xD0], "68040", "cinvp"),
+        ] {
+            assert_eq!(decode_one_on(bytes, cpu), want, "{bytes:02x?}");
+        }
     }
 
     fn decode_one_on(bytes: &[u8], cpu: &str) -> String {
@@ -2350,7 +2502,7 @@ mod tests {
     fn test_decode_fbeq_long() {
         // Reference encoding: fbeq.l $1010 (at pc=$1000) -> f2c10000000e
         let inst = decode_one(&[0xF2, 0xC1, 0x00, 0x00, 0x00, 0x0E], "68040");
-        assert_eq!(inst.mnemonic, "fbeq");
+        assert_eq!(inst.mnemonic, "fbeq.l");
         assert_eq!(inst.target_address, Some(0x1010));
     }
 

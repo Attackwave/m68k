@@ -20,4 +20,5 @@
 //!
 //! Run any binary with `--help` for its full flag list.
 
+pub mod roundtrip;
 pub mod system;
