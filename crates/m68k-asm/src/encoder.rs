@@ -3,7 +3,7 @@
 use m68k_core::errors::AsmError;
 use m68k_core::operands::Operand;
 
-use crate::enc_bitfield::{enc_bfinv, enc_bitfield};
+use crate::enc_bitfield::enc_bitfield;
 use crate::enc_flow::*;
 use crate::enc_fpu::*;
 use crate::enc_logic::*;
@@ -1076,14 +1076,6 @@ pub fn encode_instruction(
             }
             _ => Err(AsmError::new("BFINS requires Dn,ea{offset:width}")),
         },
-        // BFINV (non-standard bitfield invert)
-        "BFINV" => match src {
-            Some(bf @ Operand::Bitfield(..)) => enc_bfinv(bf, pc + 6, cpu),
-            _ => Err(AsmError::new(
-                "BFINV requires bitfield operand: ea{offset:width}",
-            )),
-        },
-
         // FPU arithmetic instructions (68020/68881+): FADD, FSQRT, FSIN, FCMP, FTST, ...
         _ if fpu_arith_cmd(mnemonic).is_some() => {
             let cmd = fpu_arith_cmd(mnemonic).unwrap();
@@ -1554,17 +1546,6 @@ mod tests {
         );
         let words = encode_instruction("BFSET", None, Some(&bf), None, 0, "68020").unwrap();
         assert_eq!(words_to_bytes(&words), "eed00000");
-    }
-
-    #[test]
-    fn test_bfinv_reference_bytes() {
-        let bf = Operand::Bitfield(
-            Box::new(Operand::AddrRegIndirect(0)),
-            Box::new(BitfieldSpec::Immediate(0)),
-            Box::new(BitfieldSpec::Immediate(8)),
-        );
-        let words = encode_instruction("BFINV", None, Some(&bf), None, 0, "68020").unwrap();
-        assert_eq!(words_to_bytes(&words), "efd00028");
     }
 
     #[test]

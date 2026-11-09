@@ -1,5 +1,5 @@
 //! Bitfield instruction encoders (68020+): BFTST, BFEXTU, BFEXTS, BFFFO,
-//! BFCHG, BFCLR, BFSET, BFINS, and the non-standard BFINV.
+//! BFCHG, BFCLR, BFSET and BFINS.
 
 use m68k_core::ea_categories::ea;
 use m68k_core::errors::AsmError;
@@ -114,37 +114,6 @@ pub fn enc_bitfield(
     Ok(words)
 }
 
-/// Encode BFINV (non-standard bitfield invert): same shape as BFSET/BFCLR
-/// but sets the invert flag (extension word bit 5) and uses alterable-memory-only EA.
-pub fn enc_bfinv(bitfield: &Operand, ext_pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    if cpu == "68000" || cpu == "68010" {
-        return Err(AsmError::new("BFINV requires 68020 or later"));
-    }
-
-    let Operand::Bitfield(ea_op, offset, width) = bitfield else {
-        return Err(AsmError::new(
-            "BFINV requires bitfield operand: ea{offset:width}",
-        ));
-    };
-
-    let (ea_mode, ea_reg, ea_ext) = encode_ea(ea_op, "b", ext_pc, ea::CONTROL_ALT, cpu)?;
-
-    let mut ext = bitfield_ext(offset, width);
-    ext |= 1 << 5;
-
-    let opword = 0xE000
-        | (1 << 11)
-        | (1 << 7)
-        | (1 << 6)
-        | (7 << 8)
-        | ((ea_mode as u16) << 3)
-        | (ea_reg as u16);
-
-    let mut words = vec![opword, ext];
-    words.extend(ea_ext);
-    Ok(words)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,29 +173,6 @@ mod tests {
         );
         let words = enc_bitfield("BFTST", &bf, None, 0, "68020").unwrap();
         assert_eq!(words[1] & 0x1F, 0);
-    }
-
-    #[test]
-    fn test_bfinv_sets_invert_bit() {
-        // BFINV requires an alterable-memory EA (Dn is not allowed).
-        let bf = Operand::Bitfield(
-            Box::new(Operand::AddrRegIndirect(0)),
-            Box::new(BitfieldSpec::Immediate(0)),
-            Box::new(BitfieldSpec::Immediate(8)),
-        );
-        let words = enc_bfinv(&bf, 0, "68020").unwrap();
-        assert_eq!(words[0], 0xE000 | 0x800 | 0x80 | 0x40 | (7 << 8) | (2 << 3));
-        assert_eq!(words[1] & (1 << 5), 1 << 5);
-    }
-
-    #[test]
-    fn test_bfinv_rejects_dn_ea() {
-        let bf = Operand::Bitfield(
-            Box::new(Operand::DataReg(0)),
-            Box::new(BitfieldSpec::Immediate(0)),
-            Box::new(BitfieldSpec::Immediate(8)),
-        );
-        assert!(enc_bfinv(&bf, 0, "68020").is_err());
     }
 
     #[test]

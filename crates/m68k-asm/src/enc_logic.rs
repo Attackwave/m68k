@@ -438,7 +438,7 @@ pub fn enc_cas2(
 
     let base: u16 = match size_code {
         1 => 0x0CFC,
-        3 => 0x0DFC,
+        3 => 0x0EFC,
         _ => unreachable!(),
     };
     let dc1_reg = match dc1 {

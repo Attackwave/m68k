@@ -130,7 +130,7 @@ pub fn encode_ea(
             // verified against reference encodings -no-opt` at org 0:
             // `lea (6,pc,d1.w),a0` @0 -> 0x41FB 0x1004 (6 - 2 = 4),
             // `lea (0,pc,d1.w),a0` @4 -> 0x41FB 0x10FA (0 - 6 = -6).
-            let disp = (*target).wrapping_sub(ext_pc as i32 - 2);
+            let disp = target.map_or(0, |t| t.wrapping_sub(ext_pc as i32 - 2));
             if !(-128..=127).contains(&disp) {
                 return Err(AsmError::new(
                     "PC-relative indexed displacement out of range (brief format is 8-bit)",
@@ -145,6 +145,11 @@ pub fn encode_ea(
             let words = encode_immediate(*val, size)?;
             check_ea(mode, reg, allowed)?;
             Ok((mode, reg, words))
+        }
+        Operand::ImmediateWords(words) => {
+            let (mode, reg) = (7, 4);
+            check_ea(mode, reg, allowed)?;
+            Ok((mode, reg, words.clone()))
         }
         Operand::Bitfield(..) => Err(AsmError::new(
             "bitfield operand cannot be used as a plain EA",
@@ -248,7 +253,11 @@ fn encode_immediate(value: i64, size: &str) -> Result<Vec<u16>, AsmError> {
             to_word((value >> 16) as i32),
             to_word((value & 0xFFFF) as i32),
         ]),
-        _ => Ok(vec![to_word(value as i32)]),
+        // FPU .s/.d/.x/.p constants arrive as `ImmediateWords`; an integer
+        // here would be emitted as a single truncated word.
+        other => Err(AsmError::new(format!(
+            "immediate of size .{other} must be a floating-point constant"
+        ))),
     }
 }
 

@@ -1066,33 +1066,27 @@ fn parse_parens_disp_pc(text: &str, symbols: &SymbolTable, pc: u32) -> Option<(i
 /// Returns (Xn, target address, scale, is_long). The second element is the
 /// full target address as written, *not* the encoded displacement: the PC
 /// is not known here, so `encode_ea` performs the subtraction (same split
-/// as the non-indexed `(d,PC)` form).
+/// as the non-indexed `(d,PC)` form). It is `None` for `(PC,Xn)`, which
+/// names no target.
 fn parse_parens_disp_pc_index(
     text: &str,
     symbols: &SymbolTable,
     pc: u32,
-) -> Option<(u8, i32, u8, bool)> {
-    let trimmed = text.trim();
-    if trimmed.starts_with('(') && trimmed.ends_with(')') {
-        let inner = &trimmed[1..trimmed.len() - 1];
-        let parts: Vec<&str> = inner.split(',').collect();
-        if parts.len() == 3 {
-            let disp_str = parts[0].trim();
-            let pc_str = parts[1].trim().to_uppercase();
-            let xn_full = parts[2].trim();
-
-            if pc_str == "PC" {
-                let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
-                if let Some(reg) = parse_register(&xn_name)
-                    && let Some(reg_num) = index_reg_num(&reg)
-                {
-                    let target = evaluate_pc_target(disp_str, symbols, pc);
-                    return Some((reg_num, target, scale, is_long));
-                }
-            }
-        }
-    }
-    None
+) -> Option<(u8, Option<i32>, u8, bool)> {
+    let inner = text.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    // `(PC,Xn)` has no target at all: displacement 0 from the extension
+    // word. It used to fall through to the suppressed-base parser, which
+    // read `PC` as a symbol worth 0 and encoded an absolute `(0,Xn)`.
+    let (disp_str, xn_full) = match parts.as_slice() {
+        [pc_str, xn] if pc_str.eq_ignore_ascii_case("pc") => (None, *xn),
+        [disp, pc_str, xn] if pc_str.eq_ignore_ascii_case("pc") => (Some(*disp), *xn),
+        _ => return None,
+    };
+    let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
+    let reg_num = index_reg_num(&parse_register(&xn_name)?)?;
+    let target = disp_str.map(|d| evaluate_pc_target(d, symbols, pc));
+    Some((reg_num, target, scale, is_long))
 }
 
 /// Parse (d8,An,Xn*scale) - base register with index register.
@@ -3718,20 +3712,28 @@ impl Assembler {
                 other => other,
             }
         };
-        let src = if !operand_texts.is_empty() {
+        let mut src = if !operand_texts.is_empty() {
             parse_operand_text(&operand_texts[0], &self.symbols, self.pc)
                 .ok()
                 .map(widen_forward_ref)
         } else {
             None
         };
-        let dst = if operand_texts.len() > 1 {
+        let mut dst = if operand_texts.len() > 1 {
             parse_operand_text(&operand_texts[1], &self.symbols, self.pc)
                 .ok()
                 .map(widen_forward_ref)
         } else {
             None
         };
+        // An FPU constant's size depends only on its format, so a forward
+        // reference in it still sizes correctly.
+        for (text, slot) in operand_texts.iter().zip([&mut src, &mut dst]) {
+            if let Some(op) = fpu_immediate(mnemonic, size, text, &self.symbols, self.pc) {
+                let words = size.and_then(fpu_immediate_words).unwrap_or(0);
+                *slot = Some(op.unwrap_or(Operand::ImmediateWords(vec![0; words])));
+            }
+        }
 
         // Use optimistic encoding (will be refined in pass 2)
         let mnemonic_upper = mnemonic.to_uppercase();
@@ -4407,8 +4409,22 @@ impl Assembler {
                 None
             }
         };
-        let src = operand_texts.first().and_then(|t| parse_operand(t));
-        let dst = operand_texts.get(1).and_then(|t| parse_operand(t));
+        let mut src = operand_texts.first().and_then(|t| parse_operand(t));
+        let mut dst = operand_texts.get(1).and_then(|t| parse_operand(t));
+        for (text, slot) in operand_texts.iter().zip([&mut src, &mut dst]) {
+            if let Some(op) = fpu_immediate(mnemonic, size, text, &self.symbols, pc) {
+                *slot = Some(op.map_err(|e| AsmError::with_line(e.message, line.line_no))?);
+            }
+        }
+
+        // The branch paths below re-parse their target and never reach the
+        // encoder's error, so an undefined target assembled to a branch to
+        // address 0 with exit status 0.
+        if (is_branch_mnemonic(mnemonic) || is_pc_relaxable(mnemonic))
+            && let Some(e) = operand_error.take()
+        {
+            return Err(AsmError::with_line(e.message, line.line_no));
+        }
 
         if is_pc_relaxable(mnemonic)
             && let Some(hint) = self.branch_for_line(line.line_no).map(|b| b.size_hint)
@@ -5704,6 +5720,60 @@ fn dbcc_condition(mnemonic: &str) -> Result<String, AsmError> {
     Ok(cond.to_string())
 }
 
+/// Number of extension words an FPU immediate of `size` occupies.
+fn fpu_immediate_words(size: &str) -> Option<usize> {
+    match size.to_ascii_lowercase().as_str() {
+        "s" => Some(2),
+        "d" => Some(4),
+        "x" | "p" => Some(6),
+        _ => None,
+    }
+}
+
+/// An FPU instruction's `#` operand of size `.s/.d/.x/.p`, encoded in that
+/// format. `None` when the instruction or operand is not such a constant.
+///
+/// A `$` hex literal gives the raw bits; anything else is a number: a
+/// decimal literal such as `1.5`, or an integer expression whose value is
+/// converted (`#1` is 1.0). The integer path used to emit one truncated
+/// word for all four sizes, shortening the instruction.
+fn fpu_immediate(
+    mnemonic: &str,
+    size: Option<&str>,
+    text: &str,
+    symbols: &SymbolTable,
+    pc: u32,
+) -> Option<Result<Operand, AsmError>> {
+    let size = size?.to_ascii_lowercase();
+    fpu_immediate_words(&size)?;
+    if !mnemonic.to_ascii_lowercase().starts_with('f') {
+        return None;
+    }
+    let body = text.trim().strip_prefix('#')?.trim();
+    let raw_hex = |digits: &str| match size.as_str() {
+        "s" => u32::from_str_radix(digits, 16)
+            .ok()
+            .map(|v| vec![(v >> 16) as u16, v as u16]),
+        "d" => u64::from_str_radix(digits, 16)
+            .ok()
+            .map(|v| (0..4).rev().map(|i| (v >> (i * 16)) as u16).collect()),
+        _ => None,
+    };
+    if let Some(words) = body.strip_prefix('$').and_then(raw_hex) {
+        return Some(Ok(Operand::ImmediateWords(words)));
+    }
+    let literal =
+        if body.parse::<f64>().is_ok() || (size != "s" && size != "d" && body.starts_with('$')) {
+            body.to_string()
+        } else {
+            match evaluate_expr_str(body, symbols, pc) {
+                Ok(v) => v.to_string(),
+                Err(e) => return Some(Err(e)),
+            }
+        };
+    Some(parse_float_value(&literal, &size, 0).map(Operand::ImmediateWords))
+}
+
 /// Parse a float value string and encode it in the requested format.
 fn parse_float_value(text: &str, format: &str, line_no: usize) -> Result<Vec<u16>, AsmError> {
     let text = text.trim();
@@ -5855,15 +5925,16 @@ fn packed_decimal_words(text: &str, line_no: usize) -> Result<Vec<u16>, AsmError
         None => (rest, ""),
     };
 
-    let (exp_sign, exp_digits) = if let Some(e) = exp_part.strip_prefix('-') {
-        (1u16, e)
-    } else {
-        (0u16, exp_part.strip_prefix('+').unwrap_or(exp_part))
-    };
-    let explicit_exp: i32 = if exp_digits.is_empty() {
+    // The sign is part of the parse; it combines with the normalisation
+    // shift below, so the written sign alone does not decide the result's.
+    let explicit_exp: i32 = if exp_part.is_empty() {
         0
     } else {
-        exp_digits.parse().map_err(|_| invalid())?
+        exp_part
+            .strip_prefix('+')
+            .unwrap_or(exp_part)
+            .parse()
+            .map_err(|_| invalid())?
     };
 
     let (int_part, frac_part) = match mantissa_part.find('.') {
@@ -5902,11 +5973,8 @@ fn packed_decimal_words(text: &str, line_no: usize) -> Result<Vec<u16>, AsmError
     let is_zero = digits.iter().all(|&d| d == 0);
     let normalized_exp = if is_zero { 0 } else { effective_point - 1 };
     let total_exp = explicit_exp + normalized_exp;
-    let (exp_sign, exp_mag) = if total_exp < 0 {
-        (1u16, (-total_exp) as u32)
-    } else {
-        (exp_sign, total_exp as u32)
-    };
+    let exp_sign = u16::from(total_exp < 0);
+    let exp_mag = total_exp.unsigned_abs();
     if exp_mag > 999 {
         return Err(AsmError::with_line(
             format!("DC.P exponent out of range (-999..=999): {}", text),
@@ -5918,7 +5986,9 @@ fn packed_decimal_words(text: &str, line_no: usize) -> Result<Vec<u16>, AsmError
     digits.resize(17, 0);
 
     let bcd_exp = ((exp_mag / 100) % 10) << 8 | ((exp_mag / 10) % 10) << 4 | (exp_mag % 10);
-    let word0 = (mantissa_sign << 15) | (exp_sign << 12) | (bcd_exp as u16);
+    // SM in bit 15, SE in bit 14; bits 13-12 (YY) are only set for
+    // infinities and NaNs.
+    let word0 = (mantissa_sign << 15) | (exp_sign << 14) | (bcd_exp as u16);
 
     let word1 = digits[0] as u16;
     let mut words = vec![word0, word1];
@@ -6370,26 +6440,26 @@ start:
         let st = SymbolTable::new();
         assert!(matches!(
             parse_parens_disp_pc_index("($10,PC,D0)", &st, 0),
-            Some((0, 16, _, false))
+            Some((0, Some(16), _, false))
         ));
         assert!(matches!(
             parse_parens_disp_pc_index("(0,PC,D1)", &st, 0),
-            Some((1, 0, _, false))
+            Some((1, Some(0), _, false))
         ));
         // An index register that is an *address* register is reported as
         // 8 + n, the numbering the brief-format extension word uses to
         // derive its D/A bit — so A2 is 10, not 2 (which would be D2).
         assert!(matches!(
             parse_parens_disp_pc_index("($20,PC,A2)", &st, 0),
-            Some((10, 32, _, false))
+            Some((10, Some(32), _, false))
         ));
         assert!(matches!(
             parse_parens_disp_pc_index("($10,PC,D3.W)", &st, 0),
-            Some((3, 16, _, false))
+            Some((3, Some(16), _, false))
         ));
         assert!(matches!(
             parse_parens_disp_pc_index("($10,PC,D3.L)", &st, 0),
-            Some((3, 16, _, true))
+            Some((3, Some(16), _, true))
         ));
         assert!(parse_parens_disp_pc_index("(A0)", &st, 0).is_none());
         assert!(parse_parens_disp_pc_index("($10,PC)", &st, 0).is_none());
@@ -7306,6 +7376,42 @@ after:
     }
 
     #[test]
+    fn dc_p_exponent_sign_is_bit_14_and_follows_the_normalised_value() {
+        let word0 = |lit: &str| {
+            let mut asm = Assembler::new(0);
+            asm.assemble(&format!(" dc.p {lit}\n")).unwrap();
+            asm.code[0].words[0]
+        };
+        assert_eq!(word0("1e-5"), 0x4005);
+        assert_eq!(word0("100e-1"), 0x0001); // 1.0e1
+        assert_eq!(word0("0.05"), 0x4002); // 5.0e-2
+        assert_eq!(word0("-12.5e3"), 0x8004);
+    }
+
+    #[test]
+    fn fpu_immediates_are_encoded_in_their_format() {
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68030");
+        asm.assemble(
+            " fmove.s #1.5,fp0\n fmove.s #$3fc00000,fp1\n fmove.d #1,fp2\n fcmp.s #x,fp0\nx equ 3\n",
+        )
+        .unwrap();
+        let ext: Vec<&[u16]> = asm.code.iter().map(|i| &i.words[2..]).collect();
+        assert_eq!(ext[0], [0x3FC0, 0x0000]);
+        assert_eq!(ext[1], [0x3FC0, 0x0000]);
+        assert_eq!(ext[2], [0x3FF0, 0, 0, 0]);
+        assert_eq!(ext[3], [0x4040, 0x0000]);
+    }
+
+    #[test]
+    fn branch_to_an_undefined_label_is_an_error() {
+        for src in [" bra.w nosuch\n", " bsr nosuch\n", " dbra d0,nosuch\n"] {
+            let mut asm = Assembler::new(0x1000);
+            assert!(asm.assemble(src).is_err(), "{src}");
+        }
+    }
+
+    #[test]
     fn test_dc_p_simple_integer() {
         // DC.P 123: mantissa sign 0, exponent 0 (2 is the normalized
         // exponent for 3 significant digits "123" -> 1.23 x 10^2), 17
@@ -8112,6 +8218,22 @@ mymexc MACRO
         // cas2.w d0:d1,d2:d3,(a0):(a1) -> 0cfc808090c1
         let bytes = assemble_source_with_cpu("    CAS2.W D0:D1,D2:D3,(A0):(A1)\n", "68020");
         assert_eq!(bytes, vec![0x0C, 0xFC, 0x80, 0x80, 0x90, 0xC1]);
+    }
+
+    #[test]
+    fn test_source_cas2_long() {
+        // Size field bits 10-9 = 11 for long: 0000 1110 1111 1100.
+        let bytes = assemble_source_with_cpu("    CAS2.L D0:D1,D2:D3,(A0):(A1)\n", "68020");
+        assert_eq!(bytes, vec![0x0E, 0xFC, 0x80, 0x80, 0x90, 0xC1]);
+    }
+
+    #[test]
+    fn pc_index_without_displacement_is_pc_relative() {
+        let bytes = assemble_source_with_cpu(" jmp (pc,d0.w)\n", "68020");
+        assert_eq!(bytes, vec![0x4E, 0xFB, 0x00, 0x00]);
+        let mut asm = Assembler::new(0);
+        asm.set_cpu("68020");
+        assert!(asm.assemble(" move.l d1,(pc,d0.w)\n").is_err());
     }
 
     #[test]
