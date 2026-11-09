@@ -200,17 +200,7 @@ mod tests {
     #[test]
     fn test_ipf_fallback_to_native() {
         let dir = tempdir();
-        let mut buf = Vec::new();
-        buf.extend_from_slice(b"CAPS");
-        buf.extend_from_slice(&4u32.to_be_bytes());
-        buf.extend_from_slice(&[0, 0, 0, 1]);
-        buf.extend_from_slice(b"INFO");
-        let info_data: Vec<u8> = [80u16, 2, 0, 0]
-            .iter()
-            .flat_map(|v| v.to_be_bytes())
-            .collect();
-        buf.extend_from_slice(&(info_data.len() as u32).to_be_bytes());
-        buf.extend_from_slice(&info_data);
+        let buf = crate::ipf::test_image::header();
         let path = dir.path().join("test.ipf");
         std::fs::write(&path, buf).unwrap();
 
