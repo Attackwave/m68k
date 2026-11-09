@@ -599,7 +599,7 @@ fn parse_operand_text(
         return Ok(Operand::MemoryIndirect(Box::new(MemoryIndirectOperand {
             base_reg: None,
             base_is_pc: false,
-            base_disp: Some(disp),
+            base_disp: disp,
             index_reg: Some(xn),
             index_long: xn_is_long,
             index_scale: scale,
@@ -1149,12 +1149,17 @@ fn parse_parens_disp_pc_index(
     Some((reg_num, target, scale, is_long))
 }
 
+/// Index register, displacement (`None` when suppressed), scale, index
+/// size long, and the forced displacement size.
+type NoBaseIndex = (u8, Option<i32>, u8, bool, Option<bool>);
+
 /// Parse (d8,An,Xn*scale) - base register with index register.
 /// Supports optional scale: (d8,An,Xn*1), (d8,An,Xn*2), (d8,An,Xn*4), (d8,An,Xn*8)
 /// Supports optional index size: (d8,An,Xn.W), (d8,An,Xn.L)
 /// Returns (An, Xn, disp, scale, is_long).
 /// Parse `(bd,Xn.size*scale)` — an indexed EA with the base register
-/// suppressed — and the equivalent `(bd,ZAn,Xn.size*scale)` spelling.
+/// suppressed — the equivalent `(bd,ZAn,Xn.size*scale)` spelling, and
+/// `(Dn.size*scale)`, which suppresses the displacement too (`None`).
 ///
 /// Distinguished from `(bd,An,Xn)` by the middle field: either it is
 /// absent, or it names a suppressed base (`ZA0`..`ZA7`, `ZPC`). Returns
@@ -1163,10 +1168,20 @@ fn parse_parens_disp_index_no_base(
     text: &str,
     symbols: &SymbolTable,
     pc: u32,
-) -> Option<(u8, i32, u8, bool, Option<bool>)> {
+) -> Option<NoBaseIndex> {
     let trimmed = text.trim();
     let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?;
     let parts: Vec<&str> = inner.split(',').collect();
+
+    // (Dn.size*scale): only a data register, since `(An)` is register
+    // indirect and an address register alone never means an index.
+    if let [xn_full] = parts.as_slice() {
+        let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full.trim());
+        return match parse_register(&xn_name)? {
+            Operand::DataReg(n) => Some((n, None, scale, is_long, None)),
+            _ => None,
+        };
+    }
 
     let (disp_str, xn_full) = match parts.len() {
         // (bd,Xn)
@@ -1203,7 +1218,7 @@ fn parse_parens_disp_index_no_base(
     }
     let (disp_str, forced) = split_displacement_size(disp_str);
     let disp = evaluate_displacement(disp_str, symbols, pc);
-    Some((xn, disp, scale, is_long, forced))
+    Some((xn, Some(disp), scale, is_long, forced))
 }
 
 fn parse_parens_disp_reg_index(
@@ -8378,6 +8393,34 @@ n   SET 10
             let mut asm = Assembler::new(0);
             asm.set_cpu("68020");
             assert!(asm.assemble(&format!(" {src}\n")).is_ok(), "{src}");
+        }
+    }
+
+    #[test]
+    fn index_only_and_single_control_register_forms() {
+        let cases: &[(&str, &[u8])] = &[
+            // Base and displacement both suppressed: BS=1, BD SIZE=01.
+            (" move.l (d0.w),d1\n", &[0x22, 0x30, 0x01, 0x90]),
+            (" move.l (d3.l*4),d1\n", &[0x22, 0x30, 0x3D, 0x90]),
+            // One control register moves through Dn, FPIAR through An.
+            (" fmovem.l d1,fpcr\n", &[0xF2, 0x01, 0x90, 0x00]),
+            (" fmovem.l fpsr,d2\n", &[0xF2, 0x02, 0xA8, 0x00]),
+            (" fmovem.l a2,fpiar\n", &[0xF2, 0x0A, 0x84, 0x00]),
+        ];
+        for (src, bytes) in cases {
+            assert_eq!(assemble_source_with_cpu(src, "68040"), *bytes, "{src}");
+        }
+        for (src, cpu) in [
+            (" move.l (d0.w),d1\n", "68000"),
+            (" move.l (a1.w),d1\n", "68020"),
+            // A data register holds one long, not a register list.
+            (" fmovem.l d1,fpcr/fpsr\n", "68040"),
+            (" fmove.l fpcr/fpsr,d1\n", "68040"),
+            (" fmovem.l a2,fpcr\n", "68040"),
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu(cpu);
+            assert!(asm.assemble(src).is_err(), "{src}");
         }
     }
 
