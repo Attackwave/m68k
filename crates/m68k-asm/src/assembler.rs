@@ -687,6 +687,7 @@ fn parse_operand_text(
             "ITT1" => Some(0x005),
             "DTT0" => Some(0x006),
             "DTT1" => Some(0x007),
+            "BUSCR" => Some(0x008),
             "USP" => Some(0x800),
             "VBR" => Some(0x801),
             "CAAR" => Some(0x802),
@@ -695,6 +696,7 @@ fn parse_operand_text(
             "MMUSR" => Some(0x805),
             "URP" => Some(0x806),
             "SRP" => Some(0x807),
+            "PCR" => Some(0x808),
             _ => None,
         }
     };
@@ -1949,8 +1951,10 @@ pub struct Assembler {
     /// does the same for a `MOVEM` list. Verified against the reference:
     /// the aliased and spelled-out forms assemble to identical bytes.
     pub register_aliases: HashMap<String, String>,
-    /// Files already spliced in, so each is included only once.
-    included_files: std::collections::HashSet<PathBuf>,
+    /// Files already spliced in, and whether only inside a conditional.
+    included_files: std::collections::HashMap<PathBuf, bool>,
+    /// Conditional blocks open at the current point of INCLUDE expansion.
+    include_conditional_depth: usize,
     /// Absolute path of every included file, keyed by the name
     /// [`SourceOrigin::file`] carries (the name as written in `INCLUDE`).
     /// Debug info needs a path a debugger can open; diagnostics keep the
@@ -2092,7 +2096,8 @@ impl Assembler {
             source_map: Vec::new(),
             conditional_results: HashMap::new(),
             register_aliases: HashMap::new(),
-            included_files: std::collections::HashSet::new(),
+            included_files: std::collections::HashMap::new(),
+            include_conditional_depth: 0,
             include_paths_resolved: HashMap::new(),
             file_overlays: HashMap::new(),
             dependencies: Vec::new(),
@@ -2489,6 +2494,7 @@ impl Assembler {
     /// body or a REPT/IRP/IRPC body can hold a nested REPT or a macro call.
     fn macro_preprocess_pass(&mut self, source: &str) -> (String, bool) {
         let mut any_macro_invoked = false;
+        let mut consts = SymbolTable::new();
         let mut output = Vec::new();
         let lines: Vec<&str> = source.lines().collect();
         let mut i = 0;
@@ -2515,6 +2521,14 @@ impl Assembler {
             let raw = lines[i];
             // Check for MACRO definition via proper parsing
             let (lbl1, mnemonic1, _, operands1) = split_line(raw);
+            // Constants defined so far, for REPT counts: pass 1 has not run
+            // yet, so `n EQU 3 / REPT n` needs its own small table.
+            if let Some(name) = &lbl1
+                && matches!(mnemonic1.as_str(), "equ" | "set" | "=")
+                && let Ok(v) = evaluate_expr_str(&operands1.join(","), &consts, 0)
+            {
+                consts.force_set(name, v as u32, None);
+            }
             if mnemonic1 == "macro"
                 && let Some(mname) = lbl1
             {
@@ -2576,33 +2590,23 @@ impl Assembler {
             // --- REPT: repeat block N times ---
             if mnemonic1 == "rept" && !operands1.is_empty() {
                 let repeat_line = i;
-                let count: usize = match operands1[0].parse() {
-                    Ok(n) => n,
-                    Err(_) => {
-                        // A malformed hex count used to `unwrap_or(0)` here,
-                        // which expanded the block zero times and dropped its
-                        // body without a word — `REPT $ZZ` silently assembled
-                        // to nothing while the reference assembler rejects it.
-                        // Passing the line through is not enough either: `rept`
-                        // is a known name in `is_directive_name`, so it lands in
-                        // a no-op arm and the body would be emitted once,
-                        // unguarded. Report it instead.
-                        match operands1[0]
-                            .strip_prefix('$')
-                            .and_then(|hex| usize::from_str_radix(hex, 16).ok())
-                        {
-                            Some(n) => n,
-                            None => {
-                                self.errors.error(
-                                    format!("invalid REPT count: '{}'", operands1[0]),
-                                    Some(i + 1),
-                                );
-                                output.push(raw.to_string());
-                                trace.push((i, None));
-                                i += 1;
-                                continue;
-                            }
-                        }
+                // Any constant expression over symbols defined above. A
+                // malformed count is reported, not taken as zero: the body
+                // would otherwise vanish or be emitted once, unguarded.
+                let count = match evaluate_expr_str(&operands1[0], &consts, 0)
+                    .ok()
+                    .and_then(|n| usize::try_from(n).ok())
+                {
+                    Some(n) => n,
+                    None => {
+                        self.errors.error(
+                            format!("invalid REPT count: '{}'", operands1[0]),
+                            Some(i + 1),
+                        );
+                        output.push(raw.to_string());
+                        trace.push((i, None));
+                        i += 1;
+                        continue;
                     }
                 };
 
@@ -2872,6 +2876,7 @@ impl Assembler {
         // macros, constants and structures the rest of the source uses,
         // so it has to be in place before macro expansion and parsing.
         self.included_files.clear();
+        self.include_conditional_depth = 0;
         self.dependencies.clear();
         self.source_map.clear();
         let included = self.expand_includes(source, 0, None)?;
@@ -2887,7 +2892,17 @@ impl Assembler {
         self.relax_branches(&parsed)?;
 
         // Pass 2: Encode instructions with resolved symbols
-        self.pass2(&parsed)
+        self.pass2(&parsed)?;
+
+        // Errors found while expanding macros and REPT blocks are only
+        // collected; without this the run still reported success.
+        match self.errors.errors.pop() {
+            Some(d) => Err(match d.line_no {
+                Some(line) => AsmError::with_line(d.message, line),
+                None => AsmError::new(d.message),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Everything the last [`Self::assemble`] reported, in source order,
@@ -2931,6 +2946,7 @@ impl Assembler {
     /// Test/diagnostic hook: run include + macro expansion only.
     pub fn debug_expand(&mut self, source: &str) -> Result<String, AsmError> {
         self.included_files.clear();
+        self.include_conditional_depth = 0;
         self.source_map.clear();
         let included = self.expand_includes(source, 0, None)?;
         Ok(self.macro_preprocess(&included))
@@ -2995,6 +3011,15 @@ impl Assembler {
                 macro_name: None,
             };
             let (_, mnemonic, size, operands) = split_line(raw);
+            match mnemonic.as_str() {
+                "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef" | "ifndef"
+                | "ifd" | "ifnd" => self.include_conditional_depth += 1,
+                "endc" | "endif" => {
+                    self.include_conditional_depth =
+                        self.include_conditional_depth.saturating_sub(1)
+                }
+                _ => {}
+            }
             if mnemonic == "incdir" {
                 // Register the search path and keep the line: pass 1 sees it
                 // again as a no-op, and dropping it here would change line
@@ -3034,11 +3059,18 @@ impl Assembler {
             let path = resolve_include_path_in(&filename, &self.source_root, &self.include_paths)
                 .map_err(|e| here(e.message, &current_file, idx + 1))?;
 
-            // Already pulled in? Drop the directive and move on.
+            // Already pulled in? Drop the directive and move on. But
+            // conditionals are not evaluated yet, so a file pulled in only
+            // inside an `IF` may never have been assembled: an unconditional
+            // INCLUDE of it is kept. (Header guards keep the repeat
+            // harmless when the earlier one was assembled after all.)
             let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-            if !self.included_files.insert(canonical) {
-                continue;
+            let conditional = self.include_conditional_depth > 0;
+            match self.included_files.get(&canonical) {
+                Some(&was_conditional) if !was_conditional || conditional => continue,
+                _ => {}
             }
+            self.included_files.insert(canonical, conditional);
             self.dependencies.push(path.clone());
             // Not the canonical path: on Windows that carries a `\\?\`
             // prefix no editor uses, so a debugger could not match it.
@@ -3352,13 +3384,11 @@ impl Assembler {
                 line_no,
             ));
         }
-        // CNOP offset,align → aligns to (PC + offset) % align == 0
-        let target = self.pc + offset;
-        Ok(if target.is_multiple_of(alignment) {
-            0
-        } else {
-            alignment - (target % alignment)
-        })
+        // CNOP offset,align moves to the next address that is `offset`
+        // past a multiple of `align`: PC ≡ offset (mod align). It used to
+        // pad until PC + offset was a multiple instead, so `cnop 2,8` at 0
+        // went to 6 rather than 2.
+        Ok(offset.wrapping_sub(self.pc) & (alignment - 1))
     }
 
     fn estimate_directive_size(
@@ -4479,7 +4509,7 @@ impl Assembler {
                     // Reference encoding: `pflush (a0)` -> F508.
                     let reg_op = parse_operand_text(&operand_texts[0], &self.symbols, pc)
                         .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                    let w = crate::enc_mmu::enc_mmu_single_reg(0xF508, &reg_op, &self.cpu)
+                    let w = crate::enc_mmu::enc_mmu_single_reg(0xF508, &reg_op, "68040", &self.cpu)
                         .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
                     self.push_instruction(AssembledInstruction {
                         pc,
@@ -4497,17 +4527,8 @@ impl Assembler {
                         line.line_no,
                     ));
                 }
-                let fc = match parse_operand_text(&operand_texts[0], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-                {
-                    Operand::Immediate(v) => v,
-                    _ => {
-                        return Err(AsmError::with_line(
-                            "PFLUSH's first operand (#fc) must be immediate".to_string(),
-                            line.line_no,
-                        ));
-                    }
-                };
+                let fc = mmu_fc_field(&operand_texts[0], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
                 let mask = match parse_operand_text(&operand_texts[1], &self.symbols, pc)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?
                 {
@@ -4539,17 +4560,8 @@ impl Assembler {
                         line.line_no,
                     ));
                 }
-                let fc = match parse_operand_text(&operand_texts[0], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-                {
-                    Operand::Immediate(v) => v,
-                    _ => {
-                        return Err(AsmError::with_line(
-                            format!("{}'s first operand (FC) must be immediate", mnemonic_upper),
-                            line.line_no,
-                        ));
-                    }
-                };
+                let fc = mmu_fc_field(&operand_texts[0], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
                 let ea = parse_operand_text(&operand_texts[1], &self.symbols, pc)
                     .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
                 let level = match parse_operand_text(&operand_texts[2], &self.symbols, pc)
@@ -5720,6 +5732,25 @@ fn dbcc_condition(mnemonic: &str) -> Result<String, AsmError> {
         }
     };
     Ok(cond.to_string())
+}
+
+/// The 5-bit function-code field of a 68030 PFLUSH/PTEST operand: `SFC`
+/// (`00000`), `DFC` (`00001`), `Dn` (`01RRR`) or `#0`-`#7` (`10XXX`).
+/// SFC and DFC parse as MOVEC control register numbers 0 and 1, which used
+/// to be taken as the immediates `#0`/`#1`.
+fn mmu_fc_field(text: &str, symbols: &SymbolTable, pc: u32) -> Result<u16, AsmError> {
+    let text = text.trim();
+    if text.eq_ignore_ascii_case("sfc") {
+        return Ok(0b00_000);
+    }
+    if text.eq_ignore_ascii_case("dfc") {
+        return Ok(0b00_001);
+    }
+    match parse_operand_text(text, symbols, pc)? {
+        Operand::DataReg(n) => Ok(0b01_000 | n as u16),
+        Operand::Immediate(v) if text.starts_with('#') => crate::enc_mmu::fc_immediate(v),
+        _ => Err(AsmError::new("function code must be #0-#7, Dn, SFC or DFC")),
+    }
 }
 
 /// Number of extension words an FPU immediate of `size` occupies.
@@ -8270,6 +8301,36 @@ mymexc MACRO
     }
 
     #[test]
+    fn cpu_specific_registers_and_mmu_fields_are_checked() {
+        assert_eq!(
+            assemble_source_with_cpu(" pflush sfc,#3\n", "68030"),
+            [0xF0, 0x00, 0x30, 0x60]
+        );
+        assert_eq!(
+            assemble_source_with_cpu(" pflush d1,#0\n", "68030"),
+            [0xF0, 0x00, 0x30, 0x09]
+        );
+        for (src, cpu) in [
+            (" ptestr #1,(a0),#8\n", "68030"),
+            (" pflush #8,#0\n", "68030"),
+            (" movec cacr,d0\n", "68010"),
+            (" movec urp,d0\n", "68020"),
+            (" movec pcr,d0\n", "68040"),
+            (" pflushn (a0)\n", "68030"),
+            (" plpar (a0)\n", "68040"),
+            (" fmove.x fp0,d0\n", "68030"),
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu(cpu);
+            assert!(asm.assemble(src).is_err(), "{cpu}: {src}");
+        }
+        assert_eq!(
+            assemble_source_with_cpu(" movec pcr,d0\n", "68060"),
+            [0x4E, 0x7A, 0x08, 0x08]
+        );
+    }
+
+    #[test]
     fn test_source_cas2_long() {
         // Size field bits 10-9 = 11 for long: 0000 1110 1111 1100.
         let bytes = assemble_source_with_cpu("    CAS2.L D0:D1,D2:D3,(A0):(A1)\n", "68020");
@@ -8684,6 +8745,48 @@ later: DC.W 0
             b"ABCD"
         );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn include_inside_a_false_if_does_not_drop_a_later_include() {
+        let dir = std::env::temp_dir().join(format!("m68k-incif-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("c.s"), " dc.w $1234\n").unwrap();
+        let mut asm = Assembler::new(0);
+        asm.set_source_root(dir.clone());
+        let bytes = asm
+            .assemble_bytes(" if 0\n include \"c.s\"\n endc\n include \"c.s\"\n dc.w $5678\n")
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(bytes, [0x12, 0x34, 0x56, 0x78]);
+    }
+
+    #[test]
+    fn rept_count_is_an_expression_and_nested_rept_repeats() {
+        let nops = |src: &str| {
+            let mut asm = Assembler::new(0);
+            asm.assemble(src).unwrap();
+            asm.code.len()
+        };
+        assert_eq!(nops("n equ 3\n rept n\n nop\n endr\n"), 3);
+        assert_eq!(nops(" rept 1+2\n nop\n endr\n"), 3);
+        assert_eq!(nops(" rept 2\n rept 3\n nop\n endr\n endr\n"), 6);
+        let mut asm = Assembler::new(0);
+        assert!(asm.assemble(" rept $zz\n nop\n endr\n").is_err());
+        let mut asm = Assembler::new(0);
+        assert!(asm.assemble("m macro\n m\n m\n endm\n m\n").is_err());
+    }
+
+    #[test]
+    fn cnop_moves_to_offset_past_the_alignment() {
+        let label = |src: &str| {
+            let mut asm = Assembler::new(0);
+            asm.assemble(src).unwrap();
+            asm.symbols.resolve("l").unwrap()
+        };
+        assert_eq!(label(" cnop 2,8\nl: dc.w 0\n"), 2);
+        assert_eq!(label(" dc.w 0\n cnop 0,4\nl: dc.w 0\n"), 4);
+        assert_eq!(label(" dc.l 0,0\n dc.w 0\n cnop 2,4\nl: dc.w 0\n"), 10);
     }
 
     #[test]

@@ -1005,7 +1005,7 @@ pub fn encode_instruction(
 
         // MOVE to/from SR/CCR/USP
         "MOVEC" => match (src, dst) {
-            (Some(s), Some(d)) => crate::enc_flow::enc_movec(s, d),
+            (Some(s), Some(d)) => crate::enc_flow::enc_movec(s, d, cpu),
             _ => Err(AsmError::new("MOVEC requires two operands")),
         },
 
@@ -1259,15 +1259,15 @@ pub fn encode_instruction(
         // bits 4-3, register in bits 2-0). The previous 0xF518 didn't match
         // any of that family's four opmodes.
         "PFLUSHN" => match src.or(dst) {
-            Some(d) => enc_mmu_single_reg(0xF500, d, cpu),
+            Some(d) => enc_mmu_single_reg(0xF500, d, "68040", cpu),
             _ => Err(AsmError::new("PFLUSHN requires An or (An)")),
         },
         "PLPAW" => match src.or(dst) {
-            Some(d) => enc_mmu_single_reg(0xF588, d, cpu),
+            Some(d) => enc_mmu_single_reg(0xF588, d, "68060", cpu),
             _ => Err(AsmError::new("PLPAW requires An or (An)")),
         },
         "PLPAR" => match src.or(dst) {
-            Some(d) => enc_mmu_single_reg(0xF5C8, d, cpu),
+            Some(d) => enc_mmu_single_reg(0xF5C8, d, "68060", cpu),
             _ => Err(AsmError::new("PLPAR requires An or (An)")),
         },
 
@@ -1341,7 +1341,7 @@ pub fn encode_instruction(
         // encode_instruction_ex instead.
         "PFLUSH" => match (src, dst) {
             (Some(Operand::Immediate(fc)), Some(Operand::Immediate(mask))) => {
-                enc_pflush_no_ea(*fc, *mask, cpu)
+                enc_pflush_no_ea(crate::enc_mmu::fc_immediate(*fc)?, *mask, cpu)
             }
             _ => Err(AsmError::new("PFLUSH requires #fc,#mask or #fc,#mask,<ea>")),
         },
@@ -1375,11 +1375,17 @@ pub fn encode_instruction_ex(
     if mnemonic == "PFLUSH" {
         return match (src, dst, extra) {
             (Some(Operand::Immediate(fc)), Some(Operand::Immediate(mask)), Some(ea_op)) => {
-                enc_pflush(*fc, *mask, ea_op, pc + 6, cpu)
+                enc_pflush(
+                    crate::enc_mmu::fc_immediate(*fc)?,
+                    *mask,
+                    ea_op,
+                    pc + 6,
+                    cpu,
+                )
             }
             // Two operands: the no-EA form.
             (Some(Operand::Immediate(fc)), Some(Operand::Immediate(mask)), None) => {
-                enc_pflush_no_ea(*fc, *mask, cpu)
+                enc_pflush_no_ea(crate::enc_mmu::fc_immediate(*fc)?, *mask, cpu)
             }
             _ => Err(AsmError::new("PFLUSH requires #fc,#mask or #fc,#mask,<ea>")),
         };

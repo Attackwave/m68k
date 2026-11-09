@@ -106,6 +106,24 @@ fn fill_image(
     Some((bytes, base))
 }
 
+/// The first address two instructions both write, if any.
+///
+/// Flat formats (binary, S-record, Intel Hex) place every byte at its
+/// absolute address, so two sections that each start at the origin, or an
+/// `ORG` back over earlier code, silently overwrite one another there.
+pub fn first_overlap(instructions: &[AssembledInstruction]) -> Option<u32> {
+    let mut spans: Vec<(u64, u64)> = instructions
+        .iter()
+        .filter(|i| i.size_bytes() > 0)
+        .map(|i| (i.pc as u64, i.pc as u64 + i.size_bytes() as u64))
+        .collect();
+    spans.sort_unstable();
+    spans
+        .windows(2)
+        .find(|w| w[1].0 < w[0].1)
+        .map(|w| w[1].0 as u32)
+}
+
 /// The bytes each instruction really emits, merged into contiguous runs
 /// ordered by address.
 ///

@@ -26,6 +26,24 @@ fn check_cpu(cpu: &str, min: &str) -> Result<(), AsmError> {
     }
 }
 
+/// The 5-bit FC field of an immediate function code `#fc` (`10XXX`).
+/// The other encodings are `00000` SFC, `00001` DFC and `01RRR` Dn.
+pub fn fc_immediate(fc: i64) -> Result<u16, AsmError> {
+    match fc {
+        0..=7 => Ok(0b10_000 | fc as u16),
+        _ => Err(AsmError::new(format!("function code {fc} is not 0..7"))),
+    }
+}
+
+/// A 3-bit MMU field (FC mask, search level), range-checked instead of
+/// masked: `#8` used to become 0.
+fn field3(v: i64, what: &str) -> Result<u16, AsmError> {
+    match v {
+        0..=7 => Ok(v as u16),
+        _ => Err(AsmError::new(format!("{what} {v} is not 0..7"))),
+    }
+}
+
 /// MMU register code for PMOVE, by control register name: the 6-bit
 /// combination of the extension word's 3-bit group prefix (bits 15-13) and
 /// 3-bit P-Register field (bits 12-10), as a single `bits15-10` value.
@@ -98,7 +116,7 @@ pub fn enc_pmove(
 /// base `0xF040`) that matched neither this instruction's real syntax nor
 /// its real encoding — replaced outright rather than patched.
 pub fn enc_ptest(
-    fc: i64,
+    fc_field: u16,
     ea_op: &Operand,
     level: i64,
     an: Option<u8>,
@@ -108,18 +126,13 @@ pub fn enc_ptest(
 ) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
     let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL, cpu)?;
-    let fc_field = 0b10_000 | ((fc as u16) & 0x7);
+    let level = field3(level, "PTEST level")?;
     let rw: u16 = if read { 1 } else { 0 };
     let (a_bit, an_field) = match an {
         Some(n) => (1u16, n as u16),
         None => (0u16, 0u16),
     };
-    let ext = (0b100 << 13)
-        | (((level as u16) & 0x7) << 10)
-        | (rw << 9)
-        | (a_bit << 8)
-        | (an_field << 5)
-        | fc_field;
+    let ext = (0b100 << 13) | (level << 10) | (rw << 9) | (a_bit << 8) | (an_field << 5) | fc_field;
     let mut words = vec![0xF000 | ((mode as u16) << 3) | (reg as u16), ext];
     words.extend(ext_words);
     Ok(words)
@@ -134,7 +147,7 @@ pub fn enc_ptest(
 /// FC field itself is 5 bits: `10XXX` for an immediate function code (`fc`'s
 /// low 3 bits), matching the immediate-FC form of the assembler syntax.
 pub fn enc_pflush(
-    fc: i64,
+    fc_field: u16,
     mask: i64,
     ea_op: &Operand,
     ext_pc: u32,
@@ -142,8 +155,8 @@ pub fn enc_pflush(
 ) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
     let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL, cpu)?;
-    let fc_field = 0b10_000 | ((fc as u16) & 0x7);
-    let ext = (0b001 << 13) | (0b110 << 10) | (((mask as u16) & 0x7) << 5) | fc_field;
+    let mask = field3(mask, "PFLUSH mask")?;
+    let ext = (0b001 << 13) | (0b110 << 10) | (mask << 5) | fc_field;
     let mut words = vec![0xF010 | ((mode as u16) << 3) | (reg as u16), ext];
     words.extend(ext_words);
     Ok(words)
@@ -160,10 +173,10 @@ pub fn enc_pflush(
 /// Reference encodings: `PFLUSH #0,#0` -> F000 3010,
 /// `PFLUSH #2,#0` -> F000 3012, `PFLUSH #0,#4` -> F000 3090,
 /// `PFLUSH #3,#7` -> F000 30F3.
-pub fn enc_pflush_no_ea(fc: i64, mask: i64, cpu: &str) -> Result<Vec<u16>, AsmError> {
+pub fn enc_pflush_no_ea(fc_field: u16, mask: i64, cpu: &str) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
-    let fc_field = 0b10_000 | ((fc as u16) & 0x7);
-    let ext = (0b001 << 13) | (0b100 << 10) | (((mask as u16) & 0x7) << 5) | fc_field;
+    let mask = field3(mask, "PFLUSH mask")?;
+    let ext = (0b001 << 13) | (0b100 << 10) | (mask << 5) | fc_field;
     Ok(vec![0xF000, ext])
 }
 
@@ -197,8 +210,14 @@ pub fn enc_pflushan(cpu: &str) -> Result<Vec<u16>, AsmError> {
 /// part of the 68040 PFLUSH opmode family — see `enc_pflushan`'s docs.
 /// PLPAW/PLPAR's bases (0xF588/0xF5C8) are unverified against any real
 /// assembler or the PRM; treat them with caution.
-pub fn enc_mmu_single_reg(base: u16, reg_op: &Operand, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    check_cpu(cpu, "68030")?;
+pub fn enc_mmu_single_reg(
+    base: u16,
+    reg_op: &Operand,
+    min_cpu: &str,
+    cpu: &str,
+) -> Result<Vec<u16>, AsmError> {
+    // PFLUSH(N) (An) are 68040 forms, PLPAR/PLPAW 68060 ones.
+    check_cpu(cpu, min_cpu)?;
     let reg = match reg_op {
         Operand::AddrReg(n) => *n,
         Operand::AddrRegIndirect(n) => *n,
@@ -358,7 +377,7 @@ mod tests {
         // PTESTR #2,(A0),#3 -- verified against reference output:
         // F010 8E12.
         let dst = Operand::AddrRegIndirect(0);
-        let words = enc_ptest(2, &dst, 3, None, true, 0, "68030").unwrap();
+        let words = enc_ptest(fc_immediate(2).unwrap(), &dst, 3, None, true, 0, "68030").unwrap();
         assert_eq!(words, vec![0xF010, 0x8E12]);
     }
 
@@ -367,7 +386,7 @@ mod tests {
         // PTESTW #2,(A0),#3 -- verified against reference output:
         // F010 8C12.
         let dst = Operand::AddrRegIndirect(0);
-        let words = enc_ptest(2, &dst, 3, None, false, 0, "68030").unwrap();
+        let words = enc_ptest(fc_immediate(2).unwrap(), &dst, 3, None, false, 0, "68030").unwrap();
         assert_eq!(words, vec![0xF010, 0x8C12]);
     }
 
@@ -376,7 +395,8 @@ mod tests {
         // PTESTR #2,(A0),#3,A1 -- verified against reference encodings
         // output: F010 8F32.
         let dst = Operand::AddrRegIndirect(0);
-        let words = enc_ptest(2, &dst, 3, Some(1), true, 0, "68030").unwrap();
+        let words =
+            enc_ptest(fc_immediate(2).unwrap(), &dst, 3, Some(1), true, 0, "68030").unwrap();
         assert_eq!(words, vec![0xF010, 0x8F32]);
     }
 
@@ -385,7 +405,7 @@ mod tests {
         // PFLUSH #2,#3,(A0) -- verified against reference encodings
         // output: F010 3872.
         let dst = Operand::AddrRegIndirect(0);
-        let words = enc_pflush(2, 3, &dst, 0, "68030").unwrap();
+        let words = enc_pflush(fc_immediate(2).unwrap(), 3, &dst, 0, "68030").unwrap();
         assert_eq!(words, vec![0xF010, 0x3872]);
     }
 
@@ -405,21 +425,21 @@ mod tests {
     fn test_pflushn_matches_reference() {
         // PFLUSHN (A0) -- verified against reference output: F500.
         let dst = Operand::AddrRegIndirect(0);
-        let words = enc_mmu_single_reg(0xF500, &dst, "68030").unwrap();
+        let words = enc_mmu_single_reg(0xF500, &dst, "68040", "68040").unwrap();
         assert_eq!(words, vec![0xF500]);
     }
 
     #[test]
     fn test_plpaw_reference_bytes() {
         let dst = Operand::AddrRegIndirect(0);
-        let words = enc_mmu_single_reg(0xF588, &dst, "68030").unwrap();
+        let words = enc_mmu_single_reg(0xF588, &dst, "68060", "68060").unwrap();
         assert_eq!(words, vec![0xF588]);
     }
 
     #[test]
     fn test_plpar_reference_bytes() {
         let dst = Operand::AddrRegIndirect(0);
-        let words = enc_mmu_single_reg(0xF5C8, &dst, "68030").unwrap();
+        let words = enc_mmu_single_reg(0xF5C8, &dst, "68060", "68060").unwrap();
         assert_eq!(words, vec![0xF5C8]);
     }
 
@@ -492,7 +512,7 @@ mod tests {
         let a0 = Operand::AddrRegIndirect(0);
         let tc = Operand::Immediate(0x003);
         assert!(enc_pmove(&a0, &tc, false, 0, "68020").is_err());
-        assert!(enc_ptest(0, &a0, 0, None, true, 0, "68020").is_err());
+        assert!(enc_ptest(fc_immediate(0).unwrap(), &a0, 0, None, true, 0, "68020").is_err());
     }
 
     #[test]
