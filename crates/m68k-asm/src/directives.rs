@@ -945,6 +945,7 @@ pub fn parse_simple_expr(text: &str, symbols: &SymbolTable, pc: u32) -> Result<i
 
     // Tokenize the expression
     let tokens = tokenize_expr(text, pc)?;
+    check_nesting(&tokens)?;
     let mut pos = 0;
     let value = parse_expr_or(&tokens, &mut pos, symbols)?;
     // Anything left over is a syntax error: `1+2)` used to evaluate to 3
@@ -969,6 +970,34 @@ enum ExprToken {
     LParen,
     RParen,
     Comma,
+}
+
+/// Deepest parenthesis nesting and longest operator run an expression may
+/// have. The parser recurses once per level of either; source that is
+/// fed in (or generated) with thousands of them overflowed the stack and
+/// aborted the process.
+const MAX_EXPR_NESTING: usize = 64;
+
+fn check_nesting(tokens: &[ExprToken]) -> Result<(), String> {
+    let (mut depth, mut run) = (0usize, 0usize);
+    for token in tokens {
+        match token {
+            ExprToken::LParen => depth += 1,
+            ExprToken::RParen => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+        run = if matches!(token, ExprToken::Op(_)) {
+            run + 1
+        } else {
+            0
+        };
+        if depth > MAX_EXPR_NESTING || run > MAX_EXPR_NESTING {
+            return Err(format!(
+                "expression nested more than {MAX_EXPR_NESTING} levels deep"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn tokenize_expr(text: &str, pc: u32) -> Result<Vec<ExprToken>, String> {
@@ -1786,6 +1815,19 @@ pub fn parse_dc_string(s: &str) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn deep_expressions_are_an_error_not_a_stack_overflow() {
+        let symbols = SymbolTable::new();
+        let nested = format!("{}1{}", "(".repeat(20_000), ")".repeat(20_000));
+        let unary = format!("{}1", "-".repeat(60_000));
+        for text in [nested, unary] {
+            assert!(parse_simple_expr(&text, &symbols, 0).is_err());
+        }
+        let ok = format!("{}1{}", "(".repeat(64), ")".repeat(64));
+        assert_eq!(parse_simple_expr(&ok, &symbols, 0), Ok(1));
+        assert_eq!(parse_simple_expr("1--1", &symbols, 0), Ok(2));
+    }
 
     #[test]
     fn test_strip_quotes() {

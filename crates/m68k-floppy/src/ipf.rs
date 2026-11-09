@@ -33,6 +33,12 @@ const MAX_FILE_SIZE: u64 = 64 << 20;
 /// Largest track rebuilt, in MFM cells: eight times a high-density track.
 const MAX_TRACK_CELLS: usize = 1 << 21;
 
+/// Most stream elements read for one track. A real track has a few per
+/// sector; every block descriptor may point at the same stream, and a
+/// stream of empty elements adds no cells, so without a count the work
+/// grew with blocks times stream length.
+const MAX_TRACK_ELEMENTS: usize = 1 << 16;
+
 const RECORD_HEADER: usize = 12;
 const INFO_SIZE: usize = 96;
 const IMGE_SIZE: usize = 80;
@@ -73,6 +79,9 @@ pub struct NativeIpfBackend {
     heads: u16,
     tracks: HashMap<(u32, u32), Track>,
     decoded_sectors: HashMap<(u32, u32, u32), Vec<u8>>,
+    /// Tracks already decoded, with the error if decoding failed, so a
+    /// track is rebuilt once and not on every sector read.
+    decoded_tracks: HashMap<(u32, u32), Result<(), String>>,
 }
 
 impl NativeIpfBackend {
@@ -181,6 +190,7 @@ impl NativeIpfBackend {
             heads,
             tracks,
             decoded_sectors: HashMap::new(),
+            decoded_tracks: HashMap::new(),
         })
     }
 
@@ -299,6 +309,7 @@ impl Cells {
 fn track_cells(data: &[u8], blocks: u32) -> Result<Cells, String> {
     let truncated = || "IPF track data is truncated".to_string();
     let mut cells = Cells::default();
+    let mut elements = 0usize;
     for block in 0..blocks as usize {
         let at = block * BLOCK_DESCRIPTOR;
         let desc = data.get(at..at + BLOCK_DESCRIPTOR).ok_or_else(truncated)?;
@@ -311,6 +322,12 @@ fn track_cells(data: &[u8], blocks: u32) -> Result<Cells, String> {
             let kind = head & 0x1F;
             if kind == 0 {
                 break;
+            }
+            elements += 1;
+            if elements > MAX_TRACK_ELEMENTS {
+                return Err(format!(
+                    "track has more than {MAX_TRACK_ELEMENTS} data elements"
+                ));
             }
             let width = usize::from(head >> 5);
             let size = data
@@ -363,14 +380,23 @@ fn frame_sectors(cells: &Cells) -> Vec<u8> {
     let body = SECTOR_RAW_SIZE - 8;
     let mut framed = Vec::new();
     let mut window = 0u32;
-    for i in 0..cells.len {
+    let (mut i, mut filled) = (0, 0);
+    while i < cells.len {
         window = window << 1 | u32::from(cells.bit(i));
+        filled += 1;
         let start = i + 1;
-        if i >= 31 && window == SYNC && start + body * 8 <= cells.len {
+        if filled >= 32 && window == SYNC && start + body * 8 <= cells.len {
             framed.extend_from_slice(&[0xAA, 0xAA, 0xAA, 0xAA]);
             framed.extend_from_slice(&SYNC.to_be_bytes());
             framed.extend((0..body).map(|k| cells.byte_at(start + k * 8)));
+            // Sectors do not overlap. Searching inside this one found a
+            // "sync" every 16 cells in a track of repeated sync words and
+            // copied a whole sector for each, about 3000 times the input.
+            i = start + body * 8;
+            (window, filled) = (0, 0);
+            continue;
         }
+        i += 1;
     }
     framed
 }
@@ -381,8 +407,13 @@ impl FloppyImageReader for NativeIpfBackend {
         if let Some(data) = self.decoded_sectors.get(&key) {
             return Ok(data.clone());
         }
-        self.decode_track_sectors(track, side)
-            .map_err(|e| FloppyError::new(format!("Track {track}, side {side}: {e}")))?;
+        if !self.decoded_tracks.contains_key(&(track, side)) {
+            let result = self.decode_track_sectors(track, side);
+            self.decoded_tracks.insert((track, side), result);
+        }
+        if let Some(Err(e)) = self.decoded_tracks.get(&(track, side)) {
+            return Err(FloppyError::new(format!("Track {track}, side {side}: {e}")));
+        }
         self.decoded_sectors.get(&key).cloned().ok_or_else(|| {
             FloppyError::new(format!(
                 "Sector {} not found on track {}, side {} (missing, or its checksum failed)",
@@ -559,6 +590,35 @@ mod tests {
             }
         }
         assert!(reader.read_sector(1, 0, 0).is_err());
+    }
+
+    #[test]
+    fn repeated_sync_words_frame_a_bounded_number_of_sectors() {
+        let mut cells = Cells::default();
+        let syncs = [0x44, 0x89].repeat(50_000);
+        cells.raw(&syncs, syncs.len() * 8);
+        let frame = SECTOR_RAW_SIZE;
+        let framed = frame_sectors(&cells);
+        assert!(framed.len() <= cells.len.div_ceil((frame - 8) * 8) * frame);
+    }
+
+    #[test]
+    fn element_budget_bounds_shared_streams() {
+        // Every block descriptor points at one long stream of empty
+        // elements, which adds no cells but used to be walked per block.
+        let blocks = 300u32;
+        let mut data: Vec<u8> = (0..blocks)
+            .flat_map(|_| {
+                [0u32, 0, 0, 0, 0, 0, 0, blocks * 32]
+                    .iter()
+                    .flat_map(|v| v.to_be_bytes())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        data.extend(std::iter::repeat_n(0x01, 300));
+        data.push(0);
+        let err = track_cells(&data, blocks).err().unwrap();
+        assert!(err.contains("data elements"), "{err}");
     }
 
     #[test]
