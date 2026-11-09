@@ -911,11 +911,20 @@ pub fn enc_cmpi(
         _ => return Err(AsmError::new("invalid size")),
     };
     // Data alterable — the immediate family has no address-register form
-    // (`ADDA`/`SUBA`/`CMPA` are those); see enc_addi.
-    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, DATA_ALT, cpu)?;
+    // (`ADDA`/`SUBA`/`CMPA` are those); see enc_addi. CMPI only reads its
+    // destination, and from the 68020 on it may be PC-relative.
+    let mut allowed = DATA_ALT;
+    if crate::ea_encode::cpu_level(cpu) >= 2 {
+        allowed |= m68k_core::ea_categories::ea::PCDISP | m68k_core::ea_categories::ea::PCINDEXED;
+    }
+    let imm = immediate_words(value, size)?;
+    // The destination's extension words follow the immediate, so a
+    // PC-relative displacement is measured from after it.
+    let ext_pc = pc + 2 * imm.len() as u32;
+    let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, ext_pc, allowed, cpu)?;
     let op = 0x0C00 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16);
     let mut words = vec![op];
-    words.extend(immediate_words(value, size)?);
+    words.extend(imm);
     words.extend(dst_ext);
     Ok(words)
 }

@@ -568,6 +568,17 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             parser: ParserType::Cmpi,
             fixed_size: None,
         },
+        // From the 68020 on CMPI may also compare against PC-relative memory.
+        OpcodePattern {
+            mask: 0xFF00,
+            value: 0x0C00,
+            mnemonic: "CMPI",
+            src_ea: IMM,
+            dst_ea: PCDISP | PCINDEXED,
+            cpu: "68020",
+            parser: ParserType::Cmpi,
+            fixed_size: None,
+        },
         OpcodePattern {
             mask: 0xF138,
             value: 0xB108,
@@ -910,6 +921,28 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             src_ea: 0,
             dst_ea: 0,
             cpu: "68060",
+            parser: ParserType::Plpa,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            // PTESTW/PTESTR (An) (68040): base 0xF548, bit 5 = read.
+            // Inside the CACHE pattern's range like PLPAR/PLPAW above.
+            mask: 0xFFF8,
+            value: 0xF548,
+            mnemonic: "PTESTW",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68040",
+            parser: ParserType::Plpa,
+            fixed_size: None,
+        },
+        OpcodePattern {
+            mask: 0xFFF8,
+            value: 0xF568,
+            mnemonic: "PTESTR",
+            src_ea: 0,
+            dst_ea: 0,
+            cpu: "68040",
             parser: ParserType::Plpa,
             fixed_size: None,
         },

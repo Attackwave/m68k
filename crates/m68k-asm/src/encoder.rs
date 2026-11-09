@@ -1166,6 +1166,17 @@ pub fn encode_instruction(
             (Some(s), Some(Operand::FpCtrlList(mask))) => {
                 enc_fmovem_mem_to_ctrl(s, *mask, pc + 6, cpu)
             }
+            // Dynamic list: the register mask is taken from Dn at run time.
+            (Some(Operand::DataReg(dn)), Some(d))
+                if size.is_none_or(|s| s.eq_ignore_ascii_case("x")) =>
+            {
+                enc_fmovem_dynamic(*dn, d, true, pc + 6, cpu)
+            }
+            (Some(s), Some(Operand::DataReg(dn)))
+                if size.is_none_or(|s| s.eq_ignore_ascii_case("x")) =>
+            {
+                enc_fmovem_dynamic(*dn, s, false, pc + 6, cpu)
+            }
             _ => Err(AsmError::new(
                 "FMOVEM requires a register list/range and an EA operand",
             )),

@@ -237,7 +237,9 @@ impl OperandTrait for EAOperand {
 
 impl OperandTrait for MemoryIndirectOperand {
     fn format(&self, labels: &HashMap<u32, String>) -> String {
-        let bd_str = if self.target_pc_rel {
+        // A null base displacement stays absent: `([pc])` has no bd word,
+        // and naming its target would reassemble with one.
+        let bd_str = if self.target_pc_rel && self.bd_present {
             if let Some(label) = labels.get(&self.pc_rel_target) {
                 label.clone()
             } else {
