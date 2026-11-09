@@ -633,10 +633,11 @@ fn parse_operand_text(
                 Err(_) => None,
             };
             if let Some(value) = value {
+                let value = to_32bit(value)?;
                 return if force_long {
-                    Ok(Operand::AbsoluteLong(value as i32))
+                    Ok(Operand::AbsoluteLong(value))
                 } else {
-                    Ok(Operand::AbsoluteShort(value as i32))
+                    Ok(Operand::AbsoluteShort(value))
                 };
             }
         }
@@ -660,7 +661,7 @@ fn parse_operand_text(
             if symbols.optimize_absolute() && fits_absolute_short(value) {
                 Operand::AbsoluteShort(absolute_short_value(value))
             } else {
-                Operand::AbsoluteLong(value as i32)
+                Operand::AbsoluteLong(to_32bit(value)?)
             },
         );
     }
@@ -680,7 +681,7 @@ fn parse_operand_text(
             if symbols.optimize_absolute() && fits_absolute_short(value) {
                 return Ok(Operand::AbsoluteShort(absolute_short_value(value)));
             } else {
-                return Ok(Operand::AbsoluteLong(value as i32));
+                return Ok(Operand::AbsoluteLong(to_32bit(value)?));
             }
         }
     }
@@ -1350,7 +1351,7 @@ fn parse_memory_indirect(
         }
         // Anything else is the base displacement expression.
         let value = evaluate_expr_str(part, symbols, current_pc)?;
-        base_disp = Some(value as i32);
+        base_disp = Some(to_32bit(value)?);
     }
 
     // Post-indexed form has the index register after the bracket (and
@@ -1379,7 +1380,7 @@ fn parse_memory_indirect(
                 continue;
             }
             let value = evaluate_expr_str(part, symbols, current_pc)?;
-            outer_disp = Some(value as i32);
+            outer_disp = Some(to_32bit(value)?);
         }
     }
 
@@ -1552,8 +1553,8 @@ fn evaluate_displacement(text: &str, symbols: &SymbolTable, pc: u32) -> i32 {
     if let Some(n) = evaluate_simple_number(text) {
         return n;
     }
-    match evaluate_expr_str(text, symbols, pc) {
-        Ok(v) => v as i32,
+    match evaluate_expr_str(text, symbols, pc).and_then(to_32bit) {
+        Ok(v) => v,
         Err(e) => {
             // In pass 1 this may be a forward reference; pass 2 reports it.
             symbols
@@ -1747,6 +1748,19 @@ fn fits_absolute_short(value: i64) -> bool {
 /// is the sign-extended one (`$FFFFF0` and `$FFFFFFF0` both become
 /// `-16`), which is what `encode_ea` writes to the extension word and
 /// what the disassembler prints back.
+/// `value` as a 32-bit address or displacement: anything from
+/// -$80000000 to $FFFFFFFF. Wider values were cut to their low 32 bits
+/// without a word, so `$100000004` addressed 4.
+fn to_32bit(value: i64) -> Result<i32, AsmError> {
+    if (-(1i64 << 31)..1i64 << 32).contains(&value) {
+        Ok(value as i32)
+    } else {
+        Err(AsmError::new(format!(
+            "value {value} does not fit in 32 bits"
+        )))
+    }
+}
+
 fn absolute_short_value(value: i64) -> i32 {
     (value as u64 & 0xFFFF) as u16 as i16 as i32
 }
@@ -5986,8 +6000,18 @@ fn fpu_immediate(
             .map(|v| (0..4).rev().map(|i| (v >> (i * 16)) as u16).collect()),
         _ => None,
     };
-    if let Some(words) = body.strip_prefix('$').and_then(raw_hex) {
-        return Some(Ok(Operand::ImmediateWords(words)));
+    if let Some(digits) = body.strip_prefix('$')
+        && (size == "s" || size == "d")
+        && !digits.is_empty()
+        && digits.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        // Raw bits. A literal wider than the format used to fall through
+        // to the integer path and became that number as a float.
+        return Some(
+            raw_hex(digits).map(Operand::ImmediateWords).ok_or_else(|| {
+                AsmError::new(format!("hex literal ${digits} is wider than .{size}"))
+            }),
+        );
     }
     let literal =
         if body.parse::<f64>().is_ok() || (size != "s" && size != "d" && body.starts_with('$')) {
@@ -6001,6 +6025,29 @@ fn fpu_immediate(
     Some(parse_float_value(&literal, &size, 0).map(Operand::ImmediateWords))
 }
 
+/// A finite decimal that rounded to infinity, or a non-zero one that
+/// rounded to zero, does not fit `format`. Both used to be emitted as
+/// that infinity or zero; the extended format already rejected them.
+fn check_float_range(
+    text: &str,
+    infinite: bool,
+    zero: bool,
+    format: &str,
+    line_no: usize,
+) -> Result<(), AsmError> {
+    let lower = text.to_ascii_lowercase();
+    let mantissa = lower.split('e').next().unwrap_or("");
+    let overflow = infinite && !lower.contains("inf");
+    let underflow = zero && mantissa.contains(|c: char| ('1'..='9').contains(&c));
+    if overflow || underflow {
+        return Err(AsmError::with_line(
+            format!("{text} is out of range for {format} precision"),
+            line_no,
+        ));
+    }
+    Ok(())
+}
+
 /// Parse a float value string and encode it in the requested format.
 fn parse_float_value(text: &str, format: &str, line_no: usize) -> Result<Vec<u16>, AsmError> {
     let text = text.trim();
@@ -6010,6 +6057,7 @@ fn parse_float_value(text: &str, format: &str, line_no: usize) -> Result<Vec<u16
             let val: f32 = text
                 .parse()
                 .map_err(|_| AsmError::with_line(format!("invalid float: {}", text), line_no))?;
+            check_float_range(text, val.is_infinite(), val == 0.0, "single", line_no)?;
             let bits = val.to_bits();
             Ok(vec![((bits >> 16) & 0xFFFF) as u16, (bits & 0xFFFF) as u16])
         }
@@ -6018,6 +6066,7 @@ fn parse_float_value(text: &str, format: &str, line_no: usize) -> Result<Vec<u16
             let val: f64 = text
                 .parse()
                 .map_err(|_| AsmError::with_line(format!("invalid float: {}", text), line_no))?;
+            check_float_range(text, val.is_infinite(), val == 0.0, "double", line_no)?;
             let bits = val.to_bits();
             Ok(vec![
                 ((bits >> 48) & 0xFFFF) as u16,
@@ -6032,9 +6081,15 @@ fn parse_float_value(text: &str, format: &str, line_no: usize) -> Result<Vec<u16
             // entirely, e.g. for embedding pre-computed constants.
             let text = text.trim();
             if let Some(hex) = text.strip_prefix('$') {
-                let val = u128::from_str_radix(hex, 16).map_err(|_| {
-                    AsmError::with_line(format!("invalid hex literal: {}", text), line_no)
-                })?;
+                let val = u128::from_str_radix(hex, 16)
+                    .ok()
+                    .filter(|v| v >> 96 == 0)
+                    .ok_or_else(|| {
+                        AsmError::with_line(
+                            format!("invalid hex literal (at most 96 bits): {text}"),
+                            line_no,
+                        )
+                    })?;
                 return Ok(u128_to_96bit_words(val));
             }
 
@@ -8129,6 +8184,64 @@ n   SET 10
 
     /// Valid forms the assembler used to reject, against their PRM
     /// encodings.
+    #[test]
+    fn second_audit_encodings() {
+        let cases: &[(&str, &str, &[u8])] = &[
+            // 68030 PFLUSH put a 1 into the EA mode field: (d16,An) became abs.w.
+            (
+                " pflush #1,#1,4(a0)\n",
+                "68030",
+                &[0xF0, 0x28, 0x38, 0x31, 0x00, 0x04],
+            ),
+            // Index suppressed: I/IS 1-3, never the reserved 5-7.
+            (
+                " tst.l ([4,a0],8)\n",
+                "68020",
+                &[0x4A, 0xB0, 0x01, 0x62, 0x00, 0x04, 0x00, 0x08],
+            ),
+            (
+                " tst.l ([a0],4)\n",
+                "68020",
+                &[0x4A, 0xB0, 0x01, 0x52, 0x00, 0x04],
+            ),
+            (" pack d0,d1,#-1\n", "68020", &[0x83, 0x40, 0xFF, 0xFF]),
+            (" dc.s 1e-40\n", "68000", &[0x00, 0x01, 0x16, 0xC2]),
+            (
+                " move.l $ffffffff,d0\n",
+                "68000",
+                &[0x20, 0x39, 0xFF, 0xFF, 0xFF, 0xFF],
+            ),
+        ];
+        for (src, cpu, expected) in cases {
+            assert_eq!(assemble_source_with_cpu(src, cpu), *expected, "{src}");
+        }
+    }
+
+    #[test]
+    fn second_audit_rejections() {
+        for (src, cpu) in [
+            (" move.l $100000004,d1\n", "68000"),
+            (" move.l $100000004(a0),d1\n", "68000"),
+            (" move.w $100000004.w,d1\n", "68000"),
+            (" tst.l ([4,a0],$100000004)\n", "68020"),
+            (" dc.x $1000000000000000000000001\n", "68000"),
+            (" dc.s 1e40\n", "68000"),
+            (" dc.d 1e400\n", "68000"),
+            (" dc.s 1e-50\n", "68000"),
+            (" fmove.s #$123456789,fp0\n", "68020"),
+            (" pack d0,d1,#$10000\n", "68020"),
+            (" ptestw #1,t(pc),#1\nt: nop\n", "68030"),
+            // 68030 MMU EAs are control alterable, PC-relative excluded.
+            (" pmove tc,t(pc)\nt: nop\n", "68030"),
+            (" pmove t(pc),tc\nt: nop\n", "68030"),
+            (" pflush #1,#1,t(pc)\nt: nop\n", "68030"),
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu(cpu);
+            assert!(asm.assemble(src).is_err(), "{src}");
+        }
+    }
+
     #[test]
     fn rarer_valid_forms() {
         let cases: &[(&str, &str, &[u8])] = &[

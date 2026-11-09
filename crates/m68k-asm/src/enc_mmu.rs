@@ -94,7 +94,7 @@ pub fn enc_pmove(
     check_cpu(cpu, "68030")?;
     let mmu_code = pmove_reg_code_from_operand(reg_op)
         .ok_or_else(|| AsmError::new("unknown MMU register for PMOVE"))?;
-    let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL, cpu)?;
+    let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL_ALT, cpu)?;
     let rw: u16 = if direction_ea_to_reg { 0 } else { 1 };
     let ext = (mmu_code << 10) | (rw << 9);
     let mut words = vec![0xF000 | ((mode as u16) << 3) | (reg as u16), ext];
@@ -125,7 +125,7 @@ pub fn enc_ptest(
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
-    let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL, cpu)?;
+    let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL_ALT, cpu)?;
     let level = field3(level, "PTEST level")?;
     let rw: u16 = if read { 1 } else { 0 };
     let (a_bit, an_field) = match an {
@@ -154,10 +154,10 @@ pub fn enc_pflush(
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
-    let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL, cpu)?;
+    let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL_ALT, cpu)?;
     let mask = field3(mask, "PFLUSH mask")?;
     let ext = (0b001 << 13) | (0b110 << 10) | (mask << 5) | fc_field;
-    let mut words = vec![0xF010 | ((mode as u16) << 3) | (reg as u16), ext];
+    let mut words = vec![0xF000 | ((mode as u16) << 3) | (reg as u16), ext];
     words.extend(ext_words);
     Ok(words)
 }

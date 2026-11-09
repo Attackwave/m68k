@@ -376,7 +376,10 @@ fn encode_full_ea(
         // low nibble — `($1000,d0.w*8)` came out as `07a1` where the
         // reference has `07a0`.
         0
-    } else if mi.is_postindexed {
+    } else if mi.is_postindexed && !index_suppress {
+        // With the index suppressed (IS=1) there is nothing to index
+        // after the indirection: 1-3 is plain memory indirect and 5-7 is
+        // reserved. `([4,a0],8)` came out as 0166, which the CPU rejects.
         5 + iis_offset
     } else {
         1 + iis_offset

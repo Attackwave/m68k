@@ -131,8 +131,3 @@ fn fpu_forms() {
         ],
     );
 }
-
-#[test]
-fn mmu_forms() {
-    check("68030", &["pmove @,tc"]);
-}
