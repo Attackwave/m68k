@@ -116,10 +116,6 @@ impl SymbolTable {
         self.displacement_error.borrow_mut().get_or_insert(message);
     }
 
-    fn has_displacement_error(&self) -> bool {
-        self.displacement_error.borrow().is_some()
-    }
-
     fn take_displacement_error(&self) -> Option<String> {
         self.displacement_error.borrow_mut().take()
     }
@@ -2091,9 +2087,11 @@ pub struct Assembler {
     /// while walking is enough to give each local label a unique name —
     /// see [`Assembler::qualify_label`].
     current_global_label: Option<String>,
+    /// Errors pass 2 collects before giving up on the rest of the source.
+    max_errors: usize,
 }
 
-/// Errors pass 2 collects before giving up on the rest of the source.
+/// Default for [`Assembler::set_max_errors`].
 const MAX_PASS2_ERRORS: usize = 100;
 
 /// Tracks `OPT` directive flags (`OPT flag[n][+-]`, comma-separated,
@@ -2195,6 +2193,7 @@ impl Assembler {
             image_start: None,
             branches: Vec::new(),
             cpu: "68000".to_string(),
+            max_errors: MAX_PASS2_ERRORS,
             errors: ErrorCollector::new(),
             pc: origin,
             line_pcs: Vec::new(),
@@ -2398,6 +2397,13 @@ impl Assembler {
     /// Set the CPU target.
     pub fn set_cpu(&mut self, cpu: &str) {
         self.cpu = cpu.to_string();
+    }
+
+    /// Errors pass 2 collects before it gives up on the rest of the
+    /// source (100 by default). A tool that needs every failing line,
+    /// not just a readable report, raises it.
+    pub fn set_max_errors(&mut self, max: usize) {
+        self.max_errors = max;
     }
 
     /// Warn about immediates that encode cleanly but almost certainly do
@@ -3931,8 +3937,20 @@ impl Assembler {
             }
         }
 
-        // Use optimistic encoding (will be refined in pass 2)
         let mnemonic_upper = mnemonic.to_uppercase();
+        let symbols = &self.symbols;
+        let pc = self.pc;
+        let special =
+            self.encode_special_form(&mnemonic_upper, size, operand_texts, pc, &mut |text| {
+                parse_operand_text(text, symbols, pc).map(widen_forward_ref)
+            });
+        if let Some(words) = special {
+            // A form that fails here fails again in pass 2 and is reported
+            // there; its size no longer matters.
+            return Ok(words.map_or(2, |w| (w.len() * 2) as u32));
+        }
+
+        // Use optimistic encoding (will be refined in pass 2)
         match encode_instruction(
             &mnemonic_upper,
             size,
@@ -4306,12 +4324,32 @@ impl Assembler {
         }
 
         let mut errors: Vec<AsmError> = Vec::new();
+        let mut previous: Option<usize> = None;
         for (idx, line) in lines.iter().enumerate() {
+            // Every label got its address from pass 1. A line that encodes
+            // to a different size than pass 1 reserved leaves every later
+            // label and branch distance wrong without any other symptom,
+            // so the two layouts are compared line by line.
+            let reserved = self.get_pc_for_line(Some(line.line_no))?;
+            if self.pc != reserved {
+                errors.push(AsmError::with_line(
+                    format!(
+                        "encoded size differs from the size reserved in pass 1 \
+                         (next line at ${:x}, expected ${reserved:x})",
+                        self.pc
+                    ),
+                    previous.unwrap_or(line.line_no),
+                ));
+                self.pc = reserved;
+            }
+            if !matches!(line.line_type, LineType::Empty | LineType::Label) {
+                previous = Some(line.line_no);
+            }
             if let Err(e) = self.pass2_line(line) {
                 errors.push(e);
-                if errors.len() >= MAX_PASS2_ERRORS {
+                if errors.len() >= self.max_errors {
                     errors.push(AsmError::with_line(
-                        format!("too many errors ({MAX_PASS2_ERRORS}), giving up"),
+                        format!("too many errors ({}), giving up", self.max_errors),
                         line.line_no,
                     ));
                     break;
@@ -4590,39 +4628,11 @@ impl Assembler {
         // work with an unparsed operand.
         let mut operand_error: Option<AsmError> = None;
         let symbols = &self.symbols;
-        let mut parse_operand = |text: &str| {
-            symbols.take_displacement_error();
-            match parse_operand_text(text, symbols, pc) {
-                // `parse_operand_text` answers a bare identifier with the
-                // placeholder `Address(0)` so pass 1 can size a forward
-                // reference before the symbol is known. By pass 2 every
-                // symbol is known, so a placeholder that is still here names
-                // something that was never defined — a typo. Letting it
-                // through assembled `JSR tippfehler` to `jsr $0.w` with exit
-                // status 0: working output for a program that cannot run.
-                Ok(Operand::Address(0)) if undefined_symbol_name(text, symbols).is_some() => {
-                    let name = undefined_symbol_name(text, symbols).unwrap();
-                    operand_error.get_or_insert(AsmError::new(format!("undefined symbol: {name}")));
-                    None
-                }
-                // An undefined symbol inside a displacement or expression
-                // evaluated to 0 above; by pass 2 that can only be a mistake.
-                Ok(_) if undefined_symbol_in_operand(text, symbols, pc).is_some() => {
-                    let name = undefined_symbol_in_operand(text, symbols, pc).unwrap();
-                    operand_error.get_or_insert(AsmError::new(format!("undefined symbol: {name}")));
-                    None
-                }
-                // A displacement that is not an expression also evaluated to 0.
-                Ok(_) if symbols.has_displacement_error() => {
-                    let message = symbols.take_displacement_error().unwrap_or_default();
-                    operand_error.get_or_insert(AsmError::new(message));
-                    None
-                }
-                Ok(op) => Some(op),
-                Err(e) => {
-                    operand_error.get_or_insert(e);
-                    None
-                }
+        let mut parse_operand = |text: &str| match parse_operand_strict(text, symbols, pc) {
+            Ok(op) => Some(op),
+            Err(e) => {
+                operand_error.get_or_insert(e);
+                None
             }
         };
         let mut src = operand_texts.first().and_then(|t| parse_operand(t));
@@ -4680,215 +4690,15 @@ impl Assembler {
         // Encode using the existing encoder (expects uppercase mnemonic)
         let mnemonic_upper = mnemonic.to_uppercase();
 
-        // Handle 3-operand instructions (CAS, PACK, UNPK, PFLUSH, PTESTR/PTESTW)
-        let words = match mnemonic_upper.as_str() {
-            "PFLUSH" => {
-                // Three valid spellings across two architectures:
-                //   68040+: `PFLUSH (An)`          — one operand
-                //   68030 : `PFLUSH #fc,#mask`     — no EA
-                //   68030 : `PFLUSH #fc,#mask,<ea>`
-                // Requiring three operands rejected the other two.
-                if operand_texts.len() == 1 {
-                    // 68040+ single-operand form: `PFLUSH (An)`.
-                    // Reference encoding: `pflush (a0)` -> F508.
-                    let reg_op = parse_operand_text(&operand_texts[0], &self.symbols, pc)
-                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                    let w = crate::enc_mmu::enc_mmu_single_reg(0xF508, &reg_op, "68040", &self.cpu)
-                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                    self.push_instruction(AssembledInstruction {
-                        pc,
-                        words: w.clone(),
-                        line_no: Some(line.line_no),
-                        source: Some(line.raw.clone()),
-                        byte_len: None,
-                    });
-                    self.pc += (w.len() * 2) as u32;
-                    return Ok(());
-                }
-                if operand_texts.len() != 2 && operand_texts.len() != 3 {
-                    return Err(AsmError::with_line(
-                        "PFLUSH takes (An), #fc,#mask or #fc,#mask,<ea>".to_string(),
-                        line.line_no,
-                    ));
-                }
-                let fc = mmu_fc_field(&operand_texts[0], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                let mask = match parse_operand_text(&operand_texts[1], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-                {
-                    Operand::Immediate(v) => v,
-                    _ => {
-                        return Err(AsmError::with_line(
-                            "PFLUSH's second operand (#mask) must be immediate".to_string(),
-                            line.line_no,
-                        ));
-                    }
-                };
-                if operand_texts.len() == 2 {
-                    crate::enc_mmu::enc_pflush_no_ea(fc, mask, &self.cpu)
-                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-                } else {
-                    let ea = parse_operand_text(&operand_texts[2], &self.symbols, pc)
-                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                    crate::enc_mmu::enc_pflush(fc, mask, &ea, pc + 6, &self.cpu)
-                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-                }
-            }
-            // The 68040 form takes only `(An)`: F548 | read << 5 | An.
-            "PTESTR" | "PTESTW" if operand_texts.len() == 1 => {
-                let ea = parse_operand_text(&operand_texts[0], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                if !matches!(ea, Operand::AddrRegIndirect(_)) {
-                    return Err(AsmError::with_line(
-                        format!("{mnemonic_upper} with one operand takes (An)"),
-                        line.line_no,
-                    ));
-                }
-                let base = if mnemonic_upper == "PTESTR" {
-                    0xF568
-                } else {
-                    0xF548
-                };
-                crate::enc_mmu::enc_mmu_single_reg(base, &ea, "68040", &self.cpu)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-            }
-            "PTESTR" | "PTESTW" => {
-                if operand_texts.len() != 3 && operand_texts.len() != 4 {
-                    return Err(AsmError::with_line(
-                        format!(
-                            "{} takes 3 or 4 operands: FC,<ea>,#level[,An]",
-                            mnemonic_upper
-                        ),
-                        line.line_no,
-                    ));
-                }
-                let fc = mmu_fc_field(&operand_texts[0], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                let ea = parse_operand_text(&operand_texts[1], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                let level = match parse_operand_text(&operand_texts[2], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-                {
-                    Operand::Immediate(v) => v,
-                    _ => {
-                        return Err(AsmError::with_line(
-                            format!(
-                                "{}'s third operand (#level) must be immediate",
-                                mnemonic_upper
-                            ),
-                            line.line_no,
-                        ));
-                    }
-                };
-                let an = if operand_texts.len() == 4 {
-                    match parse_operand_text(&operand_texts[3], &self.symbols, pc)
-                        .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-                    {
-                        Operand::AddrReg(n) => Some(n),
-                        _ => {
-                            return Err(AsmError::with_line(
-                                format!("{}'s fourth operand must be An", mnemonic_upper),
-                                line.line_no,
-                            ));
-                        }
-                    }
-                } else {
-                    None
-                };
-                crate::enc_mmu::enc_ptest(
-                    fc,
-                    &ea,
-                    level,
-                    an,
-                    mnemonic_upper == "PTESTR",
-                    pc + 2,
-                    &self.cpu,
-                )
-                .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-            }
-            "CAS" => {
-                if operand_texts.len() != 3 {
-                    return Err(AsmError::with_line(
-                        "CAS takes exactly 3 operands: Dc,Du,<ea>".to_string(),
-                        line.line_no,
-                    ));
-                }
-                let sz = size.unwrap_or("w");
-                let dc = parse_operand_text(&operand_texts[0], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                let du = parse_operand_text(&operand_texts[1], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                let ea = parse_operand_text(&operand_texts[2], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                crate::enc_logic::enc_cas(&dc, &du, &ea, sz, pc + 6, &self.cpu)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-            }
-            "PACK" | "UNPK" => {
-                if operand_texts.len() != 3 {
-                    return Err(AsmError::with_line(
-                        format!(
-                            "{} takes exactly 3 operands: src,dst,#adjustment",
-                            mnemonic_upper
-                        ),
-                        line.line_no,
-                    ));
-                }
-                let is_pack = mnemonic_upper == "PACK";
-                let s = parse_operand_text(&operand_texts[0], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                let d = parse_operand_text(&operand_texts[1], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                let adj = parse_operand_text(&operand_texts[2], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                crate::enc_flow::enc_pack_unpk(&s, &d, &adj, "w", is_pack)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-            }
-            "CAS2" => {
-                if operand_texts.len() != 3 {
-                    return Err(AsmError::with_line(
-                        "CAS2 takes exactly 3 operands: Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)".to_string(),
-                        line.line_no,
-                    ));
-                }
-                let sz = size.unwrap_or("w");
-                let parse_dc_du_pair = |text: &str| -> Result<(Operand, Operand), AsmError> {
-                    let (a, b) = text
-                        .split_once(':')
-                        .ok_or_else(|| AsmError::new("CAS2 operand must be Rx:Ry"))?;
-                    let pa = parse_operand_text(a.trim(), &self.symbols, pc)?;
-                    let pb = parse_operand_text(b.trim(), &self.symbols, pc)?;
-                    Ok((pa, pb))
-                };
-                let (dc1, dc2) = parse_dc_du_pair(&operand_texts[0])
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                let (du1, du2) = parse_dc_du_pair(&operand_texts[1])
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                let r_text = operand_texts[2].trim();
-                let r_inner = r_text.trim_start_matches('(').trim_end_matches(')');
-                let (r1_text, r2_text) = r_inner.split_once("):(").ok_or_else(|| {
-                    AsmError::with_line(
-                        "CAS2 register pair must be (Rn1):(Rn2)".to_string(),
-                        line.line_no,
-                    )
-                })?;
-                let rn1 = parse_operand_text(r1_text.trim(), &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                let rn2 = parse_operand_text(r2_text.trim(), &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                crate::enc_logic::enc_cas2(&dc1, &dc2, &du1, &du2, &rn1, &rn2, sz)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-            }
-            "FMOVE" if operand_texts.len() == 2 && has_kfactor_suffix(&operand_texts[1]) => {
-                let (dst_text, kfactor) = split_kfactor_suffix(&operand_texts[1])
-                    .map_err(|e| AsmError::with_line(e, line.line_no))?;
-                let s = parse_operand_text(&operand_texts[0], &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                let d = parse_operand_text(dst_text, &self.symbols, pc)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
-                crate::enc_fpu::enc_fmove(&s, &d, size, Some(kfactor), pc + 6, &self.cpu)
-                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
-            }
-            _ => {
+        let special = {
+            let symbols = &self.symbols;
+            self.encode_special_form(&mnemonic_upper, size, operand_texts, pc, &mut |text| {
+                parse_operand_strict(text, symbols, pc)
+            })
+        };
+        let words = match special {
+            Some(words) => words.map_err(|e| AsmError::with_line(e.message, line.line_no))?,
+            None => {
                 self.warn_suspicious_immediate(
                     &mnemonic_upper,
                     src.as_ref(),
@@ -4924,6 +4734,179 @@ impl Assembler {
 
         self.pc += (word_count * 2) as u32;
         Ok(())
+    }
+
+    /// Encode the forms the two-operand encoder cannot express: CAS, CAS2,
+    /// PACK/UNPK, the MMU PFLUSH/PTESTR/PTESTW forms and FMOVE with a
+    /// k-factor. `None` when `mnemonic` with these operands is not one of
+    /// them.
+    ///
+    /// Both passes call this, pass 1 with a `parse` that tolerates forward
+    /// references and pass 2 with one that rejects undefined symbols, so
+    /// the size pass 1 reserves is the size pass 2 emits.
+    fn encode_special_form(
+        &self,
+        mnemonic: &str,
+        size: Option<&str>,
+        operand_texts: &[String],
+        pc: u32,
+        parse: &mut dyn FnMut(&str) -> Result<Operand, AsmError>,
+    ) -> Option<Result<Vec<u16>, AsmError>> {
+        let n = operand_texts.len();
+        let form = match mnemonic {
+            "PFLUSH" | "PTESTR" | "PTESTW" | "CAS" | "PACK" | "UNPK" | "CAS2" => true,
+            "FMOVE" => n == 2 && has_kfactor_suffix(&operand_texts[1]),
+            _ => false,
+        };
+        if !form {
+            return None;
+        }
+        Some(self.encode_special(mnemonic, size, operand_texts, pc, parse))
+    }
+
+    /// The body of [`Self::encode_special_form`] for a form it recognised.
+    fn encode_special(
+        &self,
+        mnemonic: &str,
+        size: Option<&str>,
+        operand_texts: &[String],
+        pc: u32,
+        parse: &mut dyn FnMut(&str) -> Result<Operand, AsmError>,
+    ) -> Result<Vec<u16>, AsmError> {
+        let n = operand_texts.len();
+        let cpu = self.cpu.as_str();
+        let fc_field = |text: &str, parse: &mut dyn FnMut(&str) -> Result<Operand, AsmError>| {
+            let text = text.trim();
+            if text.eq_ignore_ascii_case("sfc") {
+                return Ok(0b00_000);
+            }
+            if text.eq_ignore_ascii_case("dfc") {
+                return Ok(0b00_001);
+            }
+            match parse(text)? {
+                Operand::DataReg(n) => Ok(0b01_000 | n as u16),
+                Operand::Immediate(v) if text.starts_with('#') => crate::enc_mmu::fc_immediate(v),
+                _ => Err(AsmError::new("function code must be #0-#7, Dn, SFC or DFC")),
+            }
+        };
+        match mnemonic {
+            // Three valid spellings across two architectures:
+            //   68040+: `PFLUSH (An)`          — one operand
+            //   68030 : `PFLUSH #fc,#mask`     — no EA
+            //   68030 : `PFLUSH #fc,#mask,<ea>`
+            // Reference encoding: `pflush (a0)` -> F508.
+            "PFLUSH" if n == 1 => {
+                let reg_op = parse(&operand_texts[0])?;
+                crate::enc_mmu::enc_mmu_single_reg(0xF508, &reg_op, "68040", cpu)
+            }
+            "PFLUSH" => {
+                if n != 2 && n != 3 {
+                    return Err(AsmError::new(
+                        "PFLUSH takes (An), #fc,#mask or #fc,#mask,<ea>",
+                    ));
+                }
+                let fc = fc_field(&operand_texts[0], parse)?;
+                let Operand::Immediate(mask) = parse(&operand_texts[1])? else {
+                    return Err(AsmError::new(
+                        "PFLUSH's second operand (#mask) must be immediate",
+                    ));
+                };
+                if n == 2 {
+                    crate::enc_mmu::enc_pflush_no_ea(fc, mask, cpu)
+                } else {
+                    let ea = parse(&operand_texts[2])?;
+                    crate::enc_mmu::enc_pflush(fc, mask, &ea, pc + 6, cpu)
+                }
+            }
+            // The 68040 form takes only `(An)`: F548 | read << 5 | An.
+            "PTESTR" | "PTESTW" if n == 1 => {
+                let ea = parse(&operand_texts[0])?;
+                if !matches!(ea, Operand::AddrRegIndirect(_)) {
+                    return Err(AsmError::new(format!(
+                        "{mnemonic} with one operand takes (An)"
+                    )));
+                }
+                let base = if mnemonic == "PTESTR" { 0xF568 } else { 0xF548 };
+                crate::enc_mmu::enc_mmu_single_reg(base, &ea, "68040", cpu)
+            }
+            "PTESTR" | "PTESTW" => {
+                if n != 3 && n != 4 {
+                    return Err(AsmError::new(format!(
+                        "{mnemonic} takes 3 or 4 operands: FC,<ea>,#level[,An]"
+                    )));
+                }
+                let fc = fc_field(&operand_texts[0], parse)?;
+                let ea = parse(&operand_texts[1])?;
+                let Operand::Immediate(level) = parse(&operand_texts[2])? else {
+                    return Err(AsmError::new(format!(
+                        "{mnemonic}'s third operand (#level) must be immediate"
+                    )));
+                };
+                let an = if n == 4 {
+                    let Operand::AddrReg(an) = parse(&operand_texts[3])? else {
+                        return Err(AsmError::new(format!(
+                            "{mnemonic}'s fourth operand must be An"
+                        )));
+                    };
+                    Some(an)
+                } else {
+                    None
+                };
+                crate::enc_mmu::enc_ptest(fc, &ea, level, an, mnemonic == "PTESTR", pc + 2, cpu)
+            }
+            "CAS" => {
+                if n != 3 {
+                    return Err(AsmError::new("CAS takes exactly 3 operands: Dc,Du,<ea>"));
+                }
+                let dc = parse(&operand_texts[0])?;
+                let du = parse(&operand_texts[1])?;
+                let ea = parse(&operand_texts[2])?;
+                crate::enc_logic::enc_cas(&dc, &du, &ea, size.unwrap_or("w"), pc + 6, cpu)
+            }
+            "PACK" | "UNPK" => {
+                if n != 3 {
+                    return Err(AsmError::new(format!(
+                        "{mnemonic} takes exactly 3 operands: src,dst,#adjustment"
+                    )));
+                }
+                let s = parse(&operand_texts[0])?;
+                let d = parse(&operand_texts[1])?;
+                let adj = parse(&operand_texts[2])?;
+                crate::enc_flow::enc_pack_unpk(&s, &d, &adj, "w", mnemonic == "PACK")
+            }
+            "CAS2" => {
+                if n != 3 {
+                    return Err(AsmError::new(
+                        "CAS2 takes exactly 3 operands: Dc1:Dc2,Du1:Du2,(Rn1):(Rn2)",
+                    ));
+                }
+                let mut pair = |text: &str| -> Result<(Operand, Operand), AsmError> {
+                    let (a, b) = text
+                        .split_once(':')
+                        .ok_or_else(|| AsmError::new("CAS2 operand must be Rx:Ry"))?;
+                    Ok((parse(a.trim())?, parse(b.trim())?))
+                };
+                let (dc1, dc2) = pair(&operand_texts[0])?;
+                let (du1, du2) = pair(&operand_texts[1])?;
+                let r_inner = operand_texts[2]
+                    .trim()
+                    .trim_start_matches('(')
+                    .trim_end_matches(')');
+                let (r1, r2) = r_inner
+                    .split_once("):(")
+                    .ok_or_else(|| AsmError::new("CAS2 register pair must be (Rn1):(Rn2)"))?;
+                let rn1 = parse(r1.trim())?;
+                let rn2 = parse(r2.trim())?;
+                crate::enc_logic::enc_cas2(&dc1, &dc2, &du1, &du2, &rn1, &rn2, size.unwrap_or("w"))
+            }
+            _ => {
+                let (dst_text, kfactor) =
+                    split_kfactor_suffix(&operand_texts[1]).map_err(AsmError::new)?;
+                let s = parse(&operand_texts[0])?;
+                let d = parse(dst_text)?;
+                crate::enc_fpu::enc_fmove(&s, &d, size, Some(kfactor), pc + 6, cpu)
+            }
+        }
     }
 
     /// Whether `--optimize` may relax this instruction to a PC-relative
@@ -5941,19 +5924,27 @@ fn dbcc_condition(mnemonic: &str) -> Result<String, AsmError> {
 /// (`00000`), `DFC` (`00001`), `Dn` (`01RRR`) or `#0`-`#7` (`10XXX`).
 /// SFC and DFC parse as MOVEC control register numbers 0 and 1, which used
 /// to be taken as the immediates `#0`/`#1`.
-fn mmu_fc_field(text: &str, symbols: &SymbolTable, pc: u32) -> Result<u16, AsmError> {
-    let text = text.trim();
-    if text.eq_ignore_ascii_case("sfc") {
-        return Ok(0b00_000);
+/// Parse an operand in pass 2, where every symbol is known.
+///
+/// `parse_operand_text` answers a bare identifier with the placeholder
+/// `Address(0)`, evaluates an undefined symbol inside an expression to 0
+/// and a malformed displacement to 0, so pass 1 can size forward
+/// references. By pass 2 each of those can only be a mistake; letting it
+/// through assembled `JSR tippfehler` to `jsr $0.w` with exit status 0.
+fn parse_operand_strict(text: &str, symbols: &SymbolTable, pc: u32) -> Result<Operand, AsmError> {
+    symbols.take_displacement_error();
+    let op = parse_operand_text(text, symbols, pc)?;
+    let undefined = matches!(op, Operand::Address(0))
+        .then(|| undefined_symbol_name(text, symbols))
+        .flatten()
+        .or_else(|| undefined_symbol_in_operand(text, symbols, pc));
+    if let Some(name) = undefined {
+        return Err(AsmError::new(format!("undefined symbol: {name}")));
     }
-    if text.eq_ignore_ascii_case("dfc") {
-        return Ok(0b00_001);
+    if let Some(message) = symbols.take_displacement_error() {
+        return Err(AsmError::new(message));
     }
-    match parse_operand_text(text, symbols, pc)? {
-        Operand::DataReg(n) => Ok(0b01_000 | n as u16),
-        Operand::Immediate(v) if text.starts_with('#') => crate::enc_mmu::fc_immediate(v),
-        _ => Err(AsmError::new("function code must be #0-#7, Dn, SFC or DFC")),
-    }
+    Ok(op)
 }
 
 /// Number of extension words an FPU immediate of `size` occupies.
@@ -8723,17 +8714,41 @@ mymexc MACRO
     }
 
     #[test]
-    fn test_source_cas_followed_by_label_size_estimate() {
-        // Regression check: pass-1 size estimation for CAS (a pre-existing 3-operand
-        // instruction not routed through encode_instruction) falls back to a fixed 2-byte
-        // guess, which undercounts the true 4-byte encoding. This does not corrupt the
-        // final CAS bytes themselves (pass 2 always re-encodes correctly), but a label
-        // placed right after CAS can end up at the wrong address if anything depends on
-        // pass-1 forward-reference sizing. Documented here rather than fixed, since CAS/
-        // PACK/UNPK's pass-1 estimation gap predates this task and CAS2 shares the same
-        // architecture; the fix belongs with a broader pass-1 estimation pass.
-        let bytes = assemble_source_with_cpu("    CAS.W D0,D1,(A0)\nlabel:\n    NOP\n", "68020");
-        assert_eq!(bytes, vec![0x0C, 0xD0, 0x00, 0x40, 0x4E, 0x71]);
+    fn special_forms_reserve_their_encoded_size_in_pass_1() {
+        // Pass 1 sized these through the two-operand encoder, which cannot
+        // express them, and fell back to 2 bytes; every label after one sat
+        // too low. `dc.l end-start` reads the pass-1 layout.
+        for (cpu, line) in [
+            ("68020", "cas.w d0,d1,$1234.l"),
+            ("68020", "cas2.l d0:d1,d2:d3,(a0):(a1)"),
+            ("68020", "pack -(a0),-(a1),#1"),
+            ("68020", "unpk d0,d1,#$f8"),
+            ("68020", "fmove.p fp0,$12345678{d1}"),
+            ("68030", "pflush #1,#1,$12345678"),
+            ("68030", "ptestr #1,$12345678,#7,a1"),
+            ("68040", "ptestw (a0)"),
+        ] {
+            let src = format!("start:\n {line}\nend:\n dc.l end-start\n");
+            let bytes = assemble_source_with_cpu(&src, cpu);
+            let reserved = u32::from_be_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+            assert_eq!(reserved as usize, bytes.len() - 4, "{line}");
+        }
+    }
+
+    #[test]
+    fn special_forms_reject_undefined_symbols() {
+        for (cpu, line) in [
+            ("68020", "cas.l d0,d1,nosuch"),
+            ("68020", "pack d0,d1,#nosuch"),
+            ("68030", "ptestr #1,nosuch(a0),#7"),
+            ("68030", "pflush #nosuch,#1,(a0)"),
+            ("68020", "fmove.p fp0,nosuch(a0){#2}"),
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu(cpu);
+            let err = asm.assemble(&format!(" {line}\n")).unwrap_err();
+            assert!(err.message.contains("nosuch"), "{line}: {}", err.message);
+        }
     }
 
     #[test]

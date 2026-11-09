@@ -88,19 +88,42 @@ pub fn make_reassemblable(
         let (text, owner) = render(lines, base);
         let mut asm = Assembler::new(base);
         asm.set_cpu(cpu);
+        // Every failing line has to be seen in the same round, or a large
+        // input with many of them needs more rounds than it gets.
+        asm.set_max_errors(usize::MAX);
+        let failed = asm.assemble(&text).is_err();
+        // Pass 2 runs to the end even when lines fail, so the bytes and
+        // address of every line that did encode are known either way.
+        let mut produced: HashMap<usize, (u32, Vec<u8>)> = HashMap::new();
+        for instr in &asm.code {
+            let Some(idx) = instr.line_no.and_then(|n| owner.get(n).copied().flatten()) else {
+                continue;
+            };
+            let bytes = instr
+                .words
+                .iter()
+                .flat_map(|w| w.to_be_bytes())
+                .take(instr.size_bytes());
+            produced
+                .entry(idx)
+                .or_insert_with(|| (instr.pc, Vec::new()))
+                .1
+                .extend(bytes);
+        }
+        // Root causes first: lines that fail on their own and lines that
+        // encode to a different size. Everything after a size change sits
+        // at a wrong address and every branch across it measures a wrong
+        // distance; those are consequences and are only replaced if they
+        // persist once the sizes are right.
         let mut bad = HashSet::new();
-        if asm.assemble(&text).is_err() {
-            let mut branches = HashSet::new();
+        let mut branches = HashSet::new();
+        if failed {
             for d in asm
                 .diagnostics()
                 .iter()
                 .filter(|d| d.severity == Severity::Error)
             {
                 match d.line_no.and_then(|n| owner.get(n).copied().flatten()) {
-                    // A line that fails emits nothing, so every branch
-                    // across it measures a wrong distance. Those errors
-                    // are consequences; they are kept for a later round
-                    // and only replaced if they persist on their own.
                     Some(idx) if is_branch(&lines[idx].text) => {
                         branches.insert(idx);
                     }
@@ -110,27 +133,16 @@ pub fn make_reassemblable(
                     None => return Err(format!("generated source does not assemble: {d}")),
                 }
             }
-            if bad.is_empty() {
-                bad = branches;
+        }
+        for (idx, (_, bytes)) in &produced {
+            if bytes.len() != lines[*idx].raw_bytes.len() {
+                bad.insert(*idx);
             }
-        } else {
-            // Bytes and address each disassembly line produced.
-            let mut produced: HashMap<usize, (u32, Vec<u8>)> = HashMap::new();
-            for instr in &asm.code {
-                let Some(idx) = instr.line_no.and_then(|n| owner.get(n).copied().flatten()) else {
-                    continue;
-                };
-                let bytes = instr
-                    .words
-                    .iter()
-                    .flat_map(|w| w.to_be_bytes())
-                    .take(instr.size_bytes());
-                produced
-                    .entry(idx)
-                    .or_insert_with(|| (instr.pc, Vec::new()))
-                    .1
-                    .extend(bytes);
-            }
+        }
+        if bad.is_empty() && failed {
+            bad = branches;
+        }
+        if bad.is_empty() && !failed {
             for (idx, line) in lines.iter().enumerate().filter(|(_, l)| !l.is_error) {
                 let ok = match produced.get(&idx) {
                     Some((pc, bytes)) => *pc == line.address && *bytes == line.raw_bytes,
@@ -184,6 +196,20 @@ mod tests {
         assert_eq!(replaced, 1);
         assert!(lines[0].text.starts_with("dc.b"), "{}", lines[0].text);
         assert_eq!(lines.last().unwrap().text, "nop");
+    }
+
+    #[test]
+    fn only_the_line_that_changes_size_is_replaced() {
+        // `3976 b396 2652 23f4` decodes to a full-format form that
+        // reassembles shorter. Every line after it then sat at a wrong
+        // address in that round and was replaced too.
+        let bytes = [
+            0x39, 0x76, 0xB3, 0x96, 0x26, 0x52, 0x23, 0xF4, 0x4E, 0x71, 0x4E, 0x75, 0x70, 0x01,
+        ];
+        let mut lines = source_lines(&bytes, "68040");
+        assert_eq!(make_reassemblable(&mut lines, 0, "68040").unwrap(), 1);
+        let texts: Vec<&str> = lines.iter().map(|l| l.text.as_str()).collect();
+        assert_eq!(texts[1..], ["nop", "rts", "moveq   #$00000001, d0"]);
     }
 
     #[test]

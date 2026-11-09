@@ -410,6 +410,7 @@ fn run(args: Args) -> Result<(), String> {
     disasm.set_cpu(&args.cpu);
 
     let mut out = std::io::stdout().lock();
+    let mut unexact = None;
     let written = (|| -> std::io::Result<()> {
         if args.source {
             writeln!(out, "        org     ${:x}", base_addr)?;
@@ -421,7 +422,9 @@ fn run(args: Args) -> Result<(), String> {
             match m68k_cli::roundtrip::make_reassemblable(&mut lines, base_addr, &args.cpu) {
                 Ok(0) => {}
                 Ok(n) => eprintln!("note: {n} line(s) emitted as DC.B to keep the bytes exact"),
-                Err(e) => eprintln!("warning: {e}"),
+                // The source is still written, but it does not rebuild
+                // the input, so the run must not look successful.
+                Err(e) => unexact = Some(e),
             }
         }
         for line in lines {
@@ -462,9 +465,10 @@ fn run(args: Args) -> Result<(), String> {
     match written {
         // The reader closed the pipe (`| head`, `| grep -q`): the listing
         // was cut short on purpose, so it is not an error.
-        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
-        other => other.map_err(|e| format!("cannot write to stdout: {}", e)),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => {}
+        other => other.map_err(|e| format!("cannot write to stdout: {}", e))?,
     }
+    unexact.map_or(Ok(()), Err)
 }
 
 fn main() {
