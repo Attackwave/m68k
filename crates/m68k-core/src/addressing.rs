@@ -137,6 +137,8 @@ pub struct MemoryIndirectOperand {
     pub base_reg: Option<String>,
     pub base_disp: i32,
     pub bd_present: bool,
+    /// The base displacement was stored as a long word.
+    pub bd_long: bool,
     pub index_reg: Option<String>,
     pub index_size: Option<String>,
     pub index_scale: u8,
@@ -242,7 +244,15 @@ impl OperandTrait for MemoryIndirectOperand {
                 format!("${:08x}", self.pc_rel_target)
             }
         } else if self.bd_present {
-            format_signed(self.base_disp)
+            // `(bd,An)` with a long bd that would fit a word: without the
+            // suffix it reassembles to the shorter `(d16,An)` mode.
+            let plain_disp =
+                !self.is_indirect && self.base_reg.is_some() && self.index_reg.is_none();
+            if plain_disp && self.bd_long && i16::try_from(self.base_disp).is_ok() {
+                format!("{}.l", format_signed(self.base_disp))
+            } else {
+                format_signed(self.base_disp)
+            }
         } else {
             String::new()
         };
@@ -480,6 +490,7 @@ pub fn decode_full_ea(
         base_reg,
         base_disp: bd,
         bd_present,
+        bd_long: bd_code == 3,
         index_reg,
         index_size: if !is_suppress {
             Some(idx_size.to_string())
