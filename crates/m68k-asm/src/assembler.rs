@@ -198,6 +198,12 @@ impl SymbolTable {
         self.symbols.contains_key(&self.resolve_name(name)) || self.symbols.contains_key(name)
     }
 
+    /// Forget a symbol, so that a use before its next definition is
+    /// reported as undefined.
+    pub(crate) fn remove(&mut self, name: &str) {
+        self.symbols.remove(name);
+    }
+
     /// Force-set a symbol value (allows redefinition, used by SET directive).
     pub fn force_set(&mut self, name: &str, value: u32, line_no: Option<usize>) {
         self.symbols.insert(
@@ -4220,6 +4226,17 @@ impl Assembler {
         // pass 1 built it.
         self.current_global_label = None;
         self.symbols.set_local_scope(None);
+        // A SET symbol takes the value of the SET above each use, so every
+        // SET is evaluated again here in source order. Pass 1 left the last
+        // value in the table; dropping it makes a use above the first SET
+        // an undefined symbol instead of silently reading that last value.
+        for line in lines {
+            if let (Some(label), LineType::Directive { name, .. }) = (&line.label, &line.line_type)
+                && name == "set"
+            {
+                self.symbols.remove(label);
+            }
+        }
 
         let mut errors: Vec<AsmError> = Vec::new();
         for (idx, line) in lines.iter().enumerate() {
@@ -5146,9 +5163,10 @@ impl Assembler {
                 }
                 Ok(())
             }
-            "equ" | "set" => {
-                // EQU/SET defines a symbol, already handled in pass 1
-                Ok(())
+            // EQU was defined in pass 1; SET takes its value in order.
+            "equ" => Ok(()),
+            "set" => {
+                handle_set(&line.label, args, &mut self.symbols, self.pc, line.line_no).map(|_| ())
             }
             "dc" => self.encode_dc(args, line),
             "ds" => self.encode_ds(args, line),
@@ -7952,6 +7970,45 @@ ALIGNVAL SET 4
         // 0x1000 + 1 byte, padded up to the next 4-byte boundary.
         let last = asm.code.last().expect("DC.W was emitted");
         assert_eq!(last.pc, 0x1004);
+    }
+
+    /// Each use of a SET symbol reads the SET above it, including inside
+    /// REPT and macro expansions; pass 2 used to see only the last value.
+    #[test]
+    fn set_symbols_take_the_value_in_source_order() {
+        let bytes = Assembler::new(0)
+            .assemble_bytes(
+                "
+i   SET 0
+    REPT 3
+    DC.W i
+i   SET i+1
+    ENDR
+    DC.W i
+count MACRO
+n   SET n+1
+    DC.W n
+    ENDM
+n   SET 10
+    count
+    count
+",
+            )
+            .unwrap();
+        assert_eq!(bytes, [0, 0, 0, 1, 0, 2, 0, 3, 0, 11, 0, 12]);
+    }
+
+    #[test]
+    fn set_symbol_used_before_its_first_set_is_undefined() {
+        let mut asm = Assembler::new(0);
+        assert!(asm.assemble("    DC.W x\nx SET 1\n").is_err());
+        assert!(
+            asm.diagnostics()
+                .iter()
+                .any(|d| d.to_string().contains("undefined symbol: x")),
+            "{:?}",
+            asm.diagnostics()
+        );
     }
 
     #[test]
