@@ -484,6 +484,9 @@ fn immediate(m: &str, long: bool, dst: Ea) -> Option<Timing> {
         ("cmpi", Ea::Dn, true) => 14,
         ("cmpi", mem, false) => 8 + mem.calc(false),
         ("cmpi", mem, true) => 12 + mem.calc(true),
+        // Table 8-5 lists ANDI.L #,Dn at 14(3/0), two less than
+        // ADDI/SUBI/ORI/EORI.L.
+        ("andi", Ea::Dn, true) => 14,
         (_, Ea::Dn, false) => 8,
         (_, Ea::Dn, true) => 16,
         (_, Ea::An, _) => return None,
@@ -624,6 +627,8 @@ mod tests {
         assert_eq!(c(" addq.w #1,a0"), 8);
         assert_eq!(c(" subq.l #1,(a0)+"), 20);
         assert_eq!(c(" andi.w #$ff,sr"), 20);
+        assert_eq!(c(" andi.l #1,d0"), 14);
+        assert_eq!(c(" ori.l #1,d0"), 16);
     }
 
     #[test]
