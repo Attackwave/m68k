@@ -35,15 +35,16 @@ fn is_read_only(mnemonic: &str) -> bool {
 /// 0 meaning 32). Bits 14-12 (the destination register, when present) are
 /// set separately by the caller — they don't overlap with this function's
 /// bits, unlike the previous (incorrect) bit-15/bit-11 layout.
-fn bitfield_ext(offset: &BitfieldSpec, width: &BitfieldSpec) -> u16 {
+fn bitfield_ext(offset: &BitfieldSpec, width: &BitfieldSpec) -> Result<u16, AsmError> {
     let mut ext = 0u16;
     match offset {
         BitfieldSpec::DataReg(n) => {
             ext |= 0x0800;
             ext |= ((*n & 0x7) as u16) << 6;
         }
+        BitfieldSpec::Immediate(v @ 0..=31) => ext |= (*v as u16) << 6,
         BitfieldSpec::Immediate(v) => {
-            ext |= (((*v as i32) & 0x1F) as u16) << 6;
+            return Err(AsmError::new(format!("bitfield offset {v} is not 0..31")));
         }
     }
     match width {
@@ -51,12 +52,13 @@ fn bitfield_ext(offset: &BitfieldSpec, width: &BitfieldSpec) -> u16 {
             ext |= 0x0020;
             ext |= (*n & 0x7) as u16;
         }
+        // A width of 32 is encoded as 0.
+        BitfieldSpec::Immediate(v @ 1..=32) => ext |= (*v as u16) & 0x1F,
         BitfieldSpec::Immediate(v) => {
-            let w = ((*v as i32) % 32) & 0x1F;
-            ext |= w as u16;
+            return Err(AsmError::new(format!("bitfield width {v} is not 1..32")));
         }
     }
-    ext
+    Ok(ext)
 }
 
 /// Encode BFTST/BFEXTU/BFEXTS/BFFFO/BFCHG/BFCLR/BFSET/BFINS.
@@ -96,7 +98,7 @@ pub fn enc_bitfield(
 
     let (ea_mode, ea_reg, ea_ext) = encode_ea(ea_op, "b", ext_pc, allowed, cpu)?;
 
-    let mut ext = bitfield_ext(offset, width);
+    let mut ext = bitfield_ext(offset, width)?;
     if let Some(rn) = reg {
         ext |= ((rn & 0x7) as u16) << 12;
     }

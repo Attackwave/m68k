@@ -1372,10 +1372,11 @@ fn parse_index_reg_size_scale(text: &str) -> Option<(String, String, u8)> {
     let text = text.trim();
     let (reg_part, scale) = if let Some(pos) = text.find('*') {
         let scale_str = text[pos + 1..].trim();
-        let scale = scale_str.parse::<u8>().unwrap_or(1);
-        let scale = match scale {
-            2 | 4 | 8 => scale,
-            _ => 1,
+        // An invalid scale is passed on as 0 so the encoder rejects it;
+        // mapping it to 1 silently dropped `*16` or `*3`.
+        let scale = match scale_str.parse::<u8>() {
+            Ok(n @ (1 | 2 | 4 | 8)) => n,
+            _ => 0,
         };
         (&text[..pos], scale)
     } else {
@@ -1415,10 +1416,11 @@ fn parse_index_reg_and_scale(text: &str) -> (String, u8, bool) {
     // Split on '*' to get scale
     let (reg_part, scale) = if let Some(pos) = text.find('*') {
         let scale_str = text[pos + 1..].trim();
-        let scale = scale_str.parse::<u8>().unwrap_or(1);
-        let scale = match scale {
-            2 | 4 | 8 => scale,
-            _ => 1,
+        // An invalid scale is passed on as 0 so the encoder rejects it;
+        // mapping it to 1 silently dropped `*16` or `*3`.
+        let scale = match scale_str.parse::<u8>() {
+            Ok(n @ (1 | 2 | 4 | 8)) => n,
+            _ => 0,
         };
         (&text[..pos], scale)
     } else {
@@ -4053,7 +4055,7 @@ impl Assembler {
             BranchSize::Short
         } else if (-32768..=32767).contains(&disp) {
             BranchSize::Word
-        } else if self.cpu == "68000" {
+        } else if crate::ea_encode::cpu_level(&self.cpu) < 2 {
             // 68000 has no 32-bit branch displacement form; encode_bra/
             // encode_bsr/enc_bcc's word-form fallback will surface this
             // as an out-of-range error in pass 2 (matching the previous
@@ -8218,6 +8220,53 @@ mymexc MACRO
         // cas2.w d0:d1,d2:d3,(a0):(a1) -> 0cfc808090c1
         let bytes = assemble_source_with_cpu("    CAS2.W D0:D1,D2:D3,(A0):(A1)\n", "68020");
         assert_eq!(bytes, vec![0x0C, 0xFC, 0x80, 0x80, 0x90, 0xC1]);
+    }
+
+    #[test]
+    fn expressions_reject_leftovers_and_know_modulo() {
+        let eval = |src: &str| {
+            let mut asm = Assembler::new(0);
+            asm.assemble(src).ok()?;
+            Some(asm.code.last()?.words.clone())
+        };
+        assert_eq!(eval(" dc.l 1+2)\n"), None);
+        assert_eq!(eval("x equ 7\n dc.w x%10\n"), Some(vec![7]));
+        assert_eq!(eval(" dc.w 7%%11\n"), Some(vec![1])); // 7 mod %11
+        assert_eq!(eval(" dc.w (1+2)*%11\n"), Some(vec![9]));
+    }
+
+    #[test]
+    fn invalid_operands_are_errors_not_silently_changed() {
+        for (src, cpu) in [
+            (" lsl.l (a0)\n", "68000"),
+            (" movem.l d0,(a0)+\n", "68000"),
+            (" movem.l -(a0),d0\n", "68000"),
+            (" movem.l d0,x(pc)\nx: nop\n", "68000"),
+            (" tst.w #5\n", "68000"),
+            (" tst.w #5\n", "68010"),
+            (" add.w #-40000,d0\n", "68000"),
+            (" move.l #$123456789,d0\n", "68000"),
+            (" stop #$10000\n", "68000"),
+            (" andi.b #$100,ccr\n", "68000"),
+            (" move.l (a0,d0.w*16),d1\n", "68020"),
+            (" bfset (a0){32:1}\n", "68020"),
+            (" bfset (a0){1:33}\n", "68020"),
+            (" link.l a6,#0\n", "68010"),
+            (" extb.l d0\n", "68010"),
+            (" muls.l d0,d1\n", "68010"),
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu(cpu);
+            assert!(asm.assemble(src).is_err(), "{cpu}: {src}");
+        }
+        assert_eq!(
+            assemble_source_with_cpu(" tst.w #5\n", "68020"),
+            [0x4A, 0x7C, 0, 5]
+        );
+        assert_eq!(
+            assemble_source_with_cpu(" tst.l a0\n", "68020"),
+            [0x4A, 0x88]
+        );
     }
 
     #[test]

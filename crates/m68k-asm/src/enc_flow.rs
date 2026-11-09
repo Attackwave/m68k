@@ -81,7 +81,7 @@ pub fn enc_bcc_sized(
     } else if (-32768..=32767).contains(&disp) {
         let op = 0x6000 | ((cc as u16) << 8);
         Ok(vec![op, (disp & 0xFFFF) as u16])
-    } else if cpu == "68000" {
+    } else if crate::ea_encode::cpu_level(cpu) < 2 {
         // The 32-bit long-displacement form below is 68020+ only. Without
         // this check, a Bcc target more than 32KB away on `--cpu 68000`
         // silently emitted the 68020 encoding instead of an error.
@@ -255,7 +255,7 @@ pub fn enc_link(reg: u8, displacement: i32, size: &str, cpu: &str) -> Result<Vec
             Ok(vec![op, (displacement & 0xFFFF) as u16])
         }
         "l" => {
-            if cpu == "68000" {
+            if crate::ea_encode::cpu_level(cpu) < 2 {
                 return Err(AsmError::new("LINK.L requires 68020 or later"));
             }
             // LINK.L has its own base opcode (0x4808), unrelated to LINK.W's
@@ -483,7 +483,7 @@ pub fn enc_negx(dst: &Operand, size: &str, pc: u32, cpu: &str) -> Result<Vec<u16
 
 /// Encode EXT.B instruction (68020+, opcode 0x49C0 | reg).
 pub fn enc_extb(reg: u8, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    if cpu == "68000" {
+    if crate::ea_encode::cpu_level(cpu) < 2 {
         return Err(AsmError::new("EXTB requires 68020 or later"));
     }
     Ok(vec![0x49C0 | (reg as u16)])
@@ -504,7 +504,7 @@ pub fn enc_scc(cond: &str, dst: &Operand, pc: u32, cpu: &str) -> Result<Vec<u16>
 /// 0 operands: TRAPcc (implicit, word-sized trap)
 /// 1 operand: TRAPcc #imm (word or long)
 pub fn enc_trapcc(cond: &str, imm: Option<(i64, &str)>, cpu: &str) -> Result<Vec<u16>, AsmError> {
-    if cpu == "68000" {
+    if crate::ea_encode::cpu_level(cpu) < 2 {
         return Err(AsmError::new("TRAPcc requires 68020 or later"));
     }
     let cc = cond_code(cond)?;

@@ -142,6 +142,29 @@ pub(crate) fn fpu_cc(cond: &str) -> Option<u16> {
     })
 }
 
+/// A 16-bit immediate field (signed or unsigned spelling). Casting with
+/// `as u16` silently kept the low half of `#$10000`.
+fn imm_word(v: i64, what: &str) -> Result<u16, AsmError> {
+    if (-0x8000..=0xFFFF).contains(&v) {
+        Ok(v as u16)
+    } else {
+        Err(AsmError::new(format!(
+            "{what} immediate {v} does not fit 16 bits"
+        )))
+    }
+}
+
+/// An 8-bit immediate (the CCR forms), in the low byte of its word.
+fn imm_byte(v: i64, what: &str) -> Result<u16, AsmError> {
+    if (-0x80..=0xFF).contains(&v) {
+        Ok(v as u16 & 0xFF)
+    } else {
+        Err(AsmError::new(format!(
+            "{what} immediate {v} does not fit 8 bits"
+        )))
+    }
+}
+
 /// Encode a single instruction given mnemonic, size, operands, current PC, and CPU.
 pub fn encode_instruction(
     mnemonic: &str,
@@ -161,7 +184,7 @@ pub fn encode_instruction(
         "RESET" => enc_reset(),
         "STOP" => {
             if let Some(Operand::Immediate(v)) = src {
-                enc_stop(*v as u16)
+                enc_stop(imm_word(*v, "STOP")?)
             } else {
                 Err(AsmError::new("STOP requires immediate operand"))
             }
@@ -321,7 +344,7 @@ pub fn encode_instruction(
         // RTD
         "RTD" => {
             if let Some(Operand::Immediate(disp)) = src {
-                enc_rtd(*disp as u16)
+                enc_rtd(imm_word(*disp, "RTD")?)
             } else {
                 Err(AsmError::new("RTD requires immediate displacement"))
             }
@@ -591,8 +614,10 @@ pub fn encode_instruction(
                 // word-sized and by one. With only one operand the parser
                 // delivers it as `src`, so matching on `dst` alone missed
                 // it and produced "Shift requires destination operand".
-                (Some(d), None) | (None, Some(d)) => enc_shift_mem(&mn, d, "w", pc + 4, cpu),
-                (Some(_), Some(d)) => enc_shift_mem(&mn, d, "w", pc + 4, cpu),
+                // The written size is passed on, so `lsl.l (a0)` is
+                // rejected instead of silently becoming `.w`.
+                (Some(d), None) | (None, Some(d)) => enc_shift_mem(&mn, d, sz, pc + 4, cpu),
+                (Some(_), Some(d)) => enc_shift_mem(&mn, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("Shift requires destination operand")),
             }
         }
@@ -695,12 +720,12 @@ pub fn encode_instruction(
             if let (Some(Operand::Immediate(v)), Some(d0)) = (src, dst)
                 && is_special(d0, "SR")
             {
-                return Ok(vec![0x46FC, *v as u16]);
+                return Ok(vec![0x46FC, imm_word(*v, "SR")?]);
             }
             if let (Some(Operand::Immediate(v)), Some(d0)) = (src, dst)
                 && is_special(d0, "CCR")
             {
-                return Ok(vec![0x44FC, *v as u16]);
+                return Ok(vec![0x44FC, imm_word(*v, "CCR")?]);
             }
             // MOVE.L An, USP -> from USP (0x4E60 | An)
             // Assembler convention: MOVE An,USP = move from USP to An
@@ -841,10 +866,10 @@ pub fn encode_instruction(
                 // -1 marks CCR and -2 marks SR (see parse_operand_text);
                 // matching any immediate meant both used the same opcode.
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "CCR") => {
-                    enc_andi_ccr_sr(*v as u16, false)
+                    enc_andi_ccr_sr(imm_byte(*v, "CCR")?, false)
                 }
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "SR") => {
-                    enc_andi_ccr_sr(*v as u16, true)
+                    enc_andi_ccr_sr(imm_word(*v, "SR")?, true)
                 }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_andi(*v, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("ANDI requires immediate and destination")),
@@ -854,10 +879,10 @@ pub fn encode_instruction(
             let sz = size.unwrap_or("w");
             match (src, dst) {
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "CCR") => {
-                    enc_ori_ccr_sr(*v as u16, false)
+                    enc_ori_ccr_sr(imm_byte(*v, "CCR")?, false)
                 }
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "SR") => {
-                    enc_ori_ccr_sr(*v as u16, true)
+                    enc_ori_ccr_sr(imm_word(*v, "SR")?, true)
                 }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_ori(*v, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("ORI requires immediate and destination")),
@@ -867,10 +892,10 @@ pub fn encode_instruction(
             let sz = size.unwrap_or("w");
             match (src, dst) {
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "CCR") => {
-                    enc_eori_ccr_sr(*v as u16, false)
+                    enc_eori_ccr_sr(imm_byte(*v, "CCR")?, false)
                 }
                 (Some(Operand::Immediate(v)), Some(d0)) if is_special(d0, "SR") => {
-                    enc_eori_ccr_sr(*v as u16, true)
+                    enc_eori_ccr_sr(imm_word(*v, "SR")?, true)
                 }
                 (Some(Operand::Immediate(v)), Some(d)) => enc_eori(*v, d, sz, pc + 4, cpu),
                 _ => Err(AsmError::new("EORI requires immediate and destination")),

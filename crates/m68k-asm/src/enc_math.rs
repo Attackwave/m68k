@@ -157,7 +157,7 @@ fn enc_mul(
             Ok(words)
         }
         "l" => {
-            if cpu == "68000" {
+            if crate::ea_encode::cpu_level(cpu) < 2 {
                 return Err(AsmError::new(format!(
                     "{}.L requires 68020 or later",
                     mnemonic
@@ -243,7 +243,7 @@ fn enc_div(
             Ok(words)
         }
         "l" => {
-            if cpu == "68000" {
+            if crate::ea_encode::cpu_level(cpu) < 2 {
                 return Err(AsmError::new(format!(
                     "{}.L requires 68020 or later",
                     mnemonic

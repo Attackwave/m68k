@@ -154,7 +154,13 @@ pub fn enc_clr(dst: &Operand, size: &str, pc: u32, cpu: &str) -> Result<Vec<u16>
 /// Encode TST instruction.
 pub fn enc_tst(dst: &Operand, size: &str, pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
     let sz = size_code(size)?;
-    let allowed = DATA | DREG;
+    // 68000/68010 test only data-alterable operands; the 68020 added An
+    // (word and long), PC-relative and immediate.
+    let allowed = if crate::ea_encode::cpu_level(cpu) < 2 {
+        DATA_ALT
+    } else {
+        ALL
+    };
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, allowed, cpu)?;
     let mut words = vec![0x4A00 | ((sz as u16) << 6) | ((dst_mode as u16) << 3) | (dst_reg as u16)];
     words.extend(dst_ext);
