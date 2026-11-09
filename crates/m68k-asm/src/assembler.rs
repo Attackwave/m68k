@@ -4734,6 +4734,24 @@ impl Assembler {
                         .map_err(|e| AsmError::with_line(e.message, line.line_no))?
                 }
             }
+            // The 68040 form takes only `(An)`: F548 | read << 5 | An.
+            "PTESTR" | "PTESTW" if operand_texts.len() == 1 => {
+                let ea = parse_operand_text(&operand_texts[0], &self.symbols, pc)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
+                if !matches!(ea, Operand::AddrRegIndirect(_)) {
+                    return Err(AsmError::with_line(
+                        format!("{mnemonic_upper} with one operand takes (An)"),
+                        line.line_no,
+                    ));
+                }
+                let base = if mnemonic_upper == "PTESTR" {
+                    0xF568
+                } else {
+                    0xF548
+                };
+                crate::enc_mmu::enc_mmu_single_reg(base, &ea, "68040", &self.cpu)
+                    .map_err(|e| AsmError::with_line(e.message, line.line_no))?
+            }
             "PTESTR" | "PTESTW" => {
                 if operand_texts.len() != 3 && operand_texts.len() != 4 {
                     return Err(AsmError::with_line(
@@ -8118,6 +8136,60 @@ n   SET 10
         }
     }
 
+    /// Valid forms the assembler used to reject, against their PRM
+    /// encodings.
+    #[test]
+    fn rarer_valid_forms() {
+        let cases: &[(&str, &str, &[u8])] = &[
+            ("    fmove.l a0,fpiar\n", "68030", &[0xF2, 0x08, 0x84, 0x00]),
+            ("    fmove.l fpiar,a3\n", "68030", &[0xF2, 0x0B, 0xA4, 0x00]),
+            (
+                "    fmove.l #$12345678,fpcr\n",
+                "68030",
+                &[0xF2, 0x3C, 0x90, 0x00, 0x12, 0x34, 0x56, 0x78],
+            ),
+            (
+                "    fmovem.x d0,-(a7)\n",
+                "68030",
+                &[0xF2, 0x27, 0xE8, 0x00],
+            ),
+            (
+                "    fmovem.x (a7)+,d1\n",
+                "68030",
+                &[0xF2, 0x1F, 0xD8, 0x10],
+            ),
+            ("    fmovem d2,(a0)\n", "68030", &[0xF2, 0x10, 0xF8, 0x20]),
+            ("    ptestr (a0)\n", "68040", &[0xF5, 0x68]),
+            ("    ptestw (a3)\n", "68040", &[0xF5, 0x4B]),
+            // The displacement is measured from after the immediate.
+            (
+                "    cmpi.w #1,t(pc)\nt: dc.w 0\n",
+                "68020",
+                &[0x0C, 0x7A, 0x00, 0x01, 0x00, 0x02, 0, 0],
+            ),
+            (
+                "    move.l ([t,pc]),d0\nt: dc.l 0\n",
+                "68020",
+                &[0x20, 0x3B, 0x01, 0x61, 0x00, 0x04, 0, 0, 0, 0],
+            ),
+            ("    lea ([pc]),a0\n", "68020", &[0x41, 0xFB, 0x01, 0x51]),
+        ];
+        for (source, cpu, expected) in cases {
+            assert_eq!(assemble_source_with_cpu(source, cpu), *expected, "{source}");
+        }
+        for (source, cpu) in [
+            ("    fmove.l a0,fpcr\n", "68030"),
+            ("    cmpi.w #1,4(pc)\n", "68000"),
+            ("    ptestr (a0)\n", "68030"),
+            ("    ptestr a0\n", "68040"),
+            ("    move.l d0,([4,pc])\n", "68020"),
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu(cpu);
+            assert!(asm.assemble(source).is_err(), "{source} on {cpu}");
+        }
+    }
+
     /// A displacement that is not an expression is an error, not 0.
     #[test]
     fn malformed_displacement_is_an_error() {
@@ -9208,15 +9280,10 @@ later: DC.W 0
     }
 
     #[test]
-    fn test_source_memory_indirect_pc_relative_unsupported() {
-        // PC-relative full-format EAs are not implemented on the assembler
-        // side (decoder-only feature).
-        let mut asm = Assembler::new(0);
-        asm.set_cpu("68020");
-        let err = asm
-            .assemble("    MOVE.L ([$10,PC],D1.W*2,$20),D2\n")
-            .unwrap_err();
-        assert!(err.message.contains("PC-relative"));
+    fn test_source_memory_indirect_pc_relative() {
+        // The bd is the target ($10) measured from the extension word at 2.
+        let bytes = assemble_source_with_cpu("    MOVE.L ([$10,PC],D1.W*2,$20),D2\n", "68020");
+        assert_eq!(bytes, [0x24, 0x3B, 0x13, 0x26, 0x00, 0x0E, 0x00, 0x20]);
     }
 
     // B4: MULS.L/MULU.L Dh:Dl (64-bit product), B3: DIVSL/DIVUL + DIVS.L/

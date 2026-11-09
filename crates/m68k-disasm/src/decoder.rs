@@ -1887,13 +1887,22 @@ fn decode_fpu_cpgen(
             let dr = (ext >> 13) & 1;
             let list_mode = (ext >> 11) & 0x3;
             let is_predec = list_mode & 0b10 == 0;
-            let raw_mask = (ext & 0xFF) as u8;
-            let mask = if is_predec {
-                raw_mask
+            let reg_list = if list_mode & 1 == 1 {
+                // Dynamic list: the mask is in Dn, named by bits 6-4; the
+                // rest of the low byte must be zero.
+                if ext & 0x078F != 0 {
+                    return Err("FMOVEM dynamic list with reserved bits set".into());
+                }
+                format!("d{}", (ext >> 4) & 0x7)
             } else {
-                reverse_fp_mask(raw_mask)
+                let raw_mask = (ext & 0xFF) as u8;
+                let mask = if is_predec {
+                    raw_mask
+                } else {
+                    reverse_fp_mask(raw_mask)
+                };
+                fpu_reg_list_text(mask)
             };
-            let reg_list = fpu_reg_list_text(mask);
             let ea = decode_ea(ea_mode, ea_reg, "x", stream, inst_pc, cpu)?;
             if dr == 1 {
                 operands.push(DecodedOperand::special(reg_list));

@@ -177,7 +177,7 @@ pub fn enc_fmove(
                 ea_op,
                 "l",
                 ext_pc,
-                ea::CONTROL_ALT | ea::APREDEC | ea::DREG,
+                ea::CONTROL_ALT | ea::APREDEC | ea::DREG | fpiar_areg(*mask),
                 cpu,
             )?;
             let ext = (5 << 13) | ((*mask as u16) << 10);
@@ -190,7 +190,7 @@ pub fn enc_fmove(
                 ea_op,
                 "l",
                 ext_pc,
-                ea::CONTROL | ea::APOSTINC | ea::DREG,
+                ea::CONTROL | ea::APOSTINC | ea::DREG | single_source(*mask),
                 cpu,
             )?;
             let ext = (4 << 13) | ((*mask as u16) << 10);
@@ -200,6 +200,18 @@ pub fn enc_fmove(
         }
         _ => Err(AsmError::new("invalid FMOVE operands")),
     }
+}
+
+/// An address register is a valid FMOVE operand only when FPIAR, an
+/// address, is the one control register moved.
+fn fpiar_areg(mask: u8) -> u16 {
+    if mask == 1 { ea::AREG } else { 0 }
+}
+
+/// Sources a single control register also accepts: An for FPIAR, and an
+/// immediate long for any one of them.
+fn single_source(mask: u8) -> u16 {
+    fpiar_areg(mask) | if mask.count_ones() == 1 { ea::IMM } else { 0 }
 }
 
 /// Encode FMOVECR #rom_offset,FPn: load a ROM constant into an FPU register.
@@ -301,6 +313,31 @@ pub fn enc_fmovem_regs_to_mem(
         (0b10u16, reverse_fp_mask(regs.0))
     };
     let ext = (0b11u16 << 14) | (1 << 13) | (list_mode << 11) | (mask as u16);
+    let mut words = vec![0xF200 | ((mode as u16) << 3) | (reg as u16), ext];
+    words.extend(ext_words);
+    Ok(words)
+}
+
+/// Encode FMOVEM with a dynamic register list held in `Dn` (bits 6-4 of
+/// the extension word): list mode `01` for predecrement, `11` for the
+/// control and postincrement modes.
+pub fn enc_fmovem_dynamic(
+    dn: u8,
+    ea_op: &Operand,
+    to_memory: bool,
+    ext_pc: u32,
+    cpu: &str,
+) -> Result<Vec<u16>, AsmError> {
+    check_fpu_cpu(cpu)?;
+    let allowed = if to_memory {
+        ea::CONTROL_ALT | ea::APREDEC
+    } else {
+        ea::CONTROL | ea::APOSTINC
+    };
+    let (mode, reg, ext_words) = encode_ea(ea_op, "x", ext_pc, allowed, cpu)?;
+    let list_mode: u16 = if mode == 4 { 0b01 } else { 0b11 };
+    let ext =
+        (0b11u16 << 14) | (u16::from(to_memory) << 13) | (list_mode << 11) | (u16::from(dn) << 4);
     let mut words = vec![0xF200 | ((mode as u16) << 3) | (reg as u16), ext];
     words.extend(ext_words);
     Ok(words)

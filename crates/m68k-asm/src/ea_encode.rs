@@ -175,7 +175,7 @@ pub fn encode_ea(
         Operand::RegPair(..) => Err(AsmError::new(
             "Dh:Dl/Dr:Dq register pair cannot be used as a plain EA",
         )),
-        Operand::MemoryIndirect(mi) => encode_full_ea(mi, allowed, cpu_level),
+        Operand::MemoryIndirect(mi) => encode_full_ea(mi, allowed, ext_pc, cpu_level),
         Operand::Memory(val) | Operand::Address(val) => {
             let addr = *val as u32;
             let addr16 = (addr & 0xFFFF) as i16;
@@ -315,10 +315,12 @@ fn encode_brief_index(
 /// - bits 5-4: base displacement size (0=null, 2=word, 3=long)
 /// - bits 3-0: indirect/index/outer-displacement selector (i_i_s)
 ///
-/// PC-relative full-format EAs (`base_is_pc`) are not supported.
+/// With `base_is_pc` the base displacement is given as the target address
+/// and measured from the extension word, as for `(d16,PC)`.
 fn encode_full_ea(
     mi: &MemoryIndirectOperand,
     allowed: u16,
+    ext_pc: u32,
     cpu_level: u8,
 ) -> Result<EAEncoded, AsmError> {
     if cpu_level < 2 {
@@ -328,18 +330,22 @@ fn encode_full_ea(
             "indexed displacement out of range (brief format is 8-bit, -128..127; wider needs 68020+)"
         }));
     }
-    if mi.base_is_pc {
-        return Err(AsmError::new("PC-relative full format EA is not supported"));
-    }
-
-    let base_suppress = mi.base_reg.is_none();
+    // The PC as base: the value of the PC is the address of the extension
+    // word (`ext_pc - 2`, the same reference point as `(d16,PC)`).
+    let base_disp = if mi.base_is_pc {
+        mi.base_disp
+            .map(|target| target.wrapping_sub(ext_pc as i32 - 2))
+    } else {
+        mi.base_disp
+    };
+    let base_suppress = mi.base_reg.is_none() && !mi.base_is_pc;
     let index_suppress = mi.index_reg.is_none();
 
     // PRM BD SIZE field: 00=reserved, 01=null displacement, 10=word, 11=long -
     // "no base displacement" is encoded as 01, not 00 (which is reserved and
     // never emitted). verified against reference output for `([a0])`
     // -> ext 0x0151 (bd_code=1).
-    let bd_code: u16 = match mi.base_disp {
+    let bd_code: u16 = match base_disp {
         None => 1,
         Some(bd) if (-32768..=32767).contains(&bd) => 2,
         Some(_) => 3,
@@ -408,12 +414,16 @@ fn encode_full_ea(
     // encoded by `base_suppress` in the extension word above — the register
     // field itself is then ignored by the CPU, so 0 is a real don't-care
     // rather than a swallowed parse failure.
-    let (mode, reg) = (6, mi.base_reg.unwrap_or(0));
+    let (mode, reg) = if mi.base_is_pc {
+        (7, 3)
+    } else {
+        (6, mi.base_reg.unwrap_or(0))
+    };
     check_ea(mode, reg, allowed)?;
 
     let mut ext_words = vec![ext_word];
 
-    if let Some(bd) = mi.base_disp {
+    if let Some(bd) = base_disp {
         if bd_code == 2 {
             if !(-32768..=32767).contains(&bd) {
                 return Err(AsmError::new("full EA base displacement out of word range"));
@@ -583,7 +593,7 @@ mod tests {
     }
 
     #[test]
-    fn test_encode_memory_indirect_pc_relative_rejected() {
+    fn test_encode_memory_indirect_pc_relative() {
         let mi = MemoryIndirectOperand {
             base_reg: None,
             base_is_pc: true,
@@ -596,7 +606,9 @@ mod tests {
             is_indirect: true,
         };
         let op = Operand::MemoryIndirect(Box::new(mi));
-        let err = encode_ea(&op, "l", 0, 0xFFFF, "68020").unwrap_err();
-        assert!(err.message.contains("PC-relative"));
+        // Extension word at 2 (`ext_pc` 4): bd = $10 - 2.
+        let (mode, reg, ext) = encode_ea(&op, "l", 4, 0xFFFF, "68020").unwrap();
+        assert_eq!((mode, reg), (7, 3));
+        assert_eq!(ext, vec![0x0161, 0x000E]);
     }
 }
