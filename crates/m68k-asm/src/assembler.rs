@@ -593,22 +593,8 @@ fn parse_operand_text(
     // to emit — `MemoryIndirectOperand::base_reg` is an `Option` precisely
     // for it — but no parser produced one, so the reference assembled
     // `move.l ($1000,d0.w*8),d1` and we rejected it.
-    if let Some((xn, disp, scale, xn_is_long, bd_forced)) =
-        parse_parens_disp_index_no_base(paren_text, symbols, current_pc)
-    {
-        return Ok(Operand::MemoryIndirect(Box::new(MemoryIndirectOperand {
-            base_reg: None,
-            base_is_pc: false,
-            base_disp: disp,
-            index_reg: Some(xn),
-            index_long: xn_is_long,
-            index_scale: scale,
-            outer_disp: None,
-            is_postindexed: false,
-            is_indirect: false,
-            bd_forced,
-            ..Default::default()
-        })));
+    if let Some(mi) = parse_parens_disp_index_no_base(paren_text, symbols, current_pc) {
+        return Ok(Operand::MemoryIndirect(Box::new(mi)));
     }
 
     // Absolute address with .W/.L suffix.
@@ -1149,78 +1135,82 @@ fn parse_parens_disp_pc_index(
     Some((reg_num, target, scale, is_long))
 }
 
-/// Index register, displacement (`None` when suppressed), scale, index
-/// size long, and the forced displacement size.
-type NoBaseIndex = (u8, Option<i32>, u8, bool, Option<bool>);
+/// Parse the unbracketed full-format forms without a usable base:
+/// `(bd,Xn.size*scale)`, `(bd,ZAn,Xn)`, `(Dn.size*scale)` (base and
+/// displacement both suppressed), and the ZPC forms `(bd,ZPC,Xn)`,
+/// `(ZPC,Xn)` and `(bd,ZPC)`.
+///
+/// Distinguished from `(bd,An,Xn)` by the middle field: either it is
+/// absent, or it names a suppressed base.
+fn parse_parens_disp_index_no_base(
+    text: &str,
+    symbols: &SymbolTable,
+    pc: u32,
+) -> Option<MemoryIndirectOperand> {
+    let inner = text.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    let is_zpc = |p: &str| p.eq_ignore_ascii_case("zpc");
+
+    let index = |text: &str| {
+        let (name, scale, long) = parse_index_reg_and_scale(text);
+        Some((index_reg_num(&parse_register(&name)?)?, scale, long))
+    };
+
+    let (disp_str, zpc, xn) = match parts.as_slice() {
+        // (Dn.size*scale): only a data register, since `(An)` is register
+        // indirect and an address register alone never means an index.
+        [xn] => match parse_register(&parse_index_reg_and_scale(xn).0)? {
+            Operand::DataReg(_) => (None, false, Some(index(xn)?)),
+            _ => return None,
+        },
+        [z, xn] if is_zpc(z) => (None, true, Some(index(xn)?)),
+        [bd, z] if is_zpc(z) => (Some(*bd), true, None),
+        // (bd,Xn): the first field must not be a register, or this is
+        // `(An,Xn)`, handled by the caller before.
+        [bd, xn] => {
+            if parse_register(bd).is_some() || bd.eq_ignore_ascii_case("pc") || is_zpc(bd) {
+                return None;
+            }
+            (Some(*bd), false, Some(index(xn)?))
+        }
+        [bd, base, xn] if is_zpc(base) => (Some(*bd), true, Some(index(xn)?)),
+        [bd, base, xn] if is_suppressed_areg(base) => (Some(*bd), false, Some(index(xn)?)),
+        _ => return None,
+    };
+
+    let (base_disp, bd_forced) = match disp_str {
+        Some(d) => {
+            let (d, forced) = split_displacement_size(d);
+            (Some(evaluate_displacement(d, symbols, pc)), forced)
+        }
+        None => (None, None),
+    };
+    let (index_reg, index_scale, index_long) = match xn {
+        Some((reg, scale, long)) => (Some(reg), scale, long),
+        None => (None, 1, false),
+    };
+    Some(MemoryIndirectOperand {
+        base_is_pc: zpc,
+        zpc,
+        base_disp,
+        bd_forced,
+        index_reg,
+        index_scale,
+        index_long,
+        ..Default::default()
+    })
+}
+
+/// `ZA0`..`ZA7`: an address register named as base but suppressed.
+fn is_suppressed_areg(text: &str) -> bool {
+    let b = text.as_bytes();
+    b.len() == 3 && b[..2].eq_ignore_ascii_case(b"za") && (b'0'..=b'7').contains(&b[2])
+}
 
 /// Parse (d8,An,Xn*scale) - base register with index register.
 /// Supports optional scale: (d8,An,Xn*1), (d8,An,Xn*2), (d8,An,Xn*4), (d8,An,Xn*8)
 /// Supports optional index size: (d8,An,Xn.W), (d8,An,Xn.L)
 /// Returns (An, Xn, disp, scale, is_long).
-/// Parse `(bd,Xn.size*scale)` — an indexed EA with the base register
-/// suppressed — the equivalent `(bd,ZAn,Xn.size*scale)` spelling, and
-/// `(Dn.size*scale)`, which suppresses the displacement too (`None`).
-///
-/// Distinguished from `(bd,An,Xn)` by the middle field: either it is
-/// absent, or it names a suppressed base (`ZA0`..`ZA7`, `ZPC`). Returns
-/// the index register, base displacement, scale and index size.
-fn parse_parens_disp_index_no_base(
-    text: &str,
-    symbols: &SymbolTable,
-    pc: u32,
-) -> Option<NoBaseIndex> {
-    let trimmed = text.trim();
-    let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?;
-    let parts: Vec<&str> = inner.split(',').collect();
-
-    // (Dn.size*scale): only a data register, since `(An)` is register
-    // indirect and an address register alone never means an index.
-    if let [xn_full] = parts.as_slice() {
-        let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full.trim());
-        return match parse_register(&xn_name)? {
-            Operand::DataReg(n) => Some((n, None, scale, is_long, None)),
-            _ => None,
-        };
-    }
-
-    let (disp_str, xn_full) = match parts.len() {
-        // (bd,Xn)
-        2 => (parts[0].trim(), parts[1].trim()),
-        // (bd,ZAn,Xn) — explicit base suppression
-        3 => {
-            let mid = parts[1].trim().to_uppercase();
-            // ZPC is not handled: it is the PC-relative mode (7/3) with the
-            // base suppressed, but this path encodes mode 6, an alterable
-            // An-relative form. Refusing it beats assembling another EA.
-            let suppressed =
-                mid.starts_with("ZA") && mid.len() == 3 && mid.as_bytes()[2].is_ascii_digit();
-            if !suppressed {
-                return None;
-            }
-            (parts[0].trim(), parts[2].trim())
-        }
-        _ => return None,
-    };
-
-    // The middle field of the 2-part form must be an index register, not a
-    // base one — `(4,A0)` is a plain displacement and belongs elsewhere.
-    let (xn_name, scale, is_long) = parse_index_reg_and_scale(xn_full);
-    let reg = parse_register(&xn_name)?;
-    let xn = index_reg_num(&reg)?;
-    // A bare `(An,Xn)` has already been handled by the caller above; here a
-    // two-part form only qualifies when the first field is not a register.
-    if parts.len() == 2
-        && (parse_register(disp_str).is_some()
-            || disp_str.eq_ignore_ascii_case("pc")
-            || disp_str.eq_ignore_ascii_case("zpc"))
-    {
-        return None;
-    }
-    let (disp_str, forced) = split_displacement_size(disp_str);
-    let disp = evaluate_displacement(disp_str, symbols, pc);
-    Some((xn, Some(disp), scale, is_long, forced))
-}
-
 fn parse_parens_disp_reg_index(
     text: &str,
     symbols: &SymbolTable,
@@ -1358,6 +1348,7 @@ fn parse_memory_indirect(
 
     let mut base_reg: Option<u8> = None;
     let mut base_is_pc = false;
+    let mut zpc = false;
     let mut base_disp: Option<i32> = None;
     let mut bd_forced = None;
     let mut index_reg: Option<u8> = None;
@@ -1371,6 +1362,14 @@ fn parse_memory_indirect(
         }
         if part.eq_ignore_ascii_case("pc") {
             base_is_pc = true;
+            continue;
+        }
+        if part.eq_ignore_ascii_case("zpc") {
+            base_is_pc = true;
+            zpc = true;
+            continue;
+        }
+        if is_suppressed_areg(part) {
             continue;
         }
         if let Some(Operand::AddrReg(n)) = parse_register(part) {
@@ -1443,6 +1442,7 @@ fn parse_memory_indirect(
         is_indirect: true,
         bd_forced,
         od_forced,
+        zpc,
     }))
 }
 
@@ -8397,7 +8397,7 @@ n   SET 10
     }
 
     #[test]
-    fn index_only_and_single_control_register_forms() {
+    fn suppressed_base_and_single_control_register_forms() {
         let cases: &[(&str, &[u8])] = &[
             // Base and displacement both suppressed: BS=1, BD SIZE=01.
             (" move.l (d0.w),d1\n", &[0x22, 0x30, 0x01, 0x90]),
@@ -8406,6 +8406,28 @@ n   SET 10
             (" fmovem.l d1,fpcr\n", &[0xF2, 0x01, 0x90, 0x00]),
             (" fmovem.l fpsr,d2\n", &[0xF2, 0x02, 0xA8, 0x00]),
             (" fmovem.l a2,fpiar\n", &[0xF2, 0x0A, 0x84, 0x00]),
+            // ZPC: mode 7/3 with BS=1; bd is absolute, not PC-relative.
+            (" jmp (zpc,d0.l*4)\n", &[0x4E, 0xFB, 0x0D, 0x90]),
+            (
+                " lea ($10,zpc,d0.w),a0\n",
+                &[0x41, 0xFB, 0x01, 0xA0, 0x00, 0x10],
+            ),
+            (
+                " lea ($1000,zpc),a0\n",
+                &[0x41, 0xFB, 0x01, 0xE0, 0x10, 0x00],
+            ),
+            (
+                " lea ([$10,zpc]),a0\n",
+                &[0x41, 0xFB, 0x01, 0xE1, 0x00, 0x10],
+            ),
+            (
+                " move.l ([zpc],d1.w,4),d2\n",
+                &[0x24, 0x3B, 0x11, 0x96, 0x00, 0x04],
+            ),
+            (
+                " lea ($10,za3,d0.w),a0\n",
+                &[0x41, 0xF0, 0x01, 0xA0, 0x00, 0x10],
+            ),
         ];
         for (src, bytes) in cases {
             assert_eq!(assemble_source_with_cpu(src, "68040"), *bytes, "{src}");
@@ -8417,6 +8439,9 @@ n   SET 10
             (" fmovem.l d1,fpcr/fpsr\n", "68040"),
             (" fmove.l fpcr/fpsr,d1\n", "68040"),
             (" fmovem.l a2,fpcr\n", "68040"),
+            // ZPC is still a program-space mode: never a destination.
+            (" move.l d0,(zpc,d1.w)\n", "68040"),
+            (" jmp (zpc,d0.w)\n", "68000"),
         ] {
             let mut asm = Assembler::new(0);
             asm.set_cpu(cpu);
@@ -8999,14 +9024,13 @@ mymexc MACRO
     }
 
     #[test]
-    fn bit_numbers_overflow_and_zpc_are_rejected() {
+    fn bit_numbers_and_overflow_are_rejected() {
         for (src, cpu) in [
             (" btst #1,#5\n", "68000"),
             (" btst #9,(a0)\n", "68000"),
             (" bset #32,d0\n", "68000"),
             (" dc.l 1<<64\n", "68000"),
             (" dc.l $7fffffffffffffff*2\n", "68000"),
-            (" jmp (zpc,d0.w)\n", "68020"),
         ] {
             let mut asm = Assembler::new(0);
             asm.set_cpu(cpu);

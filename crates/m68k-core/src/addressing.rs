@@ -424,14 +424,13 @@ pub fn decode_full_ea(
         ));
     }
 
-    let base_reg = if !bs {
-        if is_pc {
-            Some("pc".to_string())
-        } else {
-            Some(REG_ADDR[reg as usize].to_string())
-        }
-    } else {
-        None
+    // A suppressed PC stays visible as ZPC: it is still mode 7/3 (program
+    // space, not alterable), unlike a suppressed An, which has no name.
+    let base_reg = match (bs, is_pc) {
+        (false, true) => Some("pc".to_string()),
+        (false, false) => Some(REG_ADDR[reg as usize].to_string()),
+        (true, true) => Some("zpc".to_string()),
+        (true, false) => None,
     };
 
     let index_reg = if !is_suppress {

@@ -96,6 +96,10 @@ pub struct MemoryIndirectOperand {
     pub bd_forced: Option<bool>,
     /// Same for the outer displacement.
     pub od_forced: Option<bool>,
+    /// `ZPC`: PC as base but suppressed (needs `base_is_pc`). Still mode
+    /// 7/3, so program space and not alterable, but `bd` is an absolute
+    /// value, not a target measured from the extension word.
+    pub zpc: bool,
 }
 
 /// Offset or width field of a bitfield operand: either a data register or a constant.

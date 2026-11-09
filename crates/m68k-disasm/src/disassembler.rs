@@ -1283,6 +1283,21 @@ mod tests {
     }
 
     #[test]
+    fn suppressed_pc_is_shown_as_zpc() {
+        // lea ($10,zpc,d0.w),a0: printed without ZPC it would read as the
+        // An-based mode 6 form and reassemble to different bytes.
+        let bytes = vec![0x41, 0xFB, 0x01, 0xA0, 0x00, 0x10];
+        let mut disasm = Disassembler::new(bytes, 0);
+        disasm.set_cpu("68020");
+        let lines = disasm.disassemble();
+        assert!(
+            lines[0].text.contains("($10,zpc,d0.w)"),
+            "{}",
+            lines[0].text
+        );
+    }
+
+    #[test]
     fn quick_constants_are_not_labels() {
         // addq.l #4,d1 / moveq #4,d0 / nop / bra.s to the nop at $4: the
         // label at $4 must not stand in for the constant 4.
