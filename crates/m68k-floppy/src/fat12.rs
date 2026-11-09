@@ -314,13 +314,17 @@ impl<'a> Fat12<'a> {
             .rev()
             .map(|e| (prefix.to_string(), e, 1))
             .collect();
+        // Subdirectory entries that point back at an ancestor's cluster
+        // would be listed again at every level (32 entries per sector make
+        // that exponential), so each directory cluster is entered once.
+        let mut visited = std::collections::HashSet::new();
         while let Some((dir, entry, depth)) = stack.pop() {
             let full = if dir.is_empty() {
                 entry.name.clone()
             } else {
                 format!("{dir}/{}", entry.name)
             };
-            if entry.is_dir && depth < max_depth {
+            if entry.is_dir && depth < max_depth && visited.insert(entry.block) {
                 let children = self.list_dir(entry.block)?;
                 stack.extend(
                     children

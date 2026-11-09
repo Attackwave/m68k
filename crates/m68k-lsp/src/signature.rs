@@ -10,14 +10,15 @@ use crate::document::Document;
 /// Compute signature help for active instruction operands.
 pub fn compute_signature_help(doc: &Document, pos: Position) -> Option<SignatureHelp> {
     let line_idx = pos.line as usize;
-    let char_idx = pos.character as usize;
 
     let line = doc.lines.get(line_idx)?;
-    if line.is_empty() || char_idx > line.len() {
+    if line.is_empty() {
         return None;
     }
 
-    let prefix = &line[..char_idx];
+    // The column counts UTF-16 units, not bytes: slicing with it directly
+    // panicked after any non-ASCII character.
+    let prefix = &line[..crate::document::utf16_col_to_byte(line, pos.character)?];
     let parsed = doc.parsed_lines.get(line_idx)?;
 
     if parsed.mnemonic.is_empty() {

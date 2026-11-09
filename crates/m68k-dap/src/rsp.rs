@@ -19,6 +19,9 @@ pub struct Parser {
     buf: Vec<u8>,
 }
 
+/// Longest packet payload accepted from a stub.
+const MAX_PACKET: usize = 1024 * 1024;
+
 impl Parser {
     pub fn feed(&mut self, bytes: &[u8]) -> Vec<String> {
         self.buf.extend_from_slice(bytes);
@@ -32,6 +35,12 @@ impl Parser {
             // '#' after '$' ends it; two checksum digits follow.
             let Some(hash) = self.buf[start..].iter().position(|&b| b == b'#') else {
                 self.buf.drain(..start);
+                // A stub that never closes a packet must not grow the
+                // buffer forever: no reply comes near this size, so drop
+                // the unterminated packet.
+                if self.buf.len() > MAX_PACKET {
+                    self.buf.clear();
+                }
                 return packets;
             };
             let end = start + hash + 3;
@@ -93,6 +102,17 @@ pub fn send(mut stream: impl Write, payload: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn unterminated_packet_does_not_grow_without_bound() {
+        let mut p = Parser::default();
+        p.feed(b"$");
+        for _ in 0..3 {
+            p.feed(&vec![b'a'; MAX_PACKET / 2]);
+        }
+        assert!(p.buf.len() <= MAX_PACKET);
+        assert_eq!(p.feed(b"$OK#9a"), ["OK"]);
+    }
     use super::*;
 
     #[test]

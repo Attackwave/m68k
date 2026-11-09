@@ -33,64 +33,47 @@ pub fn generate_binary_to(
     generate_binary_from(instructions, end_pc, None)
 }
 
-/// Like [`generate_binary_to`], but `origin` supplies the base address
-/// when there are no instructions at all.
+/// Largest flat image: the 68000's 24-bit address space. Checked before
+/// allocating, since a stray `ORG` would otherwise ask for gigabytes.
+pub const MAX_IMAGE_SIZE: u64 = 16 * 1024 * 1024;
+
+/// Address range `(base, end)` a flat image of `instructions` covers.
+///
+/// It starts at the lowest instruction address or at `start` (the first
+/// byte the program emitted or reserved, so a leading `DS` keeps its
+/// space) and ends at the highest instruction end or `end_pc` (so a
+/// trailing reservation is kept). Measuring from the first instruction
+/// instead dropped everything an `ORG` placed below it.
+pub fn binary_span(
+    instructions: &[AssembledInstruction],
+    end_pc: Option<u32>,
+    start: Option<u32>,
+) -> Option<(u32, u64)> {
+    let base = instructions.iter().map(|i| i.pc).chain(start).min()?;
+    let end = instructions
+        .iter()
+        .map(|i| i.pc as u64 + i.size_bytes() as u64)
+        .chain(end_pc.map(u64::from))
+        .max()
+        .unwrap_or(base as u64)
+        .max(base as u64);
+    Some((base, end))
+}
+
+/// Like [`generate_binary_to`], but `start` is the first address the
+/// program emitted or reserved (see [`binary_span`]).
 ///
 /// A source file holding nothing but `DS`/`DCB` reservations emits no
-/// instruction — it only advances the location counter — so there is no
-/// first instruction to take a base address from, and such a file was
-/// rejected as "no code generated" even though a zero-filled image of
-/// the reserved size is exactly what it asks for. A pure BSS file is
-/// valid input. A file that reserves nothing still returns `None`: there
-/// the emptiness is real, and the caller's error message is right.
+/// instruction, yet a zero-filled image of the reserved size is exactly
+/// what it asks for. A file that reserves nothing returns `None`, as does
+/// an image larger than [`MAX_IMAGE_SIZE`]: check [`binary_span`] first to
+/// report that case.
 pub fn generate_binary_from(
     instructions: &[AssembledInstruction],
     end_pc: Option<u32>,
-    origin: Option<u32>,
+    start: Option<u32>,
 ) -> Option<(Vec<u8>, u32)> {
-    if instructions.is_empty() {
-        // Only reservations: size the image from origin..end_pc.
-        let (base, end) = (origin?, end_pc?);
-        return match end.checked_sub(base) {
-            Some(size) if size > 0 => Some((vec![0u8; size as usize], base)),
-            _ => None,
-        };
-    }
-
-    let base_addr = instructions[0].pc;
-    let last_addr = instructions
-        .iter()
-        .map(|i| i.pc + i.size_bytes() as u32)
-        .chain(end_pc.filter(|pc| *pc >= base_addr))
-        .max()
-        .unwrap_or(base_addr);
-
-    let total_size = (last_addr - base_addr) as usize;
-    let mut bytes = vec![0u8; total_size];
-
-    for instr in instructions {
-        let offset = (instr.pc - base_addr) as usize;
-        // Write byte-wise and stop at the instruction's real length: a
-        // DC.B emitting an odd number of bytes packs its last byte into
-        // the high half of a word, and writing the whole word would
-        // clobber the first byte of whatever follows.
-        let limit = instr.size_bytes();
-        let mut written = 0usize;
-        for word in &instr.words {
-            for b in [(word >> 8) as u8, (word & 0xFF) as u8] {
-                if written >= limit {
-                    break;
-                }
-                let pos = offset + written;
-                if pos < bytes.len() {
-                    bytes[pos] = b;
-                }
-                written += 1;
-            }
-        }
-    }
-
-    Some((bytes, base_addr))
+    fill_image(instructions, end_pc, start, 0)
 }
 
 /// Generate raw binary bytes, filling gaps with a specified padding byte.
@@ -101,40 +84,57 @@ pub fn generate_binary_with_padding(
     if instructions.is_empty() {
         return None;
     }
+    fill_image(instructions, None, None, pad_byte)
+}
 
-    let base_addr = instructions[0].pc;
-    let last_addr = instructions
-        .iter()
-        .map(|i| i.pc + i.size_bytes() as u32)
-        .max()
-        .unwrap_or(base_addr);
+fn fill_image(
+    instructions: &[AssembledInstruction],
+    end_pc: Option<u32>,
+    start: Option<u32>,
+    pad_byte: u8,
+) -> Option<(Vec<u8>, u32)> {
+    let (base, end) = binary_span(instructions, end_pc, start)?;
+    let size = end - base as u64;
+    if size > MAX_IMAGE_SIZE || (instructions.is_empty() && size == 0) {
+        return None;
+    }
+    let mut bytes = vec![pad_byte; size as usize];
+    for (addr, run) in byte_runs(instructions) {
+        let at = (addr - base) as usize;
+        bytes[at..at + run.len()].copy_from_slice(&run);
+    }
+    Some((bytes, base))
+}
 
-    let total_size = (last_addr - base_addr) as usize;
-    let mut bytes = vec![pad_byte; total_size];
-
-    for instr in instructions {
-        let offset = (instr.pc - base_addr) as usize;
-        // Write byte-wise and stop at the instruction's real length: a
-        // DC.B emitting an odd number of bytes packs its last byte into
-        // the high half of a word, and writing the whole word would
-        // clobber the first byte of whatever follows.
-        let limit = instr.size_bytes();
-        let mut written = 0usize;
-        for word in &instr.words {
-            for b in [(word >> 8) as u8, (word & 0xFF) as u8] {
-                if written >= limit {
-                    break;
-                }
-                let pos = offset + written;
-                if pos < bytes.len() {
-                    bytes[pos] = b;
-                }
-                written += 1;
+/// The bytes each instruction really emits, merged into contiguous runs
+/// ordered by address.
+///
+/// Record formats describe only the bytes that were written: a gap between
+/// ORG blocks must not turn into zero records a programmer would burn, an
+/// odd-length `DC.B` must not emit its padding byte, and an ORG that moves
+/// backwards must not be measured from the first instruction's address.
+fn byte_runs(instructions: &[AssembledInstruction]) -> Vec<(u32, Vec<u8>)> {
+    let mut sorted: Vec<&AssembledInstruction> = instructions.iter().collect();
+    sorted.sort_by_key(|i| i.pc); // stable: source order among equal addresses
+    let mut runs: Vec<(u32, Vec<u8>)> = Vec::new();
+    for instr in sorted {
+        let bytes: Vec<u8> = instr
+            .words
+            .iter()
+            .flat_map(|w| w.to_be_bytes())
+            .take(instr.size_bytes())
+            .collect();
+        if bytes.is_empty() {
+            continue;
+        }
+        match runs.last_mut() {
+            Some((start, run)) if *start as u64 + run.len() as u64 == instr.pc as u64 => {
+                run.extend_from_slice(&bytes)
             }
+            _ => runs.push((instr.pc, bytes)),
         }
     }
-
-    Some((bytes, base_addr))
+    runs
 }
 
 // ---------------------------------------------------------------------------
@@ -192,19 +192,14 @@ impl SRecordWriter {
     /// Uses S1 (16-bit addresses) if all addresses fit in 16 bits,
     /// otherwise S2 (24-bit) or S3 (32-bit).
     pub fn add_instructions(&mut self, instructions: &[AssembledInstruction]) {
-        if instructions.is_empty() {
-            return;
-        }
-
-        // Determine max address to choose record type. The `is_empty()`
-        // guard above means the iterator always yields at least one element,
-        // so the fallback is unreachable rather than a masked empty case.
-        let max_addr = instructions
+        let runs = byte_runs(instructions);
+        let Some(max_addr) = runs
             .iter()
-            .map(|i| i.pc + i.size_bytes() as u32 - 1)
+            .map(|(a, r)| (*a as u64 + r.len() as u64 - 1).min(u32::MAX as u64) as u32)
             .max()
-            .unwrap_or(0);
-
+        else {
+            return;
+        };
         self.max_addr = max_addr;
 
         let record_type = if max_addr <= 0xFFFF {
@@ -215,68 +210,37 @@ impl SRecordWriter {
             SRecType::S3
         };
 
-        // Build linear byte array
-        let base_addr = instructions[0].pc;
-        let end_addr = max_addr + 1;
-        let mut mem = vec![0u8; (end_addr - base_addr) as usize];
-
-        for instr in instructions {
-            let offset = (instr.pc - base_addr) as usize;
-            let mut pos = offset;
-            for word in &instr.words {
-                mem[pos] = (word >> 8) as u8;
-                mem[pos + 1] = (word & 0xFF) as u8;
-                pos += 2;
-            }
-        }
-
-        // Split into records of max 32 bytes of data per record
+        // Records of at most 32 data bytes, covering only written bytes.
         const MAX_DATA_PER_RECORD: usize = 32;
-        let mut offset: usize = 0;
-        while offset < mem.len() {
-            let chunk_size = MAX_DATA_PER_RECORD.min(mem.len() - offset);
-            let chunk = &mem[offset..offset + chunk_size];
-            let addr = base_addr + offset as u32;
-
-            let record = encode_srec(record_type, addr, chunk);
-            self.records.push(record);
-            offset += chunk_size;
+        for (base_addr, mem) in &runs {
+            for (i, chunk) in mem.chunks(MAX_DATA_PER_RECORD).enumerate() {
+                let addr = base_addr.wrapping_add((i * MAX_DATA_PER_RECORD) as u32);
+                self.records.push(encode_srec(record_type, addr, chunk));
+            }
         }
     }
 
-    /// Add S9 termination record with start address.
+    /// Add the termination record with the start address: S9, S8 or S7,
+    /// matching the S1, S2 or S3 data records, since the address width of a
+    /// termination record is fixed by its type.
     pub fn termination(&mut self, start_addr: u32) {
-        let record = if self.max_addr <= 0xFFFF {
-            let addr = (start_addr & 0xFFFF) as u16;
-            let byte_count = 3u8;
-            let checksum =
-                (0x100 - ((byte_count as u16 + (addr >> 8) + (addr & 0xFF)) & 0xFF)) as u8;
-            format!("S9{:02X}{:04X}{:02X}", byte_count, addr, checksum)
+        let (kind, addr_len) = if self.max_addr <= 0xFFFF {
+            ('9', 2)
         } else if self.max_addr <= 0xFFFFFF {
-            let b0 = ((start_addr >> 16) & 0xFF) as u8;
-            let b1 = ((start_addr >> 8) & 0xFF) as u8;
-            let b2 = (start_addr & 0xFF) as u8;
-            let byte_count = 4u8;
-            let checksum =
-                (0x100 - ((byte_count as u16 + b0 as u16 + b1 as u16 + b2 as u16) & 0xFF)) as u8;
-            format!(
-                "S9{:02X}{:02X}{:02X}{:02X}{:02X}",
-                byte_count, b0, b1, b2, checksum
-            )
+            ('8', 3)
         } else {
-            let b0 = ((start_addr >> 24) & 0xFF) as u8;
-            let b1 = ((start_addr >> 16) & 0xFF) as u8;
-            let b2 = ((start_addr >> 8) & 0xFF) as u8;
-            let b3 = (start_addr & 0xFF) as u8;
-            let byte_count = 5u8;
-            let checksum = (0x100
-                - ((byte_count as u16 + b0 as u16 + b1 as u16 + b2 as u16 + b3 as u16) & 0xFF))
-                as u8;
-            format!(
-                "S9{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
-                byte_count, b0, b1, b2, b3, checksum
-            )
+            ('7', 4)
         };
+        let addr = &start_addr.to_be_bytes()[4 - addr_len..];
+        let byte_count = (addr_len + 1) as u8;
+        let mut record = format!("S{kind}{byte_count:02X}");
+        for b in addr {
+            record.push_str(&format!("{b:02X}"));
+        }
+        record.push_str(&format!(
+            "{:02X}",
+            compute_checksum_srec(byte_count, 0, addr)
+        ));
         self.records.push(record);
     }
 
@@ -416,68 +380,38 @@ impl IntelHexWriter {
     }
 
     /// Add data records from assembled instructions.
+    ///
+    /// Only written bytes are emitted, and no record crosses a 64 KB
+    /// boundary: a record's address is 16 bits within the current
+    /// extended-linear segment, so a reader would wrap the excess bytes
+    /// back to the start of the segment.
     pub fn add_instructions(&mut self, instructions: &[AssembledInstruction]) {
-        if instructions.is_empty() {
-            return;
-        }
-
-        // Build linear byte array
-        let base_addr = instructions[0].pc;
-        let last_addr = instructions
-            .iter()
-            .map(|i| i.pc + i.size_bytes() as u32)
-            .max()
-            .unwrap_or(base_addr);
-
-        let total_size = (last_addr - base_addr) as usize;
-        let mut mem = vec![0u8; total_size];
-
-        for instr in instructions {
-            let offset = (instr.pc - base_addr) as usize;
-            let mut pos = offset;
-            for word in &instr.words {
-                mem[pos] = (word >> 8) as u8;
-                mem[pos + 1] = (word & 0xFF) as u8;
-                pos += 2;
-            }
-        }
-
-        // Split into 16-byte chunks (standard Intel Hex record size)
         const MAX_DATA_PER_RECORD: usize = 16;
-        let mut offset: usize = 0;
-        while offset < mem.len() {
-            let chunk_size = MAX_DATA_PER_RECORD.min(mem.len() - offset);
-            let addr = base_addr + offset as u32;
+        for (base_addr, mem) in byte_runs(instructions) {
+            let mut offset = 0usize;
+            while offset < mem.len() {
+                let addr = base_addr.wrapping_add(offset as u32);
+                let to_boundary = 0x1_0000 - (addr & 0xFFFF) as usize;
+                let chunk_size = MAX_DATA_PER_RECORD.min(mem.len() - offset).min(to_boundary);
 
-            // Check if we need an extended address record
-            let extended_addr = (addr >> 16) & 0xFFFF;
-            if extended_addr != self.current_extended_addr {
-                self.current_extended_addr = extended_addr;
-                // Type-04 (Extended Linear Address) record layout:
-                // byte_count=0x02, address field=0x0000 (unused/reserved
-                // for this record type), record_type=0x04, and the ULBA
-                // itself is the record's 2-byte *data* payload — not part
-                // of the address field. Previously the ULBA was passed as
-                // `compute_hex_checksum`'s `address` parameter with an
-                // empty data slice, so the checksum never covered the
-                // ULBA bytes actually written into the record string,
-                // producing a record whose checksum doesn't match a
-                // standards-conformant reader's recomputation.
-                let ulba_bytes = [(extended_addr >> 8) as u8, (extended_addr & 0xFF) as u8];
-                let record = format!(
-                    ":02000004{:04X}{:02X}",
-                    extended_addr,
-                    compute_hex_checksum(0x02, 0x0000, 0x04, &ulba_bytes)
-                );
-                self.records.push(record);
+                let extended_addr = (addr >> 16) & 0xFFFF;
+                if extended_addr != self.current_extended_addr {
+                    self.current_extended_addr = extended_addr;
+                    // Type-04 record: the ULBA is the 2-byte data payload,
+                    // and the checksum must cover it.
+                    let ulba_bytes = [(extended_addr >> 8) as u8, (extended_addr & 0xFF) as u8];
+                    self.records.push(format!(
+                        ":02000004{:04X}{:02X}",
+                        extended_addr,
+                        compute_hex_checksum(0x02, 0x0000, 0x04, &ulba_bytes)
+                    ));
+                }
+
+                let chunk = &mem[offset..offset + chunk_size];
+                self.records
+                    .push(encode_hex_data((addr & 0xFFFF) as u16, chunk));
+                offset += chunk_size;
             }
-
-            let chunk = &mem[offset..offset + chunk_size];
-            let record_addr = (addr & 0xFFFF) as u16;
-            let record = encode_hex_data(record_addr, chunk);
-            self.records.push(record);
-
-            offset += chunk_size;
         }
     }
 
@@ -1353,5 +1287,81 @@ mod rom_tests {
         assert_eq!(&rom[0x18E..0x190], &[0x12, 0x33]);
         assert!(apply_megadrive_checksum(&mut vec![0u8; 0x100]).is_err());
         assert!(apply_megadrive_checksum(&mut vec![0u8; 0x201]).is_err());
+    }
+
+    fn assemble(src: &str) -> crate::assembler::Assembler {
+        let mut asm = crate::assembler::Assembler::new(0);
+        asm.assemble(src).expect("assembles");
+        asm
+    }
+
+    #[test]
+    fn record_formats_emit_exact_bytes_in_address_order() {
+        // An odd-length DC.B and an ORG that moves backwards used to index
+        // past the end of the record buffer.
+        let asm = assemble(" org $100\n nop\n org 0\n dc.b 1\n");
+        let srec = generate_srecord(&asm.code, "t");
+        let data: Vec<&str> = srec.lines().filter(|l| l.starts_with("S1")).collect();
+        assert_eq!(data, ["S104000001FA", "S10501004E713A"]);
+        assert!(srec.ends_with("S9030100FB"), "{srec}");
+        let hex = generate_intel_hex(&asm.code);
+        assert!(hex.contains(":0100000001FE"), "{hex}");
+        assert!(hex.contains(":020100004E713E"), "{hex}");
+    }
+
+    #[test]
+    fn srecord_gap_is_not_filled_and_terminator_matches_width() {
+        let asm = assemble(" org $10\n nop\n org $12340\n nop\n");
+        let srec = generate_srecord(&asm.code, "t");
+        assert_eq!(srec.lines().count(), 4, "{srec}"); // S0, two S2, S8
+        assert!(
+            srec.lines().last().unwrap().starts_with("S804000010"),
+            "{srec}"
+        );
+    }
+
+    #[test]
+    fn intel_hex_records_stop_at_64k_boundaries() {
+        let asm = assemble(" org $fff8\n dcb.b 20,$aa\n");
+        let hex = generate_intel_hex(&asm.code);
+        assert!(hex.contains(":08FFF800"), "{hex}");
+        assert!(hex.contains(":020000040001F9"), "{hex}");
+        assert!(hex.contains(":0C000000"), "{hex}");
+    }
+
+    #[test]
+    fn binary_starts_at_the_lowest_emitted_or_reserved_address() {
+        let asm = assemble(" org $100\n nop\n org 0\n dc.w $1111\n");
+        let (bytes, base) =
+            generate_binary_from(&asm.code, Some(asm.end_pc()), asm.image_start()).unwrap();
+        assert_eq!(base, 0);
+        assert_eq!(&bytes[..2], &[0x11, 0x11]);
+        assert_eq!(&bytes[0x100..], &[0x4E, 0x71]);
+
+        let asm = assemble(" ds.b 2\nl: dc.w l\n");
+        let (bytes, _) =
+            generate_binary_from(&asm.code, Some(asm.end_pc()), asm.image_start()).unwrap();
+        assert_eq!(bytes, [0, 0, 0, 2]);
+
+        let asm = assemble(" org $1000\n nop\n");
+        let (bytes, base) =
+            generate_binary_from(&asm.code, Some(asm.end_pc()), asm.image_start()).unwrap();
+        assert_eq!((bytes.len(), base), (2, 0x1000));
+    }
+
+    #[test]
+    fn oversized_reservations_are_errors_not_allocations() {
+        for src in [
+            " ds.b -1\n",
+            " dcb.b $7fffffff,0\n",
+            " org $ffffff00\n ds.b $200\n",
+        ] {
+            let mut asm = crate::assembler::Assembler::new(0);
+            assert!(asm.assemble(src).is_err(), "{src}");
+        }
+        let asm = assemble(" nop\n org $2000000\n nop\n");
+        let (base, end) = binary_span(&asm.code, Some(asm.end_pc()), asm.image_start()).unwrap();
+        assert!(end - base as u64 > MAX_IMAGE_SIZE);
+        assert!(generate_binary_from(&asm.code, Some(asm.end_pc()), asm.image_start()).is_none());
     }
 }

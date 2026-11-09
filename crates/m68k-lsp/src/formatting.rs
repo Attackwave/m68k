@@ -36,7 +36,8 @@ impl Default for AsmFormatConfig {
 /// Compute document formatting edits.
 pub fn compute_formatting(doc: &Document, options: &FormattingOptions) -> Vec<TextEdit> {
     let config = AsmFormatConfig {
-        indent_spaces: options.tab_size as usize,
+        // Client-supplied; an absurd width would size the indent string.
+        indent_spaces: options.tab_size.min(32) as usize,
         ..Default::default()
     };
 

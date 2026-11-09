@@ -455,10 +455,7 @@ fn run(args: Args) -> Result<(), String> {
             // Reject path components that would escape the destination
             // directory. AmigaDOS names can legally contain characters
             // that mean something else to the host filesystem.
-            if full_path
-                .split('/')
-                .any(|c| c == "." || c == ".." || c.contains('\\'))
-            {
+            if !is_safe_relative_path(&full_path) {
                 eprintln!("skipping unsafe path: {}", full_path);
                 continue;
             }
@@ -490,10 +487,35 @@ fn run(args: Args) -> Result<(), String> {
     Ok(())
 }
 
+/// True when `path` is a plain relative path whose every component is a
+/// normal name, so joining it onto a destination directory cannot escape it.
+/// Empty components (a leading `/` or `//`), `.`, `..`, and characters that
+/// carry meaning on some host (`\\`, `:`, NUL) are refused.
+fn is_safe_relative_path(path: &str) -> bool {
+    path.split('/')
+        .all(|c| !c.is_empty() && c != "." && c != ".." && !c.contains(['\\', ':', '\0']))
+}
+
 fn main() {
     let args = Args::parse();
     if let Err(e) = run(args) {
         eprintln!("Error: {}", e);
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_safe_relative_path;
+
+    #[test]
+    fn extraction_paths_stay_inside_the_destination() {
+        assert!(is_safe_relative_path("s/Startup-Sequence"));
+        assert!(is_safe_relative_path("a b.txt"));
+        for bad in [
+            "/tmp/x", "a//b", "a/", "", ".", "..", "a/../b", "c:\\x", "x:y", "a\0b",
+        ] {
+            assert!(!is_safe_relative_path(bad), "{bad:?}");
+        }
     }
 }

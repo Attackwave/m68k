@@ -149,7 +149,15 @@ impl StBackend {
         let sectors_per_track = word(2);
         let sides = word(4) + 1;
         let (first, last) = (word(6), word(8));
-        if sectors_per_track == 0 || sides > 2 || last < first {
+        // Bounds of real Atari disks (ED: 36 sectors, at most 86 tracks).
+        // The image is preallocated from these fields, so an unchecked
+        // header could ask for terabytes.
+        if sectors_per_track == 0
+            || sectors_per_track > 36
+            || sides > 2
+            || last < first
+            || last > 85
+        {
             return Err(FloppyError::new("MSA header describes an impossible disk"));
         }
         let track_len = sectors_per_track as usize * SECTOR_SIZE;
@@ -181,9 +189,23 @@ impl StBackend {
                                 .ok_or_else(|| {
                                     FloppyError::new("MSA run marker at the end of a track")
                                 })?;
-                            image.resize(image.len() + u16::from_be_bytes([hi, lo]) as usize, byte);
+                            let run = u16::from_be_bytes([hi, lo]) as usize;
+                            // Checked per run: a track of nothing but runs
+                            // would otherwise expand 16384-fold before the
+                            // length check after the loop.
+                            if image.len() - start + run > track_len {
+                                return Err(FloppyError::new(
+                                    "MSA track decompresses past its length",
+                                ));
+                            }
+                            image.resize(image.len() + run, byte);
                             k += 4;
                         } else {
+                            if image.len() - start >= track_len {
+                                return Err(FloppyError::new(
+                                    "MSA track decompresses past its length",
+                                ));
+                            }
                             image.push(track[k]);
                             k += 1;
                         }
@@ -232,6 +254,25 @@ impl FloppyImageReader for StBackend {
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    #[test]
+    fn msa_header_and_runs_cannot_force_huge_allocations() {
+        let header = |spt: u16, last: u16| {
+            let mut h = vec![0x0E, 0x0F];
+            for w in [spt, 0, 0, last] {
+                h.extend_from_slice(&w.to_be_bytes());
+            }
+            h
+        };
+        assert!(StBackend::from_msa(&header(0xFFFF, 0xFFFF)).is_err());
+        assert!(StBackend::from_msa(&header(9, 200)).is_err());
+        // One track of 9 sectors whose runs expand far past 4608 bytes.
+        let mut msa = header(9, 0);
+        let runs: Vec<u8> = (0..64).flat_map(|_| [0xE5, 0x00, 0xFF, 0xFF]).collect();
+        msa.extend_from_slice(&(runs.len() as u16).to_be_bytes());
+        msa.extend_from_slice(&runs);
+        assert!(StBackend::from_msa(&msa).is_err());
+    }
     use super::*;
 
     /// A boot sector whose BPB describes `spt` sectors per track on

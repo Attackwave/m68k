@@ -719,6 +719,94 @@ pub fn handle_org(
     Ok(DirectiveResult::with_pc(addr))
 }
 
+/// Largest source file INCLUDE reads.
+const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read an included source file, refusing anything that is not a regular
+/// file or is implausibly large: `/dev/zero` or a FIFO would otherwise be
+/// read until memory runs out.
+pub fn read_source_file(path: &Path) -> std::io::Result<String> {
+    use std::io::{Error, ErrorKind, Read};
+    let file = fs::File::open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "not a regular file"));
+    }
+    if meta.len() > MAX_SOURCE_BYTES {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            format!("larger than {MAX_SOURCE_BYTES} bytes"),
+        ));
+    }
+    let mut text = String::with_capacity(meta.len() as usize);
+    file.take(MAX_SOURCE_BYTES).read_to_string(&mut text)?;
+    Ok(text)
+}
+
+/// Largest INCBIN block: the 68000's 24-bit address space.
+const MAX_INCBIN_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Resolve an INCBIN line to the file and the byte range it embeds,
+/// without reading the data.
+///
+/// The size comes from the file's metadata, so a device such as
+/// `/dev/zero` or a huge file is refused instead of being read whole into
+/// memory, and a negative or out-of-range offset or length is an error
+/// instead of a panic on the slice.
+fn incbin_range(
+    args: &[String],
+    symbols: &SymbolTable,
+    pc: u32,
+    source_root: &Path,
+    include_paths: &[PathBuf],
+    line_no: usize,
+) -> Result<(PathBuf, u64, u64), AsmError> {
+    if args.is_empty() {
+        return Err(AsmError::with_line("INCBIN requires a filename", line_no));
+    }
+    let filename = strip_quotes(&args[0]);
+    // Searched like INCLUDE: next to the source, then each -I directory.
+    let path = resolve_include_path_in(filename, source_root, include_paths)?;
+    let cannot = |e: &dyn std::fmt::Display| {
+        AsmError::with_line(
+            format!("cannot read file '{}': {}", path.display(), e),
+            line_no,
+        )
+    };
+    let meta = fs::metadata(&path).map_err(|e| cannot(&e))?;
+    if !meta.is_file() {
+        return Err(cannot(&"not a regular file"));
+    }
+    let file_len = meta.len();
+
+    let value = |idx: usize, what: &str| -> Result<Option<u64>, AsmError> {
+        let Some(text) = args.get(idx) else {
+            return Ok(None);
+        };
+        let v = parse_simple_expr(text, symbols, pc)
+            .map_err(|e| AsmError::with_line(format!("invalid INCBIN {what}: {e}"), line_no))?;
+        u64::try_from(v)
+            .map(Some)
+            .map_err(|_| AsmError::with_line(format!("INCBIN {what} {v} is negative"), line_no))
+    };
+    let offset = value(1, "offset")?.unwrap_or(0);
+    if offset > file_len {
+        return Err(AsmError::with_line(
+            format!("INCBIN offset {offset} is past the end of the {file_len}-byte file"),
+            line_no,
+        ));
+    }
+    let available = file_len - offset;
+    let length = value(2, "length")?.map_or(available, |l| l.min(available));
+    if length > MAX_INCBIN_BYTES {
+        return Err(AsmError::with_line(
+            format!("INCBIN of {length} bytes exceeds the {MAX_INCBIN_BYTES}-byte limit"),
+            line_no,
+        ));
+    }
+    Ok((path, offset, length))
+}
+
 /// Handle INCBIN directive in pass 1.
 ///
 /// Syntax: `INCBIN "filename"[, offset[, length]]`
@@ -726,47 +814,14 @@ pub fn handle_org(
 pub fn handle_incbin_pass1(
     args: &[String],
     symbols: &SymbolTable,
-    _pc: u32,
+    pc: u32,
     source_root: &Path,
     include_paths: &[PathBuf],
     line_no: usize,
 ) -> Result<DirectiveResult, AsmError> {
-    if args.is_empty() {
-        return Err(AsmError::with_line("INCBIN requires a filename", line_no));
-    }
-
-    let filename = strip_quotes(&args[0]);
-    // Searched like INCLUDE: next to the source, then each -I directory.
-    let path = resolve_include_path_in(filename, source_root, include_paths)?;
-
-    let data = fs::read(&path).map_err(|e| {
-        AsmError::with_line(
-            format!("cannot read file '{}': {}", path.display(), e),
-            line_no,
-        )
-    })?;
-
-    let offset = if args.len() > 1 {
-        parse_simple_expr(&args[1], symbols, _pc)
-            .map_err(|e| AsmError::with_line(format!("invalid INCBIN offset: {}", e), line_no))?
-            as usize
-    } else {
-        0
-    };
-
-    let length = if args.len() > 2 {
-        parse_simple_expr(&args[2], symbols, _pc)
-            .map_err(|e| AsmError::with_line(format!("invalid INCBIN length: {}", e), line_no))?
-            as usize
-    } else {
-        data.len().saturating_sub(offset)
-    };
-
-    let actual_len = length.min(data.len().saturating_sub(offset));
+    let (_, _, length) = incbin_range(args, symbols, pc, source_root, include_paths, line_no)?;
     // Round up to even
-    let bytes = ((actual_len + 1) & !1) as u32;
-
-    Ok(DirectiveResult::with_bytes(bytes))
+    Ok(DirectiveResult::with_bytes(((length + 1) & !1) as u32))
 }
 
 /// Handle INCBIN in pass 2 - emit the actual binary data.
@@ -779,38 +834,26 @@ pub fn handle_incbin_pass2(
     line_no: usize,
     source: &str,
 ) -> Result<(DirectiveResult, Option<AssembledInstruction>), AsmError> {
-    if args.is_empty() {
-        return Err(AsmError::with_line("INCBIN requires a filename", line_no));
-    }
-
-    let filename = strip_quotes(&args[0]);
-    let path = resolve_include_path_in(filename, source_root, include_paths)?;
-
-    let data = fs::read(&path).map_err(|e| {
+    use std::io::{Read, Seek, SeekFrom};
+    let (path, offset, length) =
+        incbin_range(args, symbols, pc, source_root, include_paths, line_no)?;
+    let cannot = |e: std::io::Error| {
         AsmError::with_line(
             format!("cannot read file '{}': {}", path.display(), e),
             line_no,
         )
-    })?;
-
-    let offset = if args.len() > 1 {
-        parse_simple_expr(&args[1], symbols, pc)
-            .map_err(|e| AsmError::with_line(format!("invalid INCBIN offset: {}", e), line_no))?
-            as usize
-    } else {
-        0
     };
-
-    let length = if args.len() > 2 {
-        parse_simple_expr(&args[2], symbols, pc)
-            .map_err(|e| AsmError::with_line(format!("invalid INCBIN length: {}", e), line_no))?
-            as usize
-    } else {
-        data.len().saturating_sub(offset)
-    };
-
-    let actual_len = length.min(data.len().saturating_sub(offset));
-    let sliced = &data[offset..offset + actual_len];
+    let mut file = fs::File::open(&path).map_err(cannot)?;
+    file.seek(SeekFrom::Start(offset)).map_err(cannot)?;
+    let mut sliced = Vec::with_capacity(length as usize);
+    file.take(length).read_to_end(&mut sliced).map_err(cannot)?;
+    if sliced.len() as u64 != length {
+        // The file shrank between the passes; pass 1's size would be wrong.
+        return Err(AsmError::with_line(
+            format!("file '{}' changed while assembling", path.display()),
+            line_no,
+        ));
+    }
 
     // Convert bytes to words (big-endian), padding with 0 if odd
     let mut words = Vec::new();
@@ -875,7 +918,7 @@ pub fn handle_include_in(
         ));
     }
 
-    let content = fs::read_to_string(&path).map_err(|e| {
+    let content = read_source_file(&path).map_err(|e| {
         AsmError::with_line(
             format!("cannot read file '{}': {}", path.display(), e),
             line_no,

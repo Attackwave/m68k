@@ -1312,6 +1312,48 @@ mod tests {
     }
 
     #[test]
+    fn self_referencing_directory_is_walked_once() {
+        use crate::amigados::AmigaFs;
+        use crate::floppy_base::{FloppyError as FE, FloppyImageReader};
+        struct Mem<'a>(&'a [u8]);
+        impl FloppyImageReader for Mem<'_> {
+            fn read_sector(&mut self, track: u32, side: u32, sector: u32) -> Result<Vec<u8>, FE> {
+                let off = ((track * 2 + side) * 11 + sector) as usize * BLOCK_SIZE;
+                self.0
+                    .get(off..off + BLOCK_SIZE)
+                    .map(|s| s.to_vec())
+                    .ok_or_else(|| FE::new("out of range"))
+            }
+        }
+        let mut image = format_empty_ofs_disk("TestDisk").unwrap();
+        AmigaFsWriter::mount(&mut image)
+            .unwrap()
+            .create_dir("C")
+            .unwrap();
+        let dir = {
+            let mut mem = Mem(&image);
+            let mut fs = AmigaFs::mount(&mut mem, 80).unwrap();
+            let root = fs.root_block_num();
+            fs.list_dir(root).unwrap()[0].block
+        };
+        // Corrupt C: every hash bucket points back at C itself.
+        let block = &mut image[dir as usize * BLOCK_SIZE..][..BLOCK_SIZE];
+        for bucket in 0..72 {
+            block[24 + bucket * 4..][..4].copy_from_slice(&dir.to_be_bytes());
+        }
+        block[20..24].fill(0);
+        let sum = block.chunks(4).fold(0u32, |a, c| {
+            a.wrapping_add(u32::from_be_bytes(c.try_into().unwrap()))
+        });
+        block[20..24].copy_from_slice(&0u32.wrapping_sub(sum).to_be_bytes());
+
+        let mut mem = Mem(&image);
+        let mut fs = AmigaFs::mount(&mut mem, 80).unwrap();
+        let entries = fs.walk("", 64).unwrap();
+        assert!(entries.len() < 200, "{} entries", entries.len());
+    }
+
+    #[test]
     fn non_empty_directory_cannot_be_deleted() {
         // Removing it anyway would orphan the contents: blocks still marked
         // used, nothing pointing at them.

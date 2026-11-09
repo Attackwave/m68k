@@ -347,8 +347,9 @@ impl<'a> AmigaFs<'a> {
     /// Recursively walk the filesystem from `path`, returning every file
     /// and directory found, each with its full slash-separated path.
     ///
-    /// Directory entries are included alongside files. Cycles caused by a
-    /// corrupt image are bounded by `max_depth`.
+    /// Directory entries are included alongside files. A corrupt image's
+    /// directory cycles are cut by entering every directory block once, and
+    /// nesting is bounded by `max_depth`.
     pub fn walk(
         &mut self,
         path: &str,
@@ -362,6 +363,10 @@ impl<'a> AmigaFs<'a> {
 
         let base = path.trim_matches('/').to_string();
         let mut out = Vec::new();
+        // A corrupt directory whose hash chains point back at itself or an
+        // ancestor would be listed again at every level: with 72 buckets
+        // that is 72^depth entries, so each directory is entered once.
+        let mut visited = std::collections::HashSet::from([start.block]);
         let mut stack = vec![(base, start.block, 0usize)];
         while let Some((prefix, block, depth)) = stack.pop() {
             for entry in self.list_dir(block)? {
@@ -370,7 +375,7 @@ impl<'a> AmigaFs<'a> {
                 } else {
                     format!("{}/{}", prefix, entry.name)
                 };
-                if entry.is_dir && depth < max_depth {
+                if entry.is_dir && depth < max_depth && visited.insert(entry.block) {
                     stack.push((full.clone(), entry.block, depth + 1));
                 }
                 out.push((full, entry));
