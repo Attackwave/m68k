@@ -1683,6 +1683,29 @@ fn absolute_short_value(value: i64) -> i32 {
     (value as u64 & 0xFFFF) as u16 as i16 as i32
 }
 
+/// Most lines macro and REPT/IRP/IRPC expansion may produce.
+const MAX_EXPANDED_LINES: usize = 2 * 1024 * 1024;
+
+/// Largest block `DCB` fills: the whole 24-bit address space. The bytes
+/// are materialised, so an unchecked count would drive a multi-gigabyte
+/// allocation before any output-size check could run.
+const MAX_DCB_BYTES: u32 = 16 * 1024 * 1024;
+
+/// Evaluate the element count of `DS`/`DCB`. A negative count used to be
+/// cast to a huge unsigned one.
+fn reservation_count(
+    expr: &str,
+    symbols: &SymbolTable,
+    pc: u32,
+    line_no: usize,
+    what: &str,
+) -> Result<u32, AsmError> {
+    let value = evaluate_expr_str(expr, symbols, pc)
+        .map_err(|e| AsmError::with_line(e.message, line_no))?;
+    u32::try_from(value)
+        .map_err(|_| AsmError::with_line(format!("{what} count {value} is out of range"), line_no))
+}
+
 /// Evaluate an expression string using the symbol table.
 fn evaluate_expr_str(text: &str, symbols: &SymbolTable, pc: u32) -> Result<i64, AsmError> {
     let text = text.trim();
@@ -1864,6 +1887,9 @@ pub struct Assembler {
     pub symbols: SymbolTable,
     /// Encoded instructions from pass 2.
     pub code: Vec<AssembledInstruction>,
+    /// Address of the first byte pass 2 emitted or reserved; see
+    /// [`Self::image_start`].
+    image_start: Option<u32>,
     /// Branch info for relaxation.
     pub branches: Vec<BranchInfo>,
     /// CPU target (e.g., "68000", "68010", "68020").
@@ -2059,6 +2085,7 @@ impl Assembler {
             origin,
             symbols: SymbolTable::new(),
             code: Vec::new(),
+            image_start: None,
             branches: Vec::new(),
             cpu: "68000".to_string(),
             errors: ErrorCollector::new(),
@@ -2094,6 +2121,7 @@ impl Assembler {
     /// after every push rather than incremented separately.
     fn push_instruction(&mut self, instr: AssembledInstruction) {
         let size = instr.size_bytes() as u32;
+        self.image_start.get_or_insert(instr.pc);
         self.sections.add_instruction(instr.clone());
         self.code.push(instr);
         self.sections.set_current_pc(self.pc + size);
@@ -2339,6 +2367,15 @@ impl Assembler {
         self.origin
     }
 
+    /// Address of the first byte the program emits or reserves.
+    ///
+    /// A flat image starts here rather than at the first instruction, so a
+    /// leading `DS` keeps its space, and rather than at [`Self::origin`],
+    /// which a later `ORG` leaves behind. `None` when nothing was emitted.
+    pub fn image_start(&self) -> Option<u32> {
+        self.image_start
+    }
+
     /// Location counter after the last assembled line.
     ///
     /// Needed to size binary output, since a trailing `DS`/`DCB` only
@@ -2402,8 +2439,10 @@ impl Assembler {
     /// function disagree with the CLI on any source containing byte data.
     pub fn assemble_bytes(&mut self, source: &str) -> Result<Vec<u8>, AsmError> {
         self.assemble(source)?;
-        Ok(crate::output::generate_binary_to(&self.code, Some(self.pc))
-            .map_or_else(Vec::new, |(bytes, _)| bytes))
+        Ok(
+            crate::output::generate_binary_from(&self.code, Some(self.pc), self.image_start)
+                .map_or_else(Vec::new, |(bytes, _)| bytes),
+        )
     }
 
     /// Pre-process macros: collect definitions and expand invocations.
@@ -2449,10 +2488,9 @@ impl Assembler {
     }
 
     /// Single pass of macro/REPT/IRP/IRPC expansion. Returns the expanded
-    /// source and whether any macro invocation (not REPT/IRP/IRPC, which
-    /// don't need a further pass since they don't introduce new macro
-    /// definitions) was expanded, so the caller knows whether another pass
-    /// could find newly-exposed invocations.
+    /// source and whether anything was expanded, so the caller knows
+    /// whether another pass could find newly exposed invocations: a macro
+    /// body or a REPT/IRP/IRPC body can hold a nested REPT or a macro call.
     fn macro_preprocess_pass(&mut self, source: &str) -> (String, bool) {
         let mut any_macro_invoked = false;
         let mut output = Vec::new();
@@ -2465,6 +2503,19 @@ impl Assembler {
         let mut trace: Vec<(usize, Option<String>)> = Vec::new();
 
         while i < lines.len() {
+            // A macro that invokes itself twice doubles the text every
+            // pass, and a REPT count is unbounded: stop before that
+            // exhausts memory.
+            if output.len() > MAX_EXPANDED_LINES {
+                self.errors.error(
+                    format!(
+                        "macro/REPT expansion exceeds {MAX_EXPANDED_LINES} lines \
+                         (runaway recursion or repeat count)"
+                    ),
+                    Some(i + 1),
+                );
+                return (String::new(), false);
+            }
             let raw = lines[i];
             // Check for MACRO definition via proper parsing
             let (lbl1, mnemonic1, _, operands1) = split_line(raw);
@@ -2588,12 +2639,22 @@ impl Assembler {
                     trace.push((repeat_line, None));
                 }
 
+                if count.saturating_mul(body.len()) > MAX_EXPANDED_LINES {
+                    self.errors.error(
+                        format!("REPT {count} expands to more than {MAX_EXPANDED_LINES} lines"),
+                        Some(repeat_line + 1),
+                    );
+                    continue;
+                }
                 for _ in 0..count {
                     for (line, input_line) in &body {
                         output.push(line.clone());
                         trace.push((*input_line, None));
                     }
                 }
+                // The body may hold a nested REPT/IRP or a macro call,
+                // which only the next pass expands.
+                any_macro_invoked |= count > 0;
                 continue;
             }
 
@@ -2638,6 +2699,7 @@ impl Assembler {
                         trace.push((*input_line, None));
                     }
                 }
+                any_macro_invoked |= !values.is_empty();
                 continue;
             }
 
@@ -2682,6 +2744,7 @@ impl Assembler {
                         trace.push((*input_line, None));
                     }
                 }
+                any_macro_invoked |= !chars.is_empty();
                 continue;
             }
 
@@ -2986,7 +3049,7 @@ impl Assembler {
             let absolute = std::path::absolute(&path).unwrap_or_else(|_| path.clone());
             let content = match self.file_overlays.get(&absolute) {
                 Some(text) => text.clone(),
-                None => std::fs::read_to_string(&path).map_err(|e| {
+                None => crate::directives::read_source_file(&path).map_err(|e| {
                     here(
                         format!("cannot read include '{}': {}", path.display(), e),
                         &current_file,
@@ -3406,7 +3469,7 @@ impl Assembler {
                     _ => 2,
                 };
                 let count = if args.len() > 1 {
-                    evaluate_expr_str(&args[1], &self.symbols, self.pc)? as u32
+                    reservation_count(&args[1], &self.symbols, self.pc, line_no, "DS")?
                 } else {
                     1
                 };
@@ -3480,12 +3543,13 @@ impl Assembler {
                     _ => 2,
                 };
                 let count = if args.len() > 1 {
-                    evaluate_expr_str(&args[1], &self.symbols, self.pc)? as u32
+                    reservation_count(&args[1], &self.symbols, self.pc, line_no, "DCB")?
                 } else {
                     0
                 };
                 let total = element_size
                     .checked_mul(count)
+                    .filter(|&n| n <= MAX_DCB_BYTES)
                     .ok_or_else(|| AsmError::with_line("DCB size too large", line_no))?;
                 Ok(total.saturating_add(1) & !1)
             }
@@ -4021,6 +4085,7 @@ impl Assembler {
         self.sections.restart_pass();
         self.rs_counter = 0;
         self.code.clear();
+        self.image_start = None;
         self.instr_infos.clear();
         self.noreturn.clear();
         self.recursion.clear();
@@ -5356,8 +5421,7 @@ impl Assembler {
         let size_suffix = &args[0];
         let count_str = &args[1];
 
-        let count = evaluate_expr_str(count_str, &self.symbols, self.pc)
-            .map_err(|e| AsmError::with_line(e.message, line.line_no))? as u32;
+        let count = reservation_count(count_str, &self.symbols, self.pc, line.line_no, "DS")?;
 
         let element_size: u32 = match size_suffix.as_str() {
             "b" => 1,
@@ -5381,7 +5445,13 @@ impl Assembler {
         let total_bytes = element_size
             .checked_mul(count)
             .ok_or_else(|| AsmError::with_line("DS size too large", line.line_no))?;
-        self.pc += total_bytes;
+        if total_bytes > 0 {
+            self.image_start.get_or_insert(self.pc);
+        }
+        self.pc = self
+            .pc
+            .checked_add(total_bytes)
+            .ok_or_else(|| AsmError::with_line("DS runs past the end of memory", line.line_no))?;
         self.sections.set_current_pc(self.pc);
 
         Ok(())
@@ -5403,8 +5473,7 @@ impl Assembler {
         let count_str = &args[1];
         let value_str = args.get(2).map(|s| s.as_str()).unwrap_or("0");
 
-        let count = evaluate_expr_str(count_str, &self.symbols, self.pc)
-            .map_err(|e| AsmError::with_line(e.message, line.line_no))? as u32;
+        let count = reservation_count(count_str, &self.symbols, self.pc, line.line_no, "DCB")?;
         let value = evaluate_expr_str(value_str, &self.symbols, self.pc)
             .map_err(|e| AsmError::with_line(e.message, line.line_no))?;
 
@@ -5430,6 +5499,7 @@ impl Assembler {
         // below.
         element_size
             .checked_mul(count)
+            .filter(|&n| n <= MAX_DCB_BYTES)
             .ok_or_else(|| AsmError::with_line("DCB size too large", line.line_no))?;
 
         let mut words = Vec::new();

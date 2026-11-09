@@ -77,6 +77,13 @@ pub fn read_dap(input: impl Read, tx: Sender<Msg>) {
                 len = v.trim().parse::<usize>().ok();
             }
         }
+        // A bogus length must not drive the allocation; no DAP message
+        // comes anywhere near this size.
+        const MAX_MESSAGE: usize = 16 * 1024 * 1024;
+        if len.is_some_and(|n| n > MAX_MESSAGE) {
+            let _ = tx.send(Msg::DapClosed);
+            return;
+        }
         let mut body = vec![0; len.unwrap_or(0)];
         if input.read_exact(&mut body).is_err() {
             let _ = tx.send(Msg::DapClosed);
@@ -86,6 +93,28 @@ pub fn read_dap(input: impl Read, tx: Sender<Msg>) {
             let _ = tx.send(Msg::Dap(v));
         }
     }
+}
+
+/// Decode a GDB `m` reply: hex pairs, at most `len` bytes. Any pair that is
+/// not hex fails the whole reply, since dropping it would shift every
+/// following byte to the wrong address; the reply is matched as bytes, so
+/// non-ASCII garbage cannot split a character.
+fn decode_hex_bytes(hex: &str, len: u32) -> Result<Vec<u8>, String> {
+    let digits = hex.as_bytes();
+    let (pairs, rest) = digits.as_chunks::<2>();
+    if !rest.is_empty() {
+        return Err(format!("odd-length memory reply: {hex:?}"));
+    }
+    pairs
+        .iter()
+        .take(len as usize)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|p| u8::from_str_radix(p, 16).ok())
+                .ok_or_else(|| format!("malformed memory reply: {hex:?}"))
+        })
+        .collect()
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -506,9 +535,7 @@ impl<W: Write> Session<W> {
 
     fn read_bytes(&mut self, addr: u32, len: u32) -> Result<Vec<u8>, String> {
         let hex = self.request(&format!("m{addr:x},{len:x}"))?;
-        Ok((0..hex.len() / 2)
-            .filter_map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).ok())
-            .collect())
+        decode_hex_bytes(&hex, len)
     }
 
     /// Read up to `len` bytes, in packet-sized chunks; stops early at
@@ -920,7 +947,7 @@ impl<W: Write> Session<W> {
         Ok(json!({
             "address": format!("0x{addr:x}"),
             "data": base64(&data),
-            "unreadableBytes": count as usize - data.len(),
+            "unreadableBytes": (count as usize).saturating_sub(data.len()),
         }))
     }
 
@@ -1053,6 +1080,15 @@ fn base64(data: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn memory_replies_are_decoded_strictly() {
+        assert_eq!(decode_hex_bytes("00ff10", 8), Ok(vec![0, 0xff, 0x10]));
+        assert_eq!(decode_hex_bytes("00ff10", 2), Ok(vec![0, 0xff]));
+        assert!(decode_hex_bytes("0\u{ff}00", 4).is_err());
+        assert!(decode_hex_bytes("0g00", 4).is_err());
+        assert!(decode_hex_bytes("000", 4).is_err());
+    }
     use super::*;
 
     #[test]

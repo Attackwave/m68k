@@ -58,6 +58,28 @@ pub enum SymbolDefKind {
     Section,
 }
 
+/// Byte offset of the UTF-16 column `col` in `line`, as LSP positions count
+/// columns. `None` past the end of the line or inside a surrogate pair, so a
+/// client's column can never slice a line inside a character.
+pub fn utf16_col_to_byte(line: &str, col: u32) -> Option<usize> {
+    let mut units = 0u32;
+    for (byte, ch) in line.char_indices() {
+        if units == col {
+            return Some(byte);
+        }
+        units += ch.len_utf16() as u32;
+        if units > col {
+            return None;
+        }
+    }
+    (units == col).then_some(line.len())
+}
+
+/// UTF-16 column of byte offset `byte` (a char boundary) in `line`.
+pub fn byte_to_utf16_col(line: &str, byte: usize) -> u32 {
+    line[..byte].encode_utf16().count() as u32
+}
+
 /// An open text document managed by the language server.
 #[derive(Debug, Clone)]
 pub struct Document {
@@ -168,18 +190,17 @@ impl Document {
     /// Retrieve the word and its semantic context at a given position.
     pub fn get_word_at_position(&self, pos: Position) -> Option<WordAtPosition> {
         let line_idx = pos.line as usize;
-        let char_idx = pos.character as usize;
 
         let raw_line = self.lines.get(line_idx)?;
         if raw_line.is_empty() {
             return None;
         }
 
-        // Find word boundary at char_idx
+        // LSP columns count UTF-16 code units; work in chars here.
+        let byte = utf16_col_to_byte(raw_line, pos.character)?;
+        let char_idx = raw_line[..byte].chars().count();
         let chars: Vec<char> = raw_line.chars().collect();
-        if char_idx > chars.len() {
-            return None;
-        }
+        let utf16_col = |idx: usize| chars[..idx].iter().map(|c| c.len_utf16()).sum::<usize>();
 
         let is_word_char =
             |c: char| c.is_alphanumeric() || c == '_' || c == '.' || c == '$' || c == '@';
@@ -208,11 +229,11 @@ impl Document {
             range: Range {
                 start: Position {
                     line: pos.line,
-                    character: start as u32,
+                    character: utf16_col(start) as u32,
                 },
                 end: Position {
                     line: pos.line,
-                    character: end as u32,
+                    character: utf16_col(end) as u32,
                 },
             },
             kind,
@@ -312,6 +333,29 @@ pub fn is_register(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn utf16_columns_never_split_a_character() {
+        let line = " nop ; 😀 é";
+        assert_eq!(utf16_col_to_byte(line, 7), Some(7));
+        assert_eq!(utf16_col_to_byte(line, 8), None); // inside the surrogate pair
+        assert_eq!(utf16_col_to_byte(line, 9), Some(11));
+        assert_eq!(utf16_col_to_byte(line, 11), Some(line.len()));
+        assert_eq!(utf16_col_to_byte(line, 12), None);
+        assert_eq!(byte_to_utf16_col(line, 11), 9);
+
+        // Positions after non-ASCII text used to panic or be off.
+        let uri = Url::parse("file:///t.s").unwrap();
+        let doc = Document::new(uri, 1, " move.l #'é',d0 ; 😀\nLbl: nop\n".to_string());
+        for col in 0..24 {
+            let pos = Position::new(0, col);
+            let _ = crate::signature::compute_signature_help(&doc, pos);
+            let _ = doc.get_word_at_position(pos);
+        }
+        let w = doc.get_word_at_position(Position::new(0, 13)).unwrap();
+        assert_eq!(w.word, "d0");
+        assert_eq!((w.range.start.character, w.range.end.character), (13, 15));
+    }
     use super::*;
 
     #[test]

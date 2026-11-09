@@ -2,7 +2,7 @@
 
 use tower_lsp::lsp_types::{Location, Position, Range};
 
-use crate::document::Document;
+use crate::document::{Document, byte_to_utf16_col};
 
 /// Compute all reference locations for the symbol under the cursor.
 pub fn compute_references(
@@ -63,11 +63,11 @@ pub fn compute_references(
                     range: Range {
                         start: Position {
                             line: line_idx as u32,
-                            character: actual_idx as u32,
+                            character: byte_to_utf16_col(line, actual_idx),
                         },
                         end: Position {
                             line: line_idx as u32,
-                            character: (actual_idx + clean_target.len()) as u32,
+                            character: byte_to_utf16_col(line, actual_idx + clean_target.len()),
                         },
                     },
                 });

@@ -10,8 +10,8 @@ use m68k_asm::atari_prg_writer::generate_prg;
 use m68k_asm::directives::SectionKind;
 use m68k_asm::ieee695::generate_ieee695_sections;
 use m68k_asm::output::{
-    OutputFormat, apply_megadrive_checksum, generate_binary_from, generate_elf_sections,
-    generate_intel_hex, generate_srecord, next_power_of_two, pad_image,
+    MAX_IMAGE_SIZE, OutputFormat, apply_megadrive_checksum, binary_span, generate_binary_from,
+    generate_elf_sections, generate_intel_hex, generate_srecord, next_power_of_two, pad_image,
 };
 
 #[derive(Parser, Debug)]
@@ -138,8 +138,20 @@ fn finish_rom_image(bytes: &mut Vec<u8>, args: &Args) -> Result<(), String> {
         let size = if size.eq_ignore_ascii_case("pow2") {
             next_power_of_two(bytes.len())
         } else {
-            parse_number(size).map_err(|e| format!("--pad: {e}"))? as usize
+            let n = parse_number(size).map_err(|e| format!("--pad: {e}"))?;
+            usize::try_from(n)
+                .ok()
+                .filter(|&n| n as u64 <= MAX_IMAGE_SIZE)
+                .ok_or_else(|| format!("--pad: {n} is not between 0 and {MAX_IMAGE_SIZE}"))?
         };
+        // A ROM image that does not fit the device it was padded for must
+        // fail here, not on the programmer.
+        if bytes.len() > size {
+            return Err(format!(
+                "--pad: the image is {} bytes, larger than {size}",
+                bytes.len()
+            ));
+        }
         pad_image(bytes, size, fill);
     }
     match args.checksum {
@@ -472,6 +484,15 @@ fn run(args: Args) -> Result<(), String> {
             p
         }
     };
+    // A source without an extension (hunk-exe default) or named after the
+    // output format (`code.bin` with -f binary) would otherwise be replaced
+    // by its own assembled output.
+    if !reading_stdin && !is_dash(&output_path) && same_file(&args.input, &output_path) {
+        return Err(format!(
+            "output '{}' is the source file itself; pass -o to choose another name",
+            output_path.display()
+        ));
+    }
     // Written ahead of the output, which has several exit paths below.
     if let Some(dep_path) = &args.depfile {
         if is_dash(&output_path) {
@@ -517,19 +538,21 @@ fn run(args: Args) -> Result<(), String> {
             // Hex/ELF (which all honor `pc`) and silently dropping DS
             // reservations. generate_binary fills gaps with zero bytes
             // between the lowest and highest instruction address instead.
-            const MAX_BINARY_SIZE: usize = 16 * 1024 * 1024; // 68k address space
-            // Pass the final PC so a trailing DS/DCB reservation (which
-            // emits no instruction) still sizes the image.
-            match generate_binary_from(&asm.code, Some(asm.end_pc()), Some(asm.origin())) {
+            // The image covers every byte from the first one emitted or
+            // reserved to the last, so check its size before allocating it.
+            let start = asm.image_start();
+            if let Some((base, end)) = binary_span(&asm.code, Some(asm.end_pc()), start)
+                && end - base as u64 > MAX_IMAGE_SIZE
+            {
+                return Err(format!(
+                    "binary output would be {} bytes (limit {} bytes) \
+                     — check for a large gap between ORG-separated blocks",
+                    end - base as u64,
+                    MAX_IMAGE_SIZE
+                ));
+            }
+            match generate_binary_from(&asm.code, Some(asm.end_pc()), start) {
                 Some((mut bytes, _base_addr)) => {
-                    if bytes.len() > MAX_BINARY_SIZE {
-                        return Err(format!(
-                            "binary output would be {} bytes (limit {} bytes) \
-                             — check for a large gap between ORG-separated blocks",
-                            bytes.len(),
-                            MAX_BINARY_SIZE
-                        ));
-                    }
                     finish_rom_image(&mut bytes, &args)?;
                     bytes
                 }
@@ -736,6 +759,14 @@ fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Re
     }
 
     Ok(())
+}
+
+/// True when both paths name the same existing file.
+fn same_file(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
 }
 
 fn main() {
