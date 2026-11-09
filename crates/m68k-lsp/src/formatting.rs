@@ -47,8 +47,15 @@ pub fn compute_formatting(doc: &Document, options: &FormattingOptions) -> Vec<Te
         return Vec::new();
     }
 
-    let end_line = doc.lines.len().saturating_sub(1) as u32;
-    let end_char = doc.lines.last().map(|l| l.len()).unwrap_or(0) as u32;
+    // The edit replaces the whole text, so it ends after the last
+    // character, past a trailing newline. Ending at the last line's end
+    // left that newline in place and every format added a blank line.
+    let end_line = doc.text.matches('\n').count() as u32;
+    let end_char = doc
+        .text
+        .rsplit('\n')
+        .next()
+        .map_or(0, |last| last.encode_utf16().count()) as u32;
 
     vec![TextEdit {
         range: Range {
@@ -111,8 +118,14 @@ pub fn format_source(source: &str, config: &AsmFormatConfig) -> String {
 
         // 1. Label
         if let Some(lbl) = label {
+            let had_colon = code_part
+                .trim_start()
+                .strip_prefix(lbl.as_str())
+                .is_some_and(|rest| rest.starts_with(':'));
             formatted_line.push_str(&lbl);
-            if !code_part.trim().ends_with(':') && !lbl.ends_with(':') && !mnemonic.is_empty() {
+            // Keep the colon the source wrote, and add one before an
+            // instruction on the same line.
+            if !lbl.ends_with(':') && (had_colon || !mnemonic.is_empty()) {
                 formatted_line.push(':');
             }
         }
@@ -210,6 +223,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn whole_document_edit_ends_after_the_trailing_newline() {
+        let uri = tower_lsp::lsp_types::Url::parse("file:///t.s").unwrap();
+        let doc = Document::new(uri, 1, "start:\n  MOVE.L d0,d1\n  rts\n".to_string());
+        let options = FormattingOptions {
+            tab_size: 4,
+            insert_spaces: true,
+            ..Default::default()
+        };
+        let edits = compute_formatting(&doc, &options);
+        assert_eq!(edits.len(), 1);
+        assert_eq!(
+            edits[0].range.end,
+            Position {
+                line: 3,
+                character: 0
+            }
+        );
+        assert!(edits[0].new_text.ends_with("rts\n"));
+    }
+
+    #[test]
     fn test_format_source() {
         let src = "START:\nmove.w #1,d0 ; set d0\n.loop: dbra d0,.loop\nrts\n";
         let config = AsmFormatConfig::default();
@@ -218,5 +252,7 @@ mod tests {
         assert!(formatted.contains("    move.w          #1, d0"));
         assert!(formatted.contains("; set d0"));
         assert!(formatted.contains("    rts"));
+        assert!(formatted.starts_with("START:\n"), "{formatted}");
+        assert!(formatted.ends_with("rts\n") && !formatted.ends_with("\n\n"));
     }
 }

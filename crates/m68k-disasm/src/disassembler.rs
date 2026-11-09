@@ -1283,6 +1283,18 @@ mod tests {
     }
 
     #[test]
+    fn quick_constants_are_not_labels() {
+        // addq.l #4,d1 / moveq #4,d0 / nop / bra.s to the nop at $4: the
+        // label at $4 must not stand in for the constant 4.
+        let bytes = vec![0x58, 0x81, 0x70, 0x04, 0x4E, 0x71, 0x60, 0xFC];
+        let mut disasm = Disassembler::new(bytes, 0);
+        let lines = disasm.disassemble();
+        assert_eq!(disasm.labels().get(&4), Some(&"label0".to_string()));
+        assert!(!lines[0].text.contains("label"), "{}", lines[0].text);
+        assert!(!lines[1].text.contains("label"), "{}", lines[1].text);
+    }
+
+    #[test]
     fn test_disassemble_discovers_branch_label() {
         // BRA.w disp=$0002 targets pc_after_opword(0x2002)+2 = 0x2004,
         // i.e. the RTS immediately following this 4-byte BRA.w encoding.

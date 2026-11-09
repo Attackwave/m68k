@@ -121,7 +121,10 @@ pub enum EAOperand {
     /// Fields: resolved target address, raw displacement, index register,
     /// index size, scale.
     PcIndex(i32, u32, String, String, u8),
-    /// Immediate: #value
+    /// Immediate: #value. The size is `b`, `w` or `l` for a constant
+    /// read from extension words, and `q` for one that is a count or
+    /// offset in the opword (MOVEQ, ADDQ/SUBQ.L, LINK.L): printed like
+    /// `l`, but never as a label, since it is not an address.
     Immediate(u64, String),
     /// Float immediate: #$hex
     FloatImm(Vec<u8>, String),

@@ -308,7 +308,7 @@ fn parse_operands(
             let val = sign_extend_8(data);
             operands.push(DecodedOperand::from_ea(EAOperand::Immediate(
                 val as u64 & 0xFFFFFFFF,
-                "l".into(),
+                "q".into(),
             )));
             operands.push(DecodedOperand::from_ea(EAOperand::DataReg(dst_reg)));
             Ok(("moveq".into(), operands, target_addr))
@@ -493,7 +493,7 @@ fn parse_operands(
             let dst = decode_ea(dst_mode, dst_reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(EAOperand::Immediate(
                 val,
-                size.into(),
+                if size == "l" { "q" } else { size }.into(),
             )));
             operands.push(DecodedOperand::from_ea(dst));
             Ok((format!("{}.{}", name, size), operands, target_addr))
@@ -701,7 +701,7 @@ fn parse_operands(
             operands.push(DecodedOperand::from_ea(EAOperand::AddrReg(reg)));
             operands.push(DecodedOperand::from_ea(EAOperand::Immediate(
                 disp as u64,
-                "l".into(),
+                "q".into(),
             )));
             Ok((format!("{}.l", name), operands, target_addr))
         }
