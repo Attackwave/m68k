@@ -52,10 +52,6 @@ fn fmt_code(size: Option<&str>) -> u16 {
     }
 }
 
-/// Encode a monadic/dyadic FPU arithmetic instruction (FADD, FSQRT, FSIN, FCMP, FTST, ...).
-///
-/// `cmd` is the 7-bit opclass/opmode field (extension word bits 6-0).
-
 /// EA categories for an FPU memory operand of format `fmt`: a data
 /// register holds only the byte, word, long and single formats, so `.d`,
 /// `.x` and `.p` cannot name one.
@@ -66,6 +62,10 @@ fn fpu_ea(fmt: &str, categories: u16) -> u16 {
         categories
     }
 }
+
+/// Encode a monadic/dyadic FPU arithmetic instruction (FADD, FSQRT, FSIN, FCMP, FTST, ...).
+///
+/// `cmd` is the 7-bit opclass/opmode field (extension word bits 6-0).
 pub fn enc_fpu_arith(
     cmd: u16,
     src: &Operand,

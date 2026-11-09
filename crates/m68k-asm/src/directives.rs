@@ -955,6 +955,12 @@ pub fn parse_simple_expr(text: &str, symbols: &SymbolTable, pc: u32) -> Result<i
     Ok(value)
 }
 
+/// Expressions are evaluated in 64 bits; a result outside that range is an
+/// error rather than a silently wrapped value.
+fn overflow() -> String {
+    "arithmetic overflow in expression".to_string()
+}
+
 #[derive(Debug, Clone)]
 enum ExprToken {
     Num(i64),
@@ -1426,13 +1432,19 @@ fn parse_expr_shift(
                 "<<" => {
                     *pos += 1;
                     let right = parse_expr_add(tokens, pos, symbols)?;
-                    left = left.wrapping_shl(right as u32);
+                    left = u32::try_from(right)
+                        .ok()
+                        .and_then(|r| left.checked_shl(r))
+                        .ok_or_else(|| format!("shift count {right} out of range"))?;
                     continue;
                 }
                 ">>" => {
                     *pos += 1;
                     let right = parse_expr_add(tokens, pos, symbols)?;
-                    left = left.wrapping_shr(right as u32);
+                    left = u32::try_from(right)
+                        .ok()
+                        .and_then(|r| left.checked_shr(r))
+                        .ok_or_else(|| format!("shift count {right} out of range"))?;
                     continue;
                 }
                 _ => {}
@@ -1459,13 +1471,13 @@ fn parse_expr_add(
                 "+" => {
                     *pos += 1;
                     let right = parse_expr_mul(tokens, pos, symbols)?;
-                    left = left.wrapping_add(right);
+                    left = left.checked_add(right).ok_or_else(overflow)?;
                     continue;
                 }
                 "-" => {
                     *pos += 1;
                     let right = parse_expr_mul(tokens, pos, symbols)?;
-                    left = left.wrapping_sub(right);
+                    left = left.checked_sub(right).ok_or_else(overflow)?;
                     continue;
                 }
                 _ => {}
@@ -1492,7 +1504,7 @@ fn parse_expr_mul(
                 "*" => {
                     *pos += 1;
                     let right = parse_expr_unary(tokens, pos, symbols)?;
-                    left = left.wrapping_mul(right);
+                    left = left.checked_mul(right).ok_or_else(overflow)?;
                     continue;
                 }
                 "/" => {
@@ -1501,7 +1513,7 @@ fn parse_expr_mul(
                     if right == 0 {
                         return Err("division by zero".to_string());
                     }
-                    left = left.wrapping_div(right);
+                    left = left.checked_div(right).ok_or_else(overflow)?;
                     continue;
                 }
                 "%" => {
@@ -1510,7 +1522,7 @@ fn parse_expr_mul(
                     if right == 0 {
                         return Err("modulo by zero".to_string());
                     }
-                    left = left.wrapping_rem(right);
+                    left = left.checked_rem(right).ok_or_else(overflow)?;
                     continue;
                 }
                 _ => {}

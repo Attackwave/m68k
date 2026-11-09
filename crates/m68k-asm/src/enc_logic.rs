@@ -357,11 +357,23 @@ pub fn enc_bit_imm(
     // See enc_bit_reg above: BTST's memory operand is read-only (DATA),
     // BSET/BCLR/BCHG's is read-modify-write (DATA_ALT). Previously `ALL`
     // (0xFFFF) bypassed validation entirely for every memory form.
+    // The static form's extension word holds the bit number, so it has
+    // no room for an immediate operand as well: `btst #1,#5` is only
+    // valid with the bit number in a register.
     let allowed = if is_data || mnemonic == "btst" {
-        DATA
+        DATA & !IMM
     } else {
         DATA_ALT
     };
+    // The CPU takes the bit number modulo 32 (register) or 8 (memory), so
+    // a larger one tests a different bit than the one written.
+    let limit = if is_data { 32 } else { 8 };
+    if bit >= limit {
+        return Err(AsmError::new(format!(
+            "bit number {bit} is out of range 0..{} for this operand",
+            limit - 1
+        )));
+    }
     let (dst_mode, dst_reg, dst_ext) = encode_ea(dst, size, pc, allowed, cpu)?;
     let mut words = vec![base | ((dst_mode as u16) << 3) | (dst_reg as u16), bit];
     words.extend(dst_ext);

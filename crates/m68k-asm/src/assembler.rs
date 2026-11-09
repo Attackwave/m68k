@@ -1116,8 +1116,11 @@ fn parse_parens_disp_index_no_base(
         // (bd,ZAn,Xn) — explicit base suppression
         3 => {
             let mid = parts[1].trim().to_uppercase();
-            let suppressed = mid == "ZPC"
-                || (mid.starts_with("ZA") && mid.len() == 3 && mid.as_bytes()[2].is_ascii_digit());
+            // ZPC is not handled: it is the PC-relative mode (7/3) with the
+            // base suppressed, but this path encodes mode 6, an alterable
+            // An-relative form. Refusing it beats assembling another EA.
+            let suppressed =
+                mid.starts_with("ZA") && mid.len() == 3 && mid.as_bytes()[2].is_ascii_digit();
             if !suppressed {
                 return None;
             }
@@ -1133,7 +1136,11 @@ fn parse_parens_disp_index_no_base(
     let xn = index_reg_num(&reg)?;
     // A bare `(An,Xn)` has already been handled by the caller above; here a
     // two-part form only qualifies when the first field is not a register.
-    if parts.len() == 2 && parse_register(disp_str).is_some() {
+    if parts.len() == 2
+        && (parse_register(disp_str).is_some()
+            || disp_str.eq_ignore_ascii_case("pc")
+            || disp_str.eq_ignore_ascii_case("zpc"))
+    {
         return None;
     }
     let disp = evaluate_displacement(disp_str, symbols, pc);
@@ -1374,12 +1381,9 @@ fn parse_index_reg_size_scale(text: &str) -> Option<(String, String, u8)> {
     let text = text.trim();
     let (reg_part, scale) = if let Some(pos) = text.find('*') {
         let scale_str = text[pos + 1..].trim();
-        // An invalid scale is passed on as 0 so the encoder rejects it;
-        // mapping it to 1 silently dropped `*16` or `*3`.
-        let scale = match scale_str.parse::<u8>() {
-            Ok(n @ (1 | 2 | 4 | 8)) => n,
-            _ => 0,
-        };
+        // Passed on as written (0 if not a number) so the encoder rejects
+        // an invalid scale; mapping it to 1 silently dropped `*16` or `*3`.
+        let scale = scale_str.parse::<u8>().unwrap_or(0);
         (&text[..pos], scale)
     } else {
         (text, 1)
@@ -1418,12 +1422,9 @@ fn parse_index_reg_and_scale(text: &str) -> (String, u8, bool) {
     // Split on '*' to get scale
     let (reg_part, scale) = if let Some(pos) = text.find('*') {
         let scale_str = text[pos + 1..].trim();
-        // An invalid scale is passed on as 0 so the encoder rejects it;
-        // mapping it to 1 silently dropped `*16` or `*3`.
-        let scale = match scale_str.parse::<u8>() {
-            Ok(n @ (1 | 2 | 4 | 8)) => n,
-            _ => 0,
-        };
+        // Passed on as written (0 if not a number) so the encoder rejects
+        // an invalid scale; mapping it to 1 silently dropped `*16` or `*3`.
+        let scale = scale_str.parse::<u8>().unwrap_or(0);
         (&text[..pos], scale)
     } else {
         (text, 1)
@@ -8327,6 +8328,26 @@ mymexc MACRO
         assert_eq!(
             assemble_source_with_cpu(" movec pcr,d0\n", "68060"),
             [0x4E, 0x7A, 0x08, 0x08]
+        );
+    }
+
+    #[test]
+    fn bit_numbers_overflow_and_zpc_are_rejected() {
+        for (src, cpu) in [
+            (" btst #1,#5\n", "68000"),
+            (" btst #9,(a0)\n", "68000"),
+            (" bset #32,d0\n", "68000"),
+            (" dc.l 1<<64\n", "68000"),
+            (" dc.l $7fffffffffffffff*2\n", "68000"),
+            (" jmp (zpc,d0.w)\n", "68020"),
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu(cpu);
+            assert!(asm.assemble(src).is_err(), "{cpu}: {src}");
+        }
+        assert_eq!(
+            assemble_source_with_cpu(" btst d1,#5\n", "68000"),
+            [0x03, 0x3C, 0, 5]
         );
     }
 
