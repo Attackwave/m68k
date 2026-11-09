@@ -18,6 +18,12 @@ pub trait FloppyImageReader {
     /// Read a single 512-byte sector from the image.
     fn read_sector(&mut self, track: u32, side: u32, sector: u32) -> Result<Vec<u8>, FloppyError>;
 
+    /// Sectors per track: 11 on a DD Amiga disk, 22 on an HD one. Logical
+    /// AmigaDOS block numbers are mapped to (track, side, sector) with it.
+    fn sectors_per_track(&self) -> u32 {
+        11
+    }
+
     /// Read the Amiga bootblock (track 0, side 0, sectors 0-1): 1024 bytes.
     fn get_bootblock(&mut self) -> Result<Vec<u8>, FloppyError> {
         let mut data = self.read_sector(0, 0, 0)?;

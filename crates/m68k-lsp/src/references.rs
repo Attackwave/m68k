@@ -26,10 +26,16 @@ pub fn compute_references(
     let clean_target = target_symbol.trim_start_matches('.');
 
     for (line_idx, line) in doc.lines.iter().enumerate() {
+        let code_end = code_length(line);
         let mut search_start = 0;
         while let Some(found_idx) = line[search_start..].find(clean_target) {
             let actual_idx = search_start + found_idx;
             search_start = actual_idx + clean_target.len();
+            // A name inside a comment or a string literal is text, not a
+            // reference: renaming it would rewrite data the program emits.
+            if actual_idx >= code_end || inside_quotes(&line[..actual_idx]) {
+                continue;
+            }
 
             // Verify word boundary before and after
             let is_boundary_before = if actual_idx == 0 {
@@ -78,6 +84,37 @@ pub fn compute_references(
     locations
 }
 
+/// Byte length of the code part of `line`: everything before a `;`
+/// comment (outside quotes); 0 for a `*` full-line comment.
+fn code_length(line: &str) -> usize {
+    if line.starts_with('*') {
+        return 0;
+    }
+    let mut quote = None;
+    for (i, c) in line.char_indices() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            (None, ';') => return i,
+            _ => {}
+        }
+    }
+    line.len()
+}
+
+/// Whether the end of `prefix` lies inside a quoted string.
+fn inside_quotes(prefix: &str) -> bool {
+    let mut quote = None;
+    for c in prefix.chars() {
+        match (quote, c) {
+            (None, '"' | '\'') => quote = Some(c),
+            (Some(q), c) if c == q => quote = None,
+            _ => {}
+        }
+    }
+    quote.is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -104,5 +141,15 @@ mod tests {
             "Expected 3 occurrences of 'Loop', found: {:?}",
             refs
         );
+    }
+
+    #[test]
+    fn references_skip_comments_and_strings() {
+        let src = "Lbl:\n bra Lbl ; Größe Lbl\n; Lbl\n* Lbl\n dc.b \"Lbl\",0\n dc.l Lbl\n";
+        let doc = Document::new(Url::parse("file:///t.s").unwrap(), 1, src.to_string());
+        let refs = compute_references(&doc, Position::new(0, 0), true);
+        let lines: Vec<u32> = refs.iter().map(|l| l.range.start.line).collect();
+        assert_eq!(lines, [0, 1, 5]);
+        assert_eq!(refs[1].range.start.character, 5);
     }
 }

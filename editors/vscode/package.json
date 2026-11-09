@@ -64,6 +64,7 @@
         },
         "m68k.toolsPath": {
           "type": "string",
+          "scope": "machine",
           "default": "",
           "description": "Directory containing m68k-lsp and m68k-asm. Empty: bundled binaries, then PATH."
         },
@@ -92,6 +93,7 @@
         },
         "m68k.emulator": {
           "type": "string",
+          "scope": "machine",
           "default": "",
           "description": "Path to a UAE build with a GDB remote debugger (patched FS-UAE, or WinUAE with gdbserver). Used by F5 debugging."
         },

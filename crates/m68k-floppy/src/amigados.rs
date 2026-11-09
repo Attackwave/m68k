@@ -14,7 +14,6 @@
 use crate::floppy_base::{FloppyError, FloppyImageReader};
 
 const BLOCK_SIZE: usize = 512;
-const SECTORS_PER_TRACK: u32 = 11;
 const SIDES: u32 = 2;
 const HASH_TABLE_SIZE: usize = 72;
 /// Slots in a file header's / extension block's data-block pointer table.
@@ -53,6 +52,7 @@ pub struct AmigaFs<'a> {
     reader: &'a mut dyn FloppyImageReader,
     pub kind: FsKind,
     root_block: u32,
+    sectors_per_track: u32,
 }
 
 fn read_u32(block: &[u8], offset: usize) -> u32 {
@@ -130,7 +130,12 @@ impl<'a> AmigaFs<'a> {
             FsKind::Ofs
         };
 
-        let total_blocks = total_tracks * SIDES * SECTORS_PER_TRACK;
+        // HD disks have 22 sectors per track; assuming 11 found the root
+        // block of an HD disk only by coincidence and mismapped the rest.
+        let sectors_per_track = reader.sectors_per_track().max(1);
+        let total_blocks = total_tracks
+            .checked_mul(SIDES * sectors_per_track)
+            .ok_or_else(|| FloppyError::new("track count too large"))?;
         if total_blocks == 0 || !total_blocks.is_multiple_of(2) {
             return Err(FloppyError::new(format!(
                 "cannot locate root block: total block count {} is not evenly halvable",
@@ -143,6 +148,7 @@ impl<'a> AmigaFs<'a> {
             reader,
             kind,
             root_block,
+            sectors_per_track,
         };
         let root = fs.read_block(root_block)?;
         if read_i32(&root, 0) != T_HEADER || read_i32(&root, 0x1FC) != ST_ROOT {
@@ -155,8 +161,8 @@ impl<'a> AmigaFs<'a> {
     }
 
     fn read_block(&mut self, block_num: u32) -> Result<Vec<u8>, FloppyError> {
-        let sector = block_num % SECTORS_PER_TRACK;
-        let track_and_side = block_num / SECTORS_PER_TRACK;
+        let sector = block_num % self.sectors_per_track;
+        let track_and_side = block_num / self.sectors_per_track;
         let side = track_and_side % SIDES;
         let track = track_and_side / SIDES;
         self.reader.read_sector(track, side, sector)

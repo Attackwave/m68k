@@ -109,11 +109,16 @@ impl UaeExtendedBackend {
 
         let mut track_num = 0u32;
         let mut side = 0u32;
+        // Entries are consecutive tracks, side 0 then side 1 of each
+        // cylinder, whatever their type. Type 0 holds plain AmigaDOS sector
+        // data (most tracks of a real image) and was skipped, and the skip
+        // advanced a whole cylinder per entry, renumbering the rest.
         for entry in &entries {
-            if entry.track_type != 1 {
-                track_num += 1;
-                side = 0;
-                continue;
+            if entry.track_type > 1 {
+                return Err(FloppyError::new(format!(
+                    "unknown UAE-ADF track type {}",
+                    entry.track_type
+                )));
             }
             file.seek(SeekFrom::Start(entry.file_offset))
                 .map_err(|e| FloppyError::new(e.to_string()))?;
@@ -125,8 +130,14 @@ impl UaeExtendedBackend {
                 ))
             })?;
 
-            decode_track_sectors(track_num, side, &raw_data, &mut decoded_sectors);
-            raw_tracks.insert((track_num, side), raw_data);
+            if entry.track_type == 0 {
+                for (i, sector) in raw_data.chunks_exact(512).enumerate() {
+                    decoded_sectors.insert((track_num, side, i as u32), sector.to_vec());
+                }
+            } else {
+                decode_track_sectors(track_num, side, &raw_data, &mut decoded_sectors);
+                raw_tracks.insert((track_num, side), raw_data);
+            }
 
             side = 1 - side;
             if side == 0 {
@@ -183,7 +194,12 @@ fn decode_track_sectors(
     let Ok(decoded) = decoder.decode_track(Some(raw_track), Some(side)) else {
         return;
     };
-    for sector in decoded {
+    // A sector whose MFM checksums fail is not returned: its data (or
+    // even its sector number) is corrupt.
+    for sector in decoded
+        .into_iter()
+        .filter(|s| s.header_checksum_ok && s.data_checksum_ok)
+    {
         decoded_sectors.insert((cylinder, side, sector.sector), sector.data);
     }
 }
@@ -203,7 +219,7 @@ impl FloppyImageReader for UaeExtendedBackend {
 
         self.decoded_sectors.get(&key).cloned().ok_or_else(|| {
             FloppyError::new(format!(
-                "Sector {} not found on track {}, side {}",
+                "Sector {} not found on track {}, side {} (missing, or its checksum failed)",
                 sector, track, side
             ))
         })
@@ -256,6 +272,31 @@ mod tests {
 
         let result = UaeExtendedBackend::open(&path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn standard_tracks_are_read_as_sectors() {
+        let dir = tempdir();
+        let tracks = 4u32; // cylinders 0 and 1, both sides
+        let size = 11 * 512u32;
+        let mut buf = b"UAE-1ADF".to_vec();
+        buf.extend_from_slice(&tracks.to_be_bytes());
+        for _ in 0..tracks {
+            buf.extend_from_slice(&0u32.to_be_bytes()); // type 0: AmigaDOS sectors
+            buf.extend_from_slice(&size.to_be_bytes());
+            buf.extend_from_slice(&(size * 8).to_be_bytes());
+        }
+        for t in 0..tracks {
+            for s in 0..11u32 {
+                buf.extend(vec![(t * 16 + s) as u8; 512]);
+            }
+        }
+        let path = dir.path().join("std.adf");
+        std::fs::write(&path, &buf).unwrap();
+        let mut reader = UaeExtendedBackend::open(&path).unwrap();
+        assert_eq!(reader.read_sector(0, 0, 3).unwrap()[0], 3);
+        assert_eq!(reader.read_sector(0, 1, 0).unwrap()[0], 16);
+        assert_eq!(reader.read_sector(1, 1, 10).unwrap()[0], 3 * 16 + 10);
     }
 
     #[test]

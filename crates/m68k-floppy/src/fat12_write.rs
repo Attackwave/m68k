@@ -415,6 +415,9 @@ impl<'a> Fat12Writer<'a> {
             entry[..11].copy_from_slice(&name);
             return self.write_entry(&old_slot, &entry);
         }
+        if entry[11] & ATTR_DIRECTORY != 0 {
+            self.refuse_move_into_itself(le16(&entry, 26) as u32, to_dir)?;
+        }
         let mut moved = entry;
         moved[..11].copy_from_slice(&name);
         let new_slot = self.free_slot(to_dir)?;
@@ -438,6 +441,34 @@ impl<'a> Fat12Writer<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Refuse to move the directory starting at `cluster` into `target`
+    /// when `target` is that directory or lies below it: it would be
+    /// unlinked from the tree and its clusters lost.
+    fn refuse_move_into_itself(&self, cluster: u32, mut target: Dir) -> Result<(), FloppyError> {
+        for _ in 0..=self.layout.cluster_count {
+            let Dir::Chain(at) = target else {
+                return Ok(());
+            };
+            if at == cluster {
+                return Err(FloppyError::new("cannot move a directory into itself"));
+            }
+            let dotdot = self.read_entry(&Slot {
+                dir: Dir::Chain(at),
+                at: ENTRY_SIZE,
+            })?;
+            if !dotdot.starts_with(b"..") {
+                return Err(FloppyError::new("subdirectory has no '..' entry"));
+            }
+            target = match le16(&dotdot, 26) {
+                0 => Dir::Root,
+                parent => Dir::Chain(parent as u32),
+            };
+        }
+        Err(FloppyError::new(
+            "directory parent chain does not terminate",
+        ))
     }
 
     /// The entries of the directory at `path`.
@@ -526,6 +557,19 @@ mod tests {
             .into_iter()
             .map(|(p, _)| p)
             .collect()
+    }
+
+    #[test]
+    fn a_directory_cannot_be_moved_into_itself() {
+        let mut image = format_empty_st_disk("TEST", 2).unwrap();
+        let mut fs = Fat12Writer::mount(&mut image).unwrap();
+        fs.create_dir("A").unwrap();
+        fs.create_dir("A/B").unwrap();
+        assert!(fs.rename("A", "A/C").is_err());
+        assert!(fs.rename("A", "A/B/C").is_err());
+        fs.create_dir("D").unwrap();
+        fs.rename("A", "D/A").unwrap();
+        assert!(walked(&image).contains(&"D/A/B".to_string()));
     }
 
     #[test]
