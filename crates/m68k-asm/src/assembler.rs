@@ -1682,8 +1682,38 @@ fn absolute_short_value(value: i64) -> i32 {
     (value as u64 & 0xFFFF) as u16 as i16 as i32
 }
 
-/// Most lines macro and REPT/IRP/IRPC expansion may produce.
-const MAX_EXPANDED_LINES: usize = 2 * 1024 * 1024;
+/// Most lines and bytes macro and REPT/IRP/IRPC expansion may add, over
+/// all passes together. Only expanded copies count, not the source's own
+/// lines, so a large program is not limited; a self-doubling macro or a
+/// nest of IRPC blocks is stopped long before it exhausts memory or time.
+const MAX_EXPANDED_LINES: usize = 128 * 1024;
+const MAX_EXPANDED_BYTES: usize = 8 * 1024 * 1024;
+
+/// Charge an expansion of `lines` lines and `bytes` bytes against the
+/// budget in `used`; false (with an error recorded) when it would exceed it.
+fn spend_expansion(
+    used: &mut (usize, usize),
+    errors: &mut ErrorCollector,
+    lines: usize,
+    bytes: usize,
+    line_no: usize,
+) -> bool {
+    let total = (used.0.saturating_add(lines), used.1.saturating_add(bytes));
+    if total.0 > MAX_EXPANDED_LINES || total.1 > MAX_EXPANDED_BYTES {
+        errors.error(
+            format!(
+                "macro/REPT expansion exceeds {MAX_EXPANDED_LINES} lines or \
+                 {MAX_EXPANDED_BYTES} bytes (runaway recursion or repeat count)"
+            ),
+            Some(line_no),
+        );
+        // Exhausted: every later expansion stops at once.
+        *used = (usize::MAX, usize::MAX);
+        return false;
+    }
+    *used = total;
+    true
+}
 
 /// Largest block `DCB` fills: the whole 24-bit address space. The bytes
 /// are materialised, so an unchecked count would drive a multi-gigabyte
@@ -1954,6 +1984,9 @@ pub struct Assembler {
     pub register_aliases: HashMap<String, String>,
     /// Files already spliced in, and whether only inside a conditional.
     included_files: std::collections::HashMap<PathBuf, bool>,
+    /// Lines and bytes macro and REPT/IRP/IRPC expansion produced so far,
+    /// over all passes; see [`spend_expansion`].
+    expansion_used: (usize, usize),
     /// Conditional blocks open at the current point of INCLUDE expansion.
     include_conditional_depth: usize,
     /// Absolute path of every included file, keyed by the name
@@ -2099,6 +2132,7 @@ impl Assembler {
             register_aliases: HashMap::new(),
             included_files: std::collections::HashMap::new(),
             include_conditional_depth: 0,
+            expansion_used: (0, 0),
             include_paths_resolved: HashMap::new(),
             file_overlays: HashMap::new(),
             dependencies: Vec::new(),
@@ -2471,8 +2505,20 @@ impl Assembler {
         // self.macro_definitions from the pass that originally parsed it.
         self.macro_definitions.clear();
         self.macro_unique_counter = 0;
+        self.expansion_used = (0, 0);
         let mut current = source.to_string();
+        // Each pass reads the whole text again, so the passes are bounded
+        // by the lines read as well as by their number: a nest of IRP
+        // blocks that adds a little every pass would otherwise rescan the
+        // text 64 times. The limit grows with the source, so a large
+        // program keeps several full passes.
+        let work_limit = (MAX_EXPANDED_LINES / 2).max(4 * source.lines().count());
+        let mut work = 0usize;
         for _ in 0..MAX_MACRO_EXPANSION_DEPTH {
+            work += current.lines().count();
+            if work > work_limit {
+                break;
+            }
             let (next, any_macro_invoked) = self.macro_preprocess_pass(&current);
             if !any_macro_invoked {
                 return next;
@@ -2481,12 +2527,22 @@ impl Assembler {
         }
         self.errors.warning(
             format!(
-                "macro expansion did not terminate within {} passes (possible unbounded recursion)",
-                MAX_MACRO_EXPANSION_DEPTH
+                "macro expansion did not terminate within {MAX_MACRO_EXPANSION_DEPTH} passes \
+                 or {work_limit} lines read (possible unbounded recursion)"
             ),
             None,
         );
         current
+    }
+
+    /// Whether a repeated body holds something a further pass expands: a
+    /// nested REPT/IRP/IRPC or a call of a macro defined so far.
+    fn body_may_expand(&self, body: &[(String, usize)]) -> bool {
+        body.iter().any(|(line, _)| {
+            let (_, mnemonic, _, _) = split_line(line);
+            matches!(mnemonic.as_str(), "rept" | "irp" | "irpc")
+                || self.macro_definitions.contains_key(&mnemonic)
+        })
     }
 
     /// Single pass of macro/REPT/IRP/IRPC expansion. Returns the expanded
@@ -2496,7 +2552,7 @@ impl Assembler {
     fn macro_preprocess_pass(&mut self, source: &str) -> (String, bool) {
         let mut any_macro_invoked = false;
         let mut consts = SymbolTable::new();
-        let mut output = Vec::new();
+        let mut output: Vec<String> = Vec::new();
         let lines: Vec<&str> = source.lines().collect();
         let mut i = 0;
         // For every line pushed to `output`, which input line it came
@@ -2506,17 +2562,7 @@ impl Assembler {
         let mut trace: Vec<(usize, Option<String>)> = Vec::new();
 
         while i < lines.len() {
-            // A macro that invokes itself twice doubles the text every
-            // pass, and a REPT count is unbounded: stop before that
-            // exhausts memory.
-            if output.len() > MAX_EXPANDED_LINES {
-                self.errors.error(
-                    format!(
-                        "macro/REPT expansion exceeds {MAX_EXPANDED_LINES} lines \
-                         (runaway recursion or repeat count)"
-                    ),
-                    Some(i + 1),
-                );
+            if self.expansion_used.0 == usize::MAX {
                 return (String::new(), false);
             }
             let raw = lines[i];
@@ -2640,11 +2686,14 @@ impl Assembler {
                     trace.push((repeat_line, None));
                 }
 
-                if count.saturating_mul(body.len()) > MAX_EXPANDED_LINES {
-                    self.errors.error(
-                        format!("REPT {count} expands to more than {MAX_EXPANDED_LINES} lines"),
-                        Some(repeat_line + 1),
-                    );
+                let body_bytes: usize = body.iter().map(|(l, _)| l.len() + 1).sum();
+                if !spend_expansion(
+                    &mut self.expansion_used,
+                    &mut self.errors,
+                    count.saturating_mul(body.len()),
+                    count.saturating_mul(body_bytes),
+                    repeat_line + 1,
+                ) {
                     continue;
                 }
                 for _ in 0..count {
@@ -2653,9 +2702,9 @@ impl Assembler {
                         trace.push((*input_line, None));
                     }
                 }
-                // The body may hold a nested REPT/IRP or a macro call,
-                // which only the next pass expands.
-                any_macro_invoked |= count > 0;
+                // A nested REPT/IRP or a macro call in the body is only
+                // expanded by the next pass.
+                any_macro_invoked |= count > 0 && self.body_may_expand(&body);
                 continue;
             }
 
@@ -2693,6 +2742,16 @@ impl Assembler {
                     trace.push((repeat_line, None));
                 }
 
+                let body_bytes: usize = body.iter().map(|(l, _)| l.len() + 1).sum();
+                if !spend_expansion(
+                    &mut self.expansion_used,
+                    &mut self.errors,
+                    values.len().saturating_mul(body.len()),
+                    values.len().saturating_mul(body_bytes),
+                    repeat_line + 1,
+                ) {
+                    continue;
+                }
                 let key = format!("\\{}", param_name);
                 for value in &values {
                     for (line, input_line) in &body {
@@ -2700,7 +2759,7 @@ impl Assembler {
                         trace.push((*input_line, None));
                     }
                 }
-                any_macro_invoked |= !values.is_empty();
+                any_macro_invoked |= !values.is_empty() && self.body_may_expand(&body);
                 continue;
             }
 
@@ -2738,6 +2797,16 @@ impl Assembler {
                     trace.push((repeat_line, None));
                 }
 
+                let body_bytes: usize = body.iter().map(|(l, _)| l.len() + 1).sum();
+                if !spend_expansion(
+                    &mut self.expansion_used,
+                    &mut self.errors,
+                    chars.len().saturating_mul(body.len()),
+                    chars.len().saturating_mul(body_bytes),
+                    repeat_line + 1,
+                ) {
+                    continue;
+                }
                 let key = format!("\\{}", param_name);
                 for ch in &chars {
                     for (line, input_line) in &body {
@@ -2745,7 +2814,7 @@ impl Assembler {
                         trace.push((*input_line, None));
                     }
                 }
-                any_macro_invoked |= !chars.is_empty();
+                any_macro_invoked |= !chars.is_empty() && self.body_may_expand(&body);
                 continue;
             }
 
@@ -2758,6 +2827,16 @@ impl Assembler {
             {
                 // Expand macro
                 let mname_key = mnemonic1.to_lowercase();
+                let body_bytes: usize = def.body.iter().map(|l| l.len() + 1).sum();
+                if !spend_expansion(
+                    &mut self.expansion_used,
+                    &mut self.errors,
+                    def.body.len(),
+                    body_bytes,
+                    i + 1,
+                ) {
+                    return (String::new(), false);
+                }
                 any_macro_invoked = true;
                 self.macro_unique_counter += 1;
                 let unique_id = self.macro_unique_counter;
@@ -2882,6 +2961,11 @@ impl Assembler {
         self.source_map.clear();
         let included = self.expand_includes(source, 0, None)?;
         let expanded = self.macro_preprocess(&included);
+        // An expansion error fails the run anyway; assembling the partial
+        // text would only add consequential errors and cost.
+        if let Some(e) = self.take_last_error() {
+            return Err(e);
+        }
         let parsed = parse_source(&expanded);
 
         self.jump_table_lines = jump_table_lines(&parsed);
@@ -2895,15 +2979,21 @@ impl Assembler {
         // Pass 2: Encode instructions with resolved symbols
         self.pass2(&parsed)?;
 
-        // Errors found while expanding macros and REPT blocks are only
-        // collected; without this the run still reported success.
-        match self.errors.errors.pop() {
-            Some(d) => Err(match d.line_no {
-                Some(line) => AsmError::with_line(d.message, line),
-                None => AsmError::new(d.message),
-            }),
+        // Errors collected without returning one must still fail the run.
+        match self.take_last_error() {
+            Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Remove the last collected error and return it as the run's result,
+    /// so it is reported once.
+    fn take_last_error(&mut self) -> Option<AsmError> {
+        let d = self.errors.errors.pop()?;
+        Some(match d.line_no {
+            Some(line) => AsmError::with_line(d.message, line),
+            None => AsmError::new(d.message),
+        })
     }
 
     /// Everything the last [`Self::assemble`] reported, in source order,
