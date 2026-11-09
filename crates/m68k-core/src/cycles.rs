@@ -317,9 +317,10 @@ pub fn instruction_timing(mnemonic: &str, size: &str, operands: &[String]) -> Op
             Ea::Dn => fixed(6),
             mem => fixed(8 + mem.calc(false)),
         },
+        // MC68000UM Table 8-6: `14(2/1)+` on memory (read-modify-write).
         "tas" => match ea(0)? {
             Ea::Dn => fixed(4),
-            mem => fixed(10 + mem.calc(false)),
+            mem => fixed(14 + mem.calc(false)),
         },
         _ if is_scc(&m) => match ea(0)? {
             Ea::Dn => Some(Timing::either(6, "if true", 4, "if false")),
@@ -628,6 +629,8 @@ mod tests {
         assert_eq!(c(" subq.l #1,(a0)+"), 20);
         assert_eq!(c(" andi.w #$ff,sr"), 20);
         assert_eq!(c(" andi.l #1,d0"), 14);
+        assert_eq!(c(" tas (a0)"), 18);
+        assert_eq!(c(" tas d0"), 4);
         assert_eq!(c(" ori.l #1,d0"), 16);
     }
 

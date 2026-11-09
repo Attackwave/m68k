@@ -988,7 +988,13 @@ pub fn enc_pack_unpk(
         _ => return Err(AsmError::new("PACK/UNPK requires Dn,Dn or -(An),-(Am)")),
     };
     let adj_val = match adj {
-        Operand::Immediate(v) => *v,
+        // A word, written signed or unsigned.
+        Operand::Immediate(v) if (-0x8000..=0xFFFF).contains(v) => *v,
+        Operand::Immediate(v) => {
+            return Err(AsmError::new(format!(
+                "PACK/UNPK adjustment {v} does not fit in a word"
+            )));
+        }
         _ => return Err(AsmError::new("PACK/UNPK third operand must be immediate")),
     };
     let base: u16 = if is_pack { 0x8140 } else { 0x8180 };
