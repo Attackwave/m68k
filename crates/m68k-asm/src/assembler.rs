@@ -5957,7 +5957,13 @@ fn parse_float_value(text: &str, format: &str, line_no: usize) -> Result<Vec<u16
                 // IEEE-754 80-bit extended precision, stored in the
                 // Motorola 96-bit DC.X slot: word0 = sign+exponent,
                 // word1 = reserved (0), words 2-5 = 64-bit mantissa with
-                // explicit integer bit.
+                // explicit integer bit. Decimal literals are converted
+                // exactly; `f64` only covers infinities and NaN.
+                if let Some(words) = crate::extended::decimal_to_extended(text) {
+                    return words
+                        .map(Vec::from)
+                        .map_err(|e| AsmError::with_line(e, line_no));
+                }
                 let val: f64 = text.parse().map_err(|_| {
                     AsmError::with_line(format!("invalid DC.X literal: {}", text), line_no)
                 })?;

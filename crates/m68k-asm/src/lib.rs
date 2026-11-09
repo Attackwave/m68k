@@ -59,5 +59,6 @@ pub mod enc_math;
 pub mod enc_mmu;
 pub mod enc_move;
 pub mod encoder;
+mod extended;
 pub mod ieee695;
 pub mod output;
