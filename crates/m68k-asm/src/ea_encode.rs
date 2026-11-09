@@ -63,10 +63,22 @@ pub fn encode_ea(
             check_ea(mode, reg, allowed)?;
             Ok((mode, reg, vec![]))
         }
-        Operand::AddrRegIndirectDisp(n, disp, _) => {
+        // `(bd,An)` with a 32-bit base displacement: the full-format
+        // extension word with the index suppressed and a long bd.
+        Operand::AddrRegIndirectDisp(n, disp, true) if cpu_level >= 2 => {
+            check_ea(6, *n, allowed)?;
+            Ok((
+                6,
+                *n,
+                vec![0x0170, to_word(*disp >> 16), to_word(*disp & 0xFFFF)],
+            ))
+        }
+        Operand::AddrRegIndirectDisp(n, disp, is_long) => {
             let (mode, reg) = (5, *n);
-            if *disp < -32768 || *disp > 32767 {
-                return Err(AsmError::new("displacement out of 16-bit range"));
+            if *is_long || *disp < -32768 || *disp > 32767 {
+                return Err(AsmError::new(
+                    "displacement out of 16-bit range (32-bit displacements need 68020+)",
+                ));
             }
             check_ea(mode, reg, allowed)?;
             Ok((mode, reg, vec![to_word(*disp)]))
@@ -310,7 +322,11 @@ fn encode_full_ea(
     cpu_level: u8,
 ) -> Result<EAEncoded, AsmError> {
     if cpu_level < 2 {
-        return Err(AsmError::new("full format EA requires CPU >= 68020"));
+        return Err(AsmError::new(if mi.is_indirect || mi.base_reg.is_none() {
+            "full format EA requires CPU >= 68020"
+        } else {
+            "indexed displacement out of range (brief format is 8-bit, -128..127; wider needs 68020+)"
+        }));
     }
     if mi.base_is_pc {
         return Err(AsmError::new("PC-relative full format EA is not supported"));

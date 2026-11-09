@@ -90,6 +90,10 @@ pub struct SymbolTable {
     /// mode. Lives here because the operand parser — a free function
     /// reached from ~27 call sites — already receives the symbol table.
     optimize_absolute: bool,
+    /// First displacement the operand parser could not evaluate. The
+    /// parser answers 0 so pass 1 can size forward references; pass 2
+    /// takes this to report text that is not an expression at all.
+    displacement_error: std::cell::RefCell<Option<String>>,
 }
 
 impl SymbolTable {
@@ -106,6 +110,18 @@ impl SymbolTable {
     /// bits (see [`Self::optimize_absolute`]).
     pub fn set_optimize_absolute(&mut self, on: bool) {
         self.optimize_absolute = on;
+    }
+
+    fn note_displacement_error(&self, message: String) {
+        self.displacement_error.borrow_mut().get_or_insert(message);
+    }
+
+    fn has_displacement_error(&self) -> bool {
+        self.displacement_error.borrow().is_some()
+    }
+
+    fn take_displacement_error(&self) -> Option<String> {
+        self.displacement_error.borrow_mut().take()
     }
 
     /// Whether absolute-address shortening is enabled.
@@ -516,17 +532,21 @@ fn parse_operand_text(
     }
 
     // Addressing with displacement: (d16,An) or (d32,An)
-    if let Some((disp, reg)) = parse_parens_disp_register(paren_text, symbols, current_pc) {
+    if let Some((disp, reg, size)) = parse_parens_disp_register(paren_text, symbols, current_pc) {
         // A displacement that evaluates to 0 means the same thing as plain
         // `(An)`, which needs no extension word — 2 bytes less. Source
         // like `MOVE.L #x,OFF(A0)` with `OFF EQU 0` hits this whenever a
         // struct field sits at offset 0. Only under `--optimize`: it
         // changes the layout, and predictable addresses are exactly why
         // optimization is off by default.
-        if disp == 0 && symbols.optimize_absolute() {
+        if disp == 0 && size.is_none() && symbols.optimize_absolute() {
             return Ok(Operand::AddrRegIndirect(reg));
         }
-        let is_long = !(-0x8000..=0x7FFF).contains(&disp);
+        let fits_word = (-0x8000..=0x7FFF).contains(&disp);
+        if size == Some(false) && !fits_word {
+            symbols.note_displacement_error(format!("displacement {disp} does not fit .W"));
+        }
+        let is_long = size.unwrap_or(!fits_word);
         return Ok(Operand::AddrRegIndirectDisp(reg, disp, is_long));
     }
 
@@ -538,15 +558,23 @@ fn parse_operand_text(
             an, xn, disp, scale, xn_is_long,
         ));
     }
-    // It parses as the indexed form but the displacement does not fit the
-    // brief format's 8-bit field. Say so, rather than falling through to
-    // "cannot parse operand", which sends the reader looking at the
-    // syntax instead of the value. The PC-relative variant has always
-    // reported this correctly; this is the register-based counterpart.
-    if let Some(disp) = indexed_displacement_out_of_range(paren_text, symbols, current_pc) {
-        return Err(AsmError::new(format!(
-            "indexed displacement {disp} out of range (brief format is 8-bit, -128..127)"
-        )));
+    // The indexed form with a displacement too wide for the brief
+    // format's 8-bit field: the 68020 full format carries it as a 16- or
+    // 32-bit base displacement. The encoder refuses it below 68020.
+    if let Some((an, xn, disp, scale, xn_is_long)) =
+        indexed_with_wide_displacement(paren_text, symbols, current_pc)
+    {
+        return Ok(Operand::MemoryIndirect(Box::new(MemoryIndirectOperand {
+            base_reg: Some(an),
+            base_is_pc: false,
+            base_disp: Some(disp),
+            index_reg: Some(xn),
+            index_long: xn_is_long,
+            index_scale: scale,
+            outer_disp: None,
+            is_postindexed: false,
+            is_indirect: false,
+        })));
     }
 
     // Indexed with the base register suppressed: `(bd,Xn.size*scale)`, and
@@ -1014,7 +1042,11 @@ fn address_paren_pos(text: &str) -> Option<usize> {
     None
 }
 
-fn parse_parens_disp_register(text: &str, symbols: &SymbolTable, pc: u32) -> Option<(i32, u8)> {
+fn parse_parens_disp_register(
+    text: &str,
+    symbols: &SymbolTable,
+    pc: u32,
+) -> Option<(i32, u8, Option<bool>)> {
     let trimmed = text.trim();
     if trimmed.starts_with('(') && trimmed.ends_with(')') {
         let inner = &trimmed[1..trimmed.len() - 1];
@@ -1037,11 +1069,12 @@ fn parse_parens_disp_register(text: &str, symbols: &SymbolTable, pc: u32) -> Opt
                 let reg_part = &reg_str[..dot_pos];
                 if let Some(Operand::AddrReg(n)) = parse_register(reg_part) {
                     let disp = evaluate_displacement(disp_str, symbols, pc);
-                    return Some((disp, n));
+                    return Some((disp, n, None));
                 }
             } else if let Some(Operand::AddrReg(n)) = parse_register(reg_str) {
+                let (disp_str, size) = split_displacement_size(disp_str);
                 let disp = evaluate_displacement(disp_str, symbols, pc);
-                return Some((disp, n));
+                return Some((disp, n, size));
             }
         }
     }
@@ -1060,6 +1093,12 @@ fn parse_parens_disp_pc(text: &str, symbols: &SymbolTable, pc: u32) -> Option<(i
             let disp_str = inner[..pos].trim();
             let reg_str = inner[pos + 1..].trim();
             if reg_str.to_uppercase() == "PC" {
+                // `.W` names the only size (d16,PC) has; `.L` is left in
+                // and reported, as the 32-bit form is not supported.
+                let disp_str = match split_displacement_size(disp_str) {
+                    (base, Some(false)) => base,
+                    _ => disp_str,
+                };
                 let target = evaluate_pc_target(disp_str, symbols, pc);
                 let is_long = !(-0x8000..=0x7FFF).contains(&target);
                 return Some((target, is_long));
@@ -1194,26 +1233,30 @@ fn parse_parens_disp_reg_index(
     None
 }
 
-/// The displacement of an `(d,An,Xn)` operand whose value does not fit
-/// the brief format's 8-bit field, or `None` if `text` is not that form
-/// or the displacement fits.
+/// An `(bd,An,Xn)` operand whose displacement does not fit the brief
+/// format's 8-bit field, as (An, Xn, bd, scale, Xn is long); `None` if
+/// `text` is not that form or the displacement fits.
 ///
 /// Mirrors [`parse_parens_disp_reg_index`]'s shape check so the two
 /// cannot disagree about what counts as the indexed form.
-fn indexed_displacement_out_of_range(text: &str, symbols: &SymbolTable, pc: u32) -> Option<i32> {
+fn indexed_with_wide_displacement(
+    text: &str,
+    symbols: &SymbolTable,
+    pc: u32,
+) -> Option<(u8, u8, i32, u8, bool)> {
     let trimmed = text.trim();
     let inner = trimmed.strip_prefix('(')?.strip_suffix(')')?;
     let parts: Vec<&str> = inner.split(',').collect();
     if parts.len() < 3 {
         return None;
     }
-    if !matches!(parse_register(parts[1].trim()), Some(Operand::AddrReg(_))) {
+    let Some(Operand::AddrReg(an)) = parse_register(parts[1].trim()) else {
         return None;
-    }
-    let (xn_name, _, _) = parse_index_reg_and_scale(parts[2].trim());
-    index_reg_num(&parse_register(&xn_name)?)?;
+    };
+    let (xn_name, scale, is_long) = parse_index_reg_and_scale(parts[2].trim());
+    let xn = index_reg_num(&parse_register(&xn_name)?)?;
     let disp = evaluate_displacement(parts[0].trim(), symbols, pc);
-    (!(-128..=127).contains(&disp)).then_some(disp)
+    (!(-128..=127).contains(&disp)).then_some((an, xn, disp, scale, is_long))
 }
 
 /// Parse 68020+ memory indirect / full format EA syntax:
@@ -1513,9 +1556,33 @@ fn evaluate_displacement(text: &str, symbols: &SymbolTable, pc: u32) -> i32 {
     if let Some(n) = evaluate_simple_number(text) {
         return n;
     }
-    evaluate_expr_str(text, symbols, pc)
-        .map(|v| v as i32)
-        .unwrap_or(0)
+    match evaluate_expr_str(text, symbols, pc) {
+        Ok(v) => v as i32,
+        Err(e) => {
+            // In pass 1 this may be a forward reference; pass 2 reports it.
+            symbols
+                .note_displacement_error(format!("invalid displacement `{text}`: {}", e.message));
+            0
+        }
+    }
+}
+
+/// Split a `.W`/`.L` size suffix off a displacement: `($10.l,A0)` asks for
+/// a 32-bit displacement, `$10.w(A0)` for the 16-bit one.
+fn split_displacement_size(text: &str) -> (&str, Option<bool>) {
+    let at = text
+        .len()
+        .checked_sub(2)
+        .filter(|&at| text.is_char_boundary(at));
+    match at.map(|at| text.split_at(at)) {
+        Some((base, sfx)) if !base.trim().is_empty() && sfx.eq_ignore_ascii_case(".w") => {
+            (base, Some(false))
+        }
+        Some((base, sfx)) if !base.trim().is_empty() && sfx.eq_ignore_ascii_case(".l") => {
+            (base, Some(true))
+        }
+        _ => (text, None),
+    }
 }
 
 /// The symbol name `text` refers to, if it is a bare identifier that has
@@ -4523,30 +4590,39 @@ impl Assembler {
         // work with an unparsed operand.
         let mut operand_error: Option<AsmError> = None;
         let symbols = &self.symbols;
-        let mut parse_operand = |text: &str| match parse_operand_text(text, symbols, pc) {
-            // `parse_operand_text` answers a bare identifier with the
-            // placeholder `Address(0)` so pass 1 can size a forward
-            // reference before the symbol is known. By pass 2 every
-            // symbol is known, so a placeholder that is still here names
-            // something that was never defined — a typo. Letting it
-            // through assembled `JSR tippfehler` to `jsr $0.w` with exit
-            // status 0: working output for a program that cannot run.
-            Ok(Operand::Address(0)) if undefined_symbol_name(text, symbols).is_some() => {
-                let name = undefined_symbol_name(text, symbols).unwrap();
-                operand_error.get_or_insert(AsmError::new(format!("undefined symbol: {name}")));
-                None
-            }
-            // An undefined symbol inside a displacement or expression
-            // evaluated to 0 above; by pass 2 that can only be a mistake.
-            Ok(_) if undefined_symbol_in_operand(text, symbols, pc).is_some() => {
-                let name = undefined_symbol_in_operand(text, symbols, pc).unwrap();
-                operand_error.get_or_insert(AsmError::new(format!("undefined symbol: {name}")));
-                None
-            }
-            Ok(op) => Some(op),
-            Err(e) => {
-                operand_error.get_or_insert(e);
-                None
+        let mut parse_operand = |text: &str| {
+            symbols.take_displacement_error();
+            match parse_operand_text(text, symbols, pc) {
+                // `parse_operand_text` answers a bare identifier with the
+                // placeholder `Address(0)` so pass 1 can size a forward
+                // reference before the symbol is known. By pass 2 every
+                // symbol is known, so a placeholder that is still here names
+                // something that was never defined — a typo. Letting it
+                // through assembled `JSR tippfehler` to `jsr $0.w` with exit
+                // status 0: working output for a program that cannot run.
+                Ok(Operand::Address(0)) if undefined_symbol_name(text, symbols).is_some() => {
+                    let name = undefined_symbol_name(text, symbols).unwrap();
+                    operand_error.get_or_insert(AsmError::new(format!("undefined symbol: {name}")));
+                    None
+                }
+                // An undefined symbol inside a displacement or expression
+                // evaluated to 0 above; by pass 2 that can only be a mistake.
+                Ok(_) if undefined_symbol_in_operand(text, symbols, pc).is_some() => {
+                    let name = undefined_symbol_in_operand(text, symbols, pc).unwrap();
+                    operand_error.get_or_insert(AsmError::new(format!("undefined symbol: {name}")));
+                    None
+                }
+                // A displacement that is not an expression also evaluated to 0.
+                Ok(_) if symbols.has_displacement_error() => {
+                    let message = symbols.take_displacement_error().unwrap_or_default();
+                    operand_error.get_or_insert(AsmError::new(message));
+                    None
+                }
+                Ok(op) => Some(op),
+                Err(e) => {
+                    operand_error.get_or_insert(e);
+                    None
+                }
             }
         };
         let mut src = operand_texts.first().and_then(|t| parse_operand(t));
@@ -8002,6 +8078,60 @@ n   SET 10
             )
             .unwrap();
         assert_eq!(bytes, [0, 0, 0, 1, 0, 2, 0, 3, 0, 11, 0, 12]);
+    }
+
+    /// A `.W`/`.L` suffix on a displacement names its size; it used to
+    /// make the displacement evaluate to 0.
+    #[test]
+    fn displacement_size_suffix() {
+        let word = assemble_source_with_cpu(
+            "    move.l ($1234.w,a0),d0\n    move.l $10.w(a1),d1\n",
+            "68000",
+        );
+        assert_eq!(word, [0x20, 0x28, 0x12, 0x34, 0x22, 0x29, 0x00, 0x10]);
+        let long = assemble_source_with_cpu("    move.l ($1234.l,a0),d0\n", "68020");
+        assert_eq!(long, [0x20, 0x30, 0x01, 0x70, 0x00, 0x00, 0x12, 0x34]);
+    }
+
+    /// Displacements too wide for `(d16,An)` or the brief index format use
+    /// the 68020 full format instead of being rejected.
+    #[test]
+    fn wide_displacements_use_the_full_format_on_68020() {
+        let bytes = assemble_source_with_cpu(
+            "    move.l ($12345678,a0),d0\n    move.l (1000,a0,d1.w),d0\n",
+            "68020",
+        );
+        assert_eq!(
+            bytes,
+            [
+                0x20, 0x30, 0x01, 0x70, 0x12, 0x34, 0x56, 0x78, 0x20, 0x30, 0x11, 0x20, 0x03, 0xE8
+            ]
+        );
+        for source in [
+            "    move.l ($12345678,a0),d0\n",
+            "    move.l (1000,a0,d1.w),d0\n",
+        ] {
+            assert!(
+                Assembler::new(0).assemble(source).is_err(),
+                "{source} on 68000"
+            );
+        }
+    }
+
+    /// A displacement that is not an expression is an error, not 0.
+    #[test]
+    fn malformed_displacement_is_an_error() {
+        for source in [
+            "    move.l (1\u{e4}w,a0),d0\n",
+            "    move.l (1+,a0),d0\n",
+            "    move.l 1+(a0),d0\n",
+            "    move.l ($12#,a0,d1.w),d0\n",
+            "x equ 4\n    move.l (x.b,a0),d0\n",
+            "    move.l ($12345.w,a0),d0\n",
+        ] {
+            let mut asm = Assembler::new(0);
+            assert!(asm.assemble(source).is_err(), "{source}");
+        }
     }
 
     #[test]
