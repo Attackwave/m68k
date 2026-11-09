@@ -345,19 +345,28 @@ fn encode_full_ea(
     // "no base displacement" is encoded as 01, not 00 (which is reserved and
     // never emitted). verified against reference output for `([a0])`
     // -> ext 0x0151 (bd_code=1).
-    let bd_code: u16 = match base_disp {
-        None => 1,
-        Some(bd) if (-32768..=32767).contains(&bd) => 2,
-        Some(_) => 3,
+    let word = |v: i32| (-32768..=32767).contains(&v);
+    let bd_code: u16 = match (base_disp, mi.bd_forced) {
+        (None, _) => 1,
+        (Some(_), Some(true)) => 3,
+        (Some(bd), Some(false)) if !word(bd) => {
+            return Err(AsmError::new("base displacement does not fit .W"));
+        }
+        (Some(bd), None) if !word(bd) => 3,
+        (Some(_), _) => 2,
     };
 
     // `MemoryIndirect` is only ever constructed for indirect forms (a plain
     // pre-indexed EA without indirection is `AddrRegIndirectIndex` instead),
     // so i_i_s is always in the indirect range (1-3 postindexed, 5-7 preindexed).
-    let od_size: u16 = match mi.outer_disp {
-        None => 0,
-        Some(od) if (-32768..=32767).contains(&od) => 2,
-        Some(_) => 3,
+    let od_size: u16 = match (mi.outer_disp, mi.od_forced) {
+        (None, _) => 0,
+        (Some(_), Some(true)) => 3,
+        (Some(od), Some(false)) if !word(od) => {
+            return Err(AsmError::new("outer displacement does not fit .W"));
+        }
+        (Some(od), None) if !word(od) => 3,
+        (Some(_), _) => 2,
     };
 
     let iis_offset = match od_size {
@@ -535,6 +544,7 @@ mod tests {
             outer_disp: None,
             is_postindexed: false,
             is_indirect: true,
+            ..Default::default()
         }
     }
 
@@ -568,6 +578,7 @@ mod tests {
             outer_disp: Some(0x20),
             is_postindexed: false,
             is_indirect: true,
+            ..Default::default()
         };
         let op = Operand::MemoryIndirect(Box::new(mi));
         let (mode, reg, ext) = encode_ea(&op, "l", 0, 0xFFFF, "68020").unwrap();
@@ -588,6 +599,7 @@ mod tests {
             outer_disp: Some(0x20),
             is_postindexed: true,
             is_indirect: true,
+            ..Default::default()
         };
         let op = Operand::MemoryIndirect(Box::new(mi));
         let (mode, reg, ext) = encode_ea(&op, "l", 0, 0xFFFF, "68020").unwrap();
@@ -607,6 +619,7 @@ mod tests {
             outer_disp: None,
             is_postindexed: false,
             is_indirect: true,
+            ..Default::default()
         };
         let op = Operand::MemoryIndirect(Box::new(mi));
         // Extension word at 2 (`ext_pc` 4): bd = $10 - 2.

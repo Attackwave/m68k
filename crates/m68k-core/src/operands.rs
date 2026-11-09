@@ -66,7 +66,7 @@ pub enum Operand {
 }
 
 /// Parsed AST for a 68020+ memory indirect / full-format EA operand.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct MemoryIndirectOperand {
     /// Base register: `Some(n)` for `An`, `None` for suppressed base or `PC`.
     pub base_reg: Option<u8>,
@@ -91,6 +91,11 @@ pub struct MemoryIndirectOperand {
     /// with the base register suppressed — uses the same extension word
     /// layout but selects I/IS = 0, so the two must be told apart.
     pub is_indirect: bool,
+    /// Size the source gave the base displacement (`.W` = `Some(false)`,
+    /// `.L` = `Some(true)`); `None` picks the smallest that fits.
+    pub bd_forced: Option<bool>,
+    /// Same for the outer displacement.
+    pub od_forced: Option<bool>,
 }
 
 /// Offset or width field of a bitfield operand: either a data register or a constant.

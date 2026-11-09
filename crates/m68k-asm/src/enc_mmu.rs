@@ -127,6 +127,13 @@ pub fn enc_ptest(
     check_cpu(cpu, "68030")?;
     let (mode, reg, ext_words) = encode_ea(ea_op, "l", ext_pc, CONTROL_ALT, cpu)?;
     let level = field3(level, "PTEST level")?;
+    // Level 0 searches only the ATC; there is no descriptor address to
+    // return in An.
+    if level == 0 && an.is_some() {
+        return Err(AsmError::new(
+            "PTEST at level 0 cannot return an address register",
+        ));
+    }
     let rw: u16 = if read { 1 } else { 0 };
     let (a_bit, an_field) = match an {
         Some(n) => (1u16, n as u16),
