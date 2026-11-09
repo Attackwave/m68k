@@ -371,7 +371,7 @@ m68k-floppy --bootblock roms/game.adf > bootblock.bin
 | Standard ADF | `adf` | 80 tracks, 2 sides, 11 sectors (DD) |
 | Extended ADF | `adf` | Larger images with more sectors per track |
 | UAE-0/1ADF | `uae` | Raw MFM bitstream per track (copy-protected disks) |
-| IPF | `native` | Clean-room IPF parser with MFM bitstream decoding |
+| IPF | `native` | Clean-room reader for SPS/CAPS IPF images: record CRCs checked, track element streams rebuilt to MFM and decoded |
 | Atari ST `.st` | `st` | Raw sector dump; geometry from the boot sector, else from the size |
 | Atari ST `.msa` | `msa` | Magic Shadow Archiver, decompressed on reading |
 

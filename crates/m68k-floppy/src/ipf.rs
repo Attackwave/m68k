@@ -1,203 +1,216 @@
 //! Native Rust IPF reader (clean-room implementation).
 //!
-//! Parses IPF chunk headers (CAPS, INFO, IMGE, TRCK) without relying on the
-//! proprietary capsimg library. MFM bitstream decoding inside TRCK chunks is
-//! handled by [`crate::mfm::MfmDecoder`].
+//! An IPF file is a sequence of records, each starting with a 12-byte
+//! header: a four-character name, the record length (header included) and
+//! a CRC-32 of the record taken with the CRC field zeroed. `CAPS` comes
+//! first, `INFO` describes the disk, one `IMGE` per track names its
+//! cylinder, head, block count and data key, and the `DATA` record with
+//! the same key is followed by the track's extra data: one 32-byte
+//! descriptor per block, then the blocks' element streams, covered by a
+//! CRC-32 of their own.
+//!
+//! An element stream is a list of `(type, size, payload)` elements: sync
+//! and raw elements hold MFM cells as recorded, data and gap elements hold
+//! decoded bytes that are MFM-encoded here, fuzzy elements carry no payload.
+//! Each track is rebuilt as a cell stream, every Amiga sector is located by
+//! its `0x4489 0x4489` sync at any bit offset and handed to
+//! [`crate::mfm::MfmDecoder`].
 //!
 //! A proprietary-library-backed `capsimg` backend is intentionally not
 //! implemented: it would require FFI bindings to a closed-source
 //! `capsimg.{dll,so}` library that may not even be present in most
-//! environments — this native parser serves as the fallback when it isn't.
+//! environments.
 
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use crate::floppy_base::{FloppyError, FloppyImageReader, require_file};
-use crate::mfm::MfmDecoder;
+use crate::mfm::{MFM_SYNC_WORD, MfmDecoder, SECTOR_RAW_SIZE};
 
-/// Read a chunk-size field and validate it against the remaining file
-/// length before the caller allocates a buffer of that size. A crafted
-/// chunk header (e.g. `size = 0xFFFFFFFF`) previously drove an unbounded
-/// `vec![0u8; size as usize]` allocation — up to 4 GB per chunk — before
-/// the inevitable `read_exact` failure, an easy DoS via a malformed IPF
-/// file. `read_exact` would fail anyway once the declared size exceeds
-/// what's left in the file, so rejecting it up front is strictly more
-/// conservative, never rejecting a chunk that would otherwise succeed.
-fn read_checked_chunk_size(file: &mut File) -> Result<u32, FloppyError> {
-    let size = read_u32_be(file)?;
-    let pos = file
-        .stream_position()
-        .map_err(|e| FloppyError::new(e.to_string()))?;
-    let len = file
-        .seek(SeekFrom::End(0))
-        .map_err(|e| FloppyError::new(e.to_string()))?;
-    file.seek(SeekFrom::Start(pos))
-        .map_err(|e| FloppyError::new(e.to_string()))?;
-    let remaining = len.saturating_sub(pos);
-    if size as u64 > remaining {
-        return Err(FloppyError::new(format!(
-            "IPF chunk size {} exceeds remaining file length {}",
-            size, remaining
-        )));
+/// Largest IPF file read. Real double-density images are about 1 MB.
+const MAX_FILE_SIZE: u64 = 64 << 20;
+
+/// Largest track rebuilt, in MFM cells: eight times a high-density track.
+const MAX_TRACK_CELLS: usize = 1 << 21;
+
+const RECORD_HEADER: usize = 12;
+const INFO_SIZE: usize = 96;
+const IMGE_SIZE: usize = 80;
+const DATA_SIZE: usize = 28;
+const BLOCK_DESCRIPTOR: usize = 32;
+
+/// Block flag: element sizes count bits, not bytes.
+const BLOCK_DATA_IN_BITS: u32 = 1 << 2;
+
+/// CRC-32 (IEEE, reflected) as used by every IPF checksum.
+fn crc32(chunks: &[&[u8]]) -> u32 {
+    let mut crc = !0u32;
+    for byte in chunks.iter().flat_map(|c| c.iter()) {
+        crc ^= u32::from(*byte);
+        for _ in 0..8 {
+            crc = (crc >> 1) ^ (0xEDB8_8320 & (crc & 1).wrapping_neg());
+        }
     }
-    Ok(size)
+    !crc
 }
 
-#[derive(Debug, Default)]
-struct ImageInfo {
-    cylinders: u16,
-    heads: u16,
+fn be32(data: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes(data[offset..offset + 4].try_into().expect("4 bytes"))
 }
 
-/// Parse IPF files natively. Supports header parsing and MFM decoding of
-/// TRCK chunks.
+/// One track of the image: its block count and extra data, or why the
+/// extra data cannot be used.
+#[derive(Debug)]
+struct Track {
+    blocks: u32,
+    data: Result<Vec<u8>, String>,
+}
+
+/// Parse IPF files natively and decode their Amiga sectors.
 #[derive(Debug)]
 pub struct NativeIpfBackend {
-    info: ImageInfo,
-    track_chunks: HashMap<(u32, u32), Vec<u8>>,
+    cylinders: u16,
+    heads: u16,
+    tracks: HashMap<(u32, u32), Track>,
     decoded_sectors: HashMap<(u32, u32, u32), Vec<u8>>,
 }
 
-fn read_u32_be(f: &mut impl Read) -> Result<u32, FloppyError> {
-    let mut buf = [0u8; 4];
-    f.read_exact(&mut buf)
-        .map_err(|_| FloppyError::new("Unexpected end of file while reading uint32"))?;
-    Ok(u32::from_be_bytes(buf))
-}
-
-fn read_u16_be(data: &[u8], offset: usize) -> u16 {
-    u16::from_be_bytes([data[offset], data[offset + 1]])
-}
-
 impl NativeIpfBackend {
-    /// Open and validate a native (non-capsimg) IPF image.
+    /// Open and validate an IPF image.
     ///
     /// # Errors
-    /// Returns [`FloppyError`] if the file doesn't exist or is missing the
-    /// mandatory `CAPS`/`INFO` chunks.
+    /// Returns [`FloppyError`] if the file doesn't exist, is too large, a
+    /// record is truncated or fails its CRC, or the mandatory `CAPS`/`INFO`
+    /// records are missing.
     pub fn open(filepath: impl AsRef<Path>) -> Result<Self, FloppyError> {
-        let filepath = require_file(filepath.as_ref())?;
-        let (chunks_present, info, track_chunks) = Self::parse_ipf(&filepath)?;
-
-        if !chunks_present.0 {
-            return Err(FloppyError::new(
-                "Not a valid IPF file: missing CAPS header",
-            ));
+        let path = require_file(filepath.as_ref())?;
+        let size = std::fs::metadata(&path)
+            .map_err(|e| FloppyError::new(e.to_string()))?
+            .len();
+        if size > MAX_FILE_SIZE {
+            return Err(FloppyError::new(format!(
+                "IPF file is {size} bytes, more than the {MAX_FILE_SIZE} supported"
+            )));
         }
-        if !chunks_present.1 {
-            return Err(FloppyError::new("Not a valid IPF file: missing INFO chunk"));
-        }
+        let bytes = std::fs::read(&path).map_err(|e| FloppyError::new(e.to_string()))?;
+        Self::parse(&bytes).map_err(FloppyError::new)
+    }
 
+    fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let mut info = None;
+        // data key -> (cylinder, head, block count) from IMGE records
+        let mut images: HashMap<u32, (u32, u32, u32)> = HashMap::new();
+        let mut payloads: HashMap<u32, Result<Vec<u8>, String>> = HashMap::new();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let header = bytes
+                .get(pos..pos + RECORD_HEADER)
+                .ok_or_else(|| format!("IPF record header at offset {pos} is truncated"))?;
+            let name: [u8; 4] = header[..4].try_into().expect("4 bytes");
+            let shown = String::from_utf8_lossy(&name).into_owned();
+            let len = be32(header, 4) as usize;
+            let record = bytes
+                .get(pos..pos.saturating_add(len))
+                .filter(|_| len >= RECORD_HEADER)
+                .ok_or_else(|| {
+                    format!("IPF record {shown} at offset {pos} has an invalid length {len}")
+                })?;
+            if crc32(&[&record[..8], &[0; 4], &record[12..]]) != be32(header, 8) {
+                return Err(format!("IPF record {shown} at offset {pos}: CRC mismatch"));
+            }
+            if pos == 0 && &name != b"CAPS" {
+                return Err("Not a valid IPF file: missing CAPS header".into());
+            }
+            let need = |size: usize| {
+                if len < size {
+                    Err(format!(
+                        "IPF record {shown} is {len} bytes, expected {size}"
+                    ))
+                } else {
+                    Ok(())
+                }
+            };
+            pos += len;
+            match &name {
+                b"INFO" => {
+                    need(INFO_SIZE)?;
+                    let max_cylinder = be32(record, 40);
+                    let max_head = be32(record, 48);
+                    info = Some((
+                        u16::try_from(max_cylinder.saturating_add(1)).unwrap_or(u16::MAX),
+                        u16::try_from(max_head.saturating_add(1)).unwrap_or(u16::MAX),
+                    ));
+                }
+                b"IMGE" => {
+                    need(IMGE_SIZE)?;
+                    let track = (be32(record, 12), be32(record, 16), be32(record, 52));
+                    images.insert(be32(record, 64), track);
+                }
+                b"DATA" => {
+                    need(DATA_SIZE)?;
+                    let size = be32(record, 12) as usize;
+                    let extra = bytes.get(pos..pos.saturating_add(size)).ok_or_else(|| {
+                        format!("IPF DATA record at offset {} runs past the end", pos - len)
+                    })?;
+                    pos += size;
+                    let data = if size == 0 || crc32(&[extra]) == be32(record, 20) {
+                        Ok(extra.to_vec())
+                    } else {
+                        Err("track data fails its CRC".to_string())
+                    };
+                    payloads.insert(be32(record, 24), data);
+                }
+                _ => {}
+            }
+        }
+        if bytes.is_empty() {
+            return Err("Not a valid IPF file: missing CAPS header".into());
+        }
+        let (cylinders, heads) = info.ok_or("Not a valid IPF file: missing INFO chunk")?;
+        let tracks = images
+            .into_iter()
+            .map(|(key, (cylinder, head, blocks))| {
+                let data = payloads
+                    .remove(&key)
+                    .unwrap_or_else(|| Err("no DATA record for the track".into()));
+                ((cylinder, head), Track { blocks, data })
+            })
+            .collect();
         Ok(Self {
-            info,
-            track_chunks,
+            cylinders,
+            heads,
+            tracks,
             decoded_sectors: HashMap::new(),
         })
     }
 
-    #[allow(clippy::type_complexity)]
-    fn parse_ipf(
-        filepath: &PathBuf,
-    ) -> Result<((bool, bool), ImageInfo, HashMap<(u32, u32), Vec<u8>>), FloppyError> {
-        let mut file = File::open(filepath).map_err(|e| FloppyError::new(e.to_string()))?;
-        let mut has_caps = false;
-        let mut has_info = false;
-        let mut info = ImageInfo::default();
-        let mut track_chunks: HashMap<(u32, u32), Vec<u8>> = HashMap::new();
-
-        loop {
-            let mut header = [0u8; 4];
-            match file.read(&mut header) {
-                Ok(4) => {}
-                _ => break,
-            };
-
-            match &header {
-                b"CAPS" => {
-                    let size = read_checked_chunk_size(&mut file)?;
-                    let mut data = vec![0u8; size as usize];
-                    file.read_exact(&mut data)
-                        .map_err(|e| FloppyError::new(e.to_string()))?;
-                    has_caps = true;
-                }
-                b"INFO" => {
-                    let size = read_checked_chunk_size(&mut file)?;
-                    let mut data = vec![0u8; size as usize];
-                    file.read_exact(&mut data)
-                        .map_err(|e| FloppyError::new(e.to_string()))?;
-                    if data.len() < 8 {
-                        return Err(FloppyError::new("INFO chunk too small"));
-                    }
-                    info.cylinders = read_u16_be(&data, 0);
-                    info.heads = read_u16_be(&data, 2);
-                    has_info = true;
-                }
-                b"IMGE" => {
-                    let size = read_checked_chunk_size(&mut file)?;
-                    let mut data = vec![0u8; size as usize];
-                    file.read_exact(&mut data)
-                        .map_err(|e| FloppyError::new(e.to_string()))?;
-                }
-                b"TRCK" => {
-                    let size = read_checked_chunk_size(&mut file)?;
-                    let mut data = vec![0u8; size as usize];
-                    file.read_exact(&mut data)
-                        .map_err(|e| FloppyError::new(e.to_string()))?;
-                    if data.len() >= 4 {
-                        let track = read_u16_be(&data, 0) as u32;
-                        let side = read_u16_be(&data, 2) as u32;
-                        track_chunks
-                            .entry((track, side))
-                            .or_default()
-                            .extend_from_slice(&data);
-                    }
-                }
-                _ => {
-                    let size = read_checked_chunk_size(&mut file)?;
-                    let mut skip = vec![0u8; size as usize];
-                    let _ = file.read_exact(&mut skip);
-                }
-            }
-        }
-
-        Ok(((has_caps, has_info), info, track_chunks))
-    }
-
-    /// Cylinder count from the INFO chunk, for diagnostics/tests.
+    /// Cylinder count from the INFO record, for diagnostics/tests.
     pub fn cylinders(&self) -> u16 {
-        self.info.cylinders
+        self.cylinders
     }
 
-    /// Head count from the INFO chunk, for diagnostics/tests.
+    /// Head count from the INFO record, for diagnostics/tests.
     pub fn heads(&self) -> u16 {
-        self.info.heads
+        self.heads
     }
 
-    /// Decode all sectors from a track's TRCK chunk and cache them.
+    /// Decode all sectors of a track and cache them.
     ///
-    /// `track`/`side` are the logical coordinates from the TRCK chunk header
-    /// (used as the public `read_sector` key). The MFM sector headers embed
-    /// the raw Amiga track number instead (`track*2+side`) - that's what
-    /// must be passed to `decode_track` as `expected_track`, since
-    /// `MfmDecoder` compares against the header's raw value directly (see
-    /// `mfm.rs::decode_sector_from_raw` and `uae.rs::decode_track_sectors`,
-    /// which has the same contract for the same reason).
-    fn decode_track_sectors(&mut self, track: u32, side: u32) {
-        let Some(raw_data) = self.track_chunks.get(&(track, side)) else {
-            return;
-        };
-        if raw_data.len() < 4 {
-            return;
+    /// The MFM sector headers carry the raw Amiga track number
+    /// (`cylinder*2+head`), which is what `MfmDecoder` compares against.
+    fn decode_track_sectors(&mut self, track: u32, side: u32) -> Result<(), String> {
+        let entry = self
+            .tracks
+            .get(&(track, side))
+            .ok_or_else(|| format!("No track {track}, side {side} in the IPF image"))?;
+        let data = entry.data.as_ref().map_err(Clone::clone)?;
+        let framed = frame_sectors(&track_cells(data, entry.blocks)?);
+        if framed.is_empty() {
+            return Ok(());
         }
-        let Ok(decoder) = MfmDecoder::new(raw_data) else {
-            return;
-        };
-        let raw_track = track * 2 + side;
-        let Ok(decoded) = decoder.decode_track(Some(raw_track), Some(side)) else {
-            return;
-        };
+        let decoded = MfmDecoder::new(&framed)
+            .and_then(|d| d.decode_track(Some(track * 2 + side), Some(side)))
+            .map_err(|e| e.0)?;
         // A sector whose MFM checksums fail is not returned: its data (or
         // even its sector number) is corrupt.
         for sector in decoded
@@ -207,7 +220,159 @@ impl NativeIpfBackend {
             self.decoded_sectors
                 .insert((track, side, sector.sector), sector.data);
         }
+        Ok(())
     }
+}
+
+/// An MFM cell stream, most significant bit first.
+#[derive(Default)]
+struct Cells {
+    bytes: Vec<u8>,
+    len: usize,
+    /// Last data bit written, which decides the next clock bit.
+    previous: bool,
+}
+
+impl Cells {
+    fn reserve(&self, cells: u64) -> Result<(), String> {
+        if (self.len as u64).saturating_add(cells) > MAX_TRACK_CELLS as u64 {
+            return Err(format!("track exceeds {MAX_TRACK_CELLS} MFM cells"));
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, cell: bool) {
+        if self.len.is_multiple_of(8) {
+            self.bytes.push(0);
+        }
+        if cell {
+            self.bytes[self.len / 8] |= 0x80 >> (self.len % 8);
+        }
+        self.len += 1;
+    }
+
+    fn bit(&self, index: usize) -> bool {
+        self.bytes[index / 8] & (0x80 >> (index % 8)) != 0
+    }
+
+    /// Eight cells starting at an arbitrary cell index.
+    fn byte_at(&self, index: usize) -> u8 {
+        (0..8).fold(0, |acc, i| acc << 1 | u8::from(self.bit(index + i)))
+    }
+
+    /// Cells as recorded (sync and raw elements).
+    fn raw(&mut self, src: &[u8], bits: usize) {
+        for i in 0..bits {
+            let cell = src[i / 8] & (0x80 >> (i % 8)) != 0;
+            self.push(cell);
+            self.previous = cell;
+        }
+    }
+
+    /// One MFM-encoded data bit: a clock cell, set only between two zeros.
+    fn data_bit(&mut self, bit: bool) {
+        self.push(!self.previous && !bit);
+        self.push(bit);
+        self.previous = bit;
+    }
+
+    fn data(&mut self, src: &[u8], bits: usize) {
+        for i in 0..bits {
+            self.data_bit(src[i / 8] & (0x80 >> (i % 8)) != 0);
+        }
+    }
+
+    /// `cells` cells of encoded zero bytes. Gap content only pads the
+    /// layout; sectors are found by their sync, not by position.
+    fn gap(&mut self, cells: usize) {
+        for _ in 0..cells / 2 {
+            self.data_bit(false);
+        }
+        if cells % 2 == 1 {
+            self.push(!self.previous);
+        }
+    }
+}
+
+/// Rebuild a track's MFM cells from its block descriptors and element
+/// streams.
+fn track_cells(data: &[u8], blocks: u32) -> Result<Cells, String> {
+    let truncated = || "IPF track data is truncated".to_string();
+    let mut cells = Cells::default();
+    for block in 0..blocks as usize {
+        let at = block * BLOCK_DESCRIPTOR;
+        let desc = data.get(at..at + BLOCK_DESCRIPTOR).ok_or_else(truncated)?;
+        let gap_bits = be32(desc, 4) as usize;
+        let in_bits = be32(desc, 20) & BLOCK_DATA_IN_BITS != 0;
+        let mut p = be32(desc, 28) as usize;
+        loop {
+            let head = *data.get(p).ok_or_else(truncated)?;
+            p += 1;
+            let kind = head & 0x1F;
+            if kind == 0 {
+                break;
+            }
+            let width = usize::from(head >> 5);
+            let size = data
+                .get(p..p + width)
+                .ok_or_else(truncated)?
+                .iter()
+                .fold(0u64, |acc, b| acc << 8 | u64::from(*b));
+            p += width;
+            let bits = if in_bits {
+                size
+            } else {
+                size.saturating_mul(8)
+            };
+            match kind {
+                // sync, raw: cells as recorded
+                1 | 4 => {
+                    cells.reserve(bits)?;
+                    let n = (bits as usize).div_ceil(8);
+                    let src = data.get(p..p + n).ok_or_else(truncated)?;
+                    p += n;
+                    cells.raw(src, bits as usize);
+                }
+                // data, gap: decoded bytes
+                2 | 3 => {
+                    cells.reserve(bits.saturating_mul(2))?;
+                    let n = (bits as usize).div_ceil(8);
+                    let src = data.get(p..p + n).ok_or_else(truncated)?;
+                    p += n;
+                    cells.data(src, bits as usize);
+                }
+                // fuzzy: bits that read differently every revolution
+                5 => {
+                    cells.reserve(bits.saturating_mul(2))?;
+                    cells.data(&vec![0; (bits as usize).div_ceil(8)], bits as usize);
+                }
+                _ => return Err(format!("unknown IPF data element type {kind}")),
+            }
+        }
+        cells.reserve(gap_bits as u64)?;
+        cells.gap(gap_bits);
+    }
+    Ok(cells)
+}
+
+/// Copy every Amiga sector found in `cells`, at whatever bit offset its
+/// sync lies, into a word-aligned buffer `MfmDecoder` can read: the
+/// `0xAAAA 0xAAAA` preamble, the two sync words, then the sector's cells.
+fn frame_sectors(cells: &Cells) -> Vec<u8> {
+    const SYNC: u32 = (MFM_SYNC_WORD as u32) << 16 | MFM_SYNC_WORD as u32;
+    let body = SECTOR_RAW_SIZE - 8;
+    let mut framed = Vec::new();
+    let mut window = 0u32;
+    for i in 0..cells.len {
+        window = window << 1 | u32::from(cells.bit(i));
+        let start = i + 1;
+        if i >= 31 && window == SYNC && start + body * 8 <= cells.len {
+            framed.extend_from_slice(&[0xAA, 0xAA, 0xAA, 0xAA]);
+            framed.extend_from_slice(&SYNC.to_be_bytes());
+            framed.extend((0..body).map(|k| cells.byte_at(start + k * 8)));
+        }
+    }
+    framed
 }
 
 impl FloppyImageReader for NativeIpfBackend {
@@ -216,16 +381,8 @@ impl FloppyImageReader for NativeIpfBackend {
         if let Some(data) = self.decoded_sectors.get(&key) {
             return Ok(data.clone());
         }
-
-        if !self.track_chunks.contains_key(&(track, side)) {
-            return Err(FloppyError::new(format!(
-                "No TRCK chunk for track {}, side {}",
-                track, side
-            )));
-        }
-
-        self.decode_track_sectors(track, side);
-
+        self.decode_track_sectors(track, side)
+            .map_err(|e| FloppyError::new(format!("Track {track}, side {side}: {e}")))?;
         self.decoded_sectors.get(&key).cloned().ok_or_else(|| {
             FloppyError::new(format!(
                 "Sector {} not found on track {}, side {} (missing, or its checksum failed)",
@@ -235,101 +392,261 @@ impl FloppyImageReader for NativeIpfBackend {
     }
 }
 
+/// Builds IPF images the way the SPS encoder lays them out, for tests.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_image {
+    use super::crc32;
 
-    fn write_chunk(buf: &mut Vec<u8>, fourcc: &[u8; 4], data: &[u8]) {
-        buf.extend_from_slice(fourcc);
-        buf.extend_from_slice(&(data.len() as u32).to_be_bytes());
-        buf.extend_from_slice(data);
+    pub fn record(name: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let len = (12 + payload.len()) as u32;
+        let mut rec = name.to_vec();
+        rec.extend_from_slice(&len.to_be_bytes());
+        let crc = crc32(&[&rec, &[0; 4], payload]);
+        rec.extend_from_slice(&crc.to_be_bytes());
+        rec.extend_from_slice(payload);
+        rec
     }
 
-    fn make_minimal_ipf(dir: &Path) -> PathBuf {
-        let mut buf = Vec::new();
-        write_chunk(&mut buf, b"CAPS", &[0, 0, 0, 1]);
-        let info_data: Vec<u8> = [80u16, 2, 0, 0]
-            .iter()
-            .flat_map(|v| v.to_be_bytes())
+    fn words(values: &[u32]) -> Vec<u8> {
+        values.iter().flat_map(|v| v.to_be_bytes()).collect()
+    }
+
+    /// `CAPS` and an `INFO` for an 80-cylinder, 2-head Amiga disk.
+    pub fn header() -> Vec<u8> {
+        let mut info = vec![1, 2, 1, 0, 1, 0, 0, 79, 0, 1, 0, 0, 1];
+        info.resize(21, 0);
+        let mut out = record(b"CAPS", &[]);
+        out.extend(record(b"INFO", &words(&info)));
+        out
+    }
+
+    /// The 16 data bits of an odd/even split long, as two decoded bytes.
+    fn compress(split: u32) -> [u8; 2] {
+        let v = (0..16)
+            .rev()
+            .fold(0u16, |acc, i| acc << 1 | ((split >> (2 * i)) & 1) as u16);
+        v.to_be_bytes()
+    }
+
+    /// The decoded bytes following the sync of one Amiga sector.
+    fn sector_body(raw_track: u32, sector: u32, data: &[u8; 512]) -> Vec<u8> {
+        let odd = |v: u32| (v >> 1) & 0x5555_5555;
+        let even = |v: u32| v & 0x5555_5555;
+        let info = 0xFF << 24 | raw_track << 16 | sector << 8 | (11 - sector);
+        let header = [odd(info), even(info), 0, 0, 0, 0, 0, 0, 0, 0];
+        let header_sum = header.iter().fold(0, |a, x| a ^ x) & 0x5555_5555;
+        let longs: Vec<u32> = data
+            .chunks(4)
+            .map(|c| u32::from_be_bytes(c.try_into().unwrap()))
             .collect();
-        write_chunk(&mut buf, b"INFO", &info_data);
-        let path = dir.join("test.ipf");
-        std::fs::write(&path, buf).unwrap();
-        path
+        let body: Vec<u32> = longs
+            .iter()
+            .map(|&v| odd(v))
+            .chain(longs.iter().map(|&v| even(v)))
+            .collect();
+        let data_sum = body.iter().fold(0, |a, x| a ^ x) & 0x5555_5555;
+        let mut split = header.to_vec();
+        split.extend([
+            odd(header_sum),
+            even(header_sum),
+            odd(data_sum),
+            even(data_sum),
+        ]);
+        split.extend(body);
+        split.into_iter().flat_map(compress).collect()
+    }
+
+    fn element(kind: u8, payload: &[u8], size: u16) -> Vec<u8> {
+        let mut e = vec![kind | 2 << 5];
+        e.extend_from_slice(&size.to_be_bytes());
+        e.extend_from_slice(payload);
+        e
+    }
+
+    /// `IMGE` and `DATA` records for one track of 11 sectors, sector `n`
+    /// filled with `fill + n`. `in_bits` stores element sizes in bits.
+    pub fn track(cylinder: u32, head: u32, fill: u8, in_bits: bool) -> Vec<u8> {
+        let unit = if in_bits { 8 } else { 1 };
+        let key = cylinder * 2 + head + 1;
+        let streams: Vec<Vec<u8>> = (0..11)
+            .map(|n| {
+                let body = sector_body(cylinder * 2 + head, n, &[fill.wrapping_add(n as u8); 512]);
+                let mut s = element(2, &[0, 0], 2 * unit);
+                s.extend(element(1, &[0x44, 0x89, 0x44, 0x89], 4 * unit));
+                s.extend(element(2, &body, body.len() as u16 * unit));
+                s.push(0);
+                s
+            })
+            .collect();
+        let gap = 1600;
+        let mut offset = 11 * 32;
+        let mut extra = Vec::new();
+        for (n, s) in streams.iter().enumerate() {
+            let gap_bits = if n == 10 { gap } else { 0 };
+            let flag = if in_bits { 4 } else { 0 };
+            extra.extend(words(&[1088 * 8, gap_bits, 0, 1, 1, flag, 0, offset]));
+            offset += s.len() as u32;
+        }
+        extra.extend(streams.concat());
+        let data_bits = 11 * 1088 * 8;
+        let image = [
+            cylinder,
+            head,
+            2,
+            1,
+            (data_bits + gap).div_ceil(8),
+            0,
+            0,
+            data_bits,
+            gap,
+            data_bits + gap,
+            11,
+            0,
+            0,
+            key,
+            0,
+            0,
+            0,
+        ];
+        let mut out = record(b"IMGE", &words(&image));
+        let crc = crc32(&[&extra]);
+        out.extend(record(
+            b"DATA",
+            &words(&[extra.len() as u32, extra.len() as u32 * 8, crc, key]),
+        ));
+        out.extend(extra);
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_image::{header, record, track};
+    use super::*;
+    use std::path::PathBuf;
+
+    fn open_bytes(dir: &TempDir, bytes: &[u8]) -> Result<NativeIpfBackend, FloppyError> {
+        let path = dir.path().join("test.ipf");
+        std::fs::write(&path, bytes).unwrap();
+        NativeIpfBackend::open(&path)
+    }
+
+    #[test]
+    fn crc32_matches_the_ieee_check_value() {
+        assert_eq!(crc32(&[b"123456789"]), 0xCBF4_3926);
     }
 
     #[test]
     fn test_valid_ipf() {
         let dir = tempdir();
-        let path = make_minimal_ipf(dir.path());
-        let reader = NativeIpfBackend::open(&path).unwrap();
+        let reader = open_bytes(&dir, &header()).unwrap();
         assert_eq!(reader.cylinders(), 80);
         assert_eq!(reader.heads(), 2);
     }
 
-    /// Regression: a chunk header claiming a size far larger than the
-    /// rest of the file (e.g. `size = 0xFFFFFFFF`) previously drove an
-    /// unbounded `vec![0u8; size as usize]` allocation — up to 4 GB —
-    /// before the inevitable `read_exact` failure. Must now be rejected
-    /// with a clean error before any such allocation happens.
+    #[test]
+    fn reads_every_sector_of_both_sides() {
+        let dir = tempdir();
+        let mut ipf = header();
+        ipf.extend(track(0, 0, 0x10, false));
+        ipf.extend(track(0, 1, 0x40, false));
+        ipf.extend(track(40, 1, 0x80, false));
+        let mut reader = open_bytes(&dir, &ipf).unwrap();
+        for (cylinder, head, fill) in [(0, 0, 0x10u8), (0, 1, 0x40), (40, 1, 0x80)] {
+            for n in 0..11 {
+                let sector = reader.read_sector(cylinder, head, n).unwrap();
+                assert_eq!(sector, vec![fill + n as u8; 512], "{cylinder}/{head}/{n}");
+            }
+        }
+        assert!(reader.read_sector(1, 0, 0).is_err());
+    }
+
+    #[test]
+    fn element_sizes_in_bits() {
+        let dir = tempdir();
+        let mut ipf = header();
+        ipf.extend(track(3, 0, 0x22, true));
+        let mut reader = open_bytes(&dir, &ipf).unwrap();
+        assert_eq!(reader.read_sector(3, 0, 10).unwrap(), vec![0x2C; 512]);
+    }
+
+    #[test]
+    fn record_crc_mismatch_is_rejected() {
+        let dir = tempdir();
+        let mut ipf = header();
+        ipf.extend(track(0, 0, 0, false));
+        let imge = ipf.windows(4).position(|w| w == b"IMGE").unwrap();
+        ipf[imge + 15] ^= 1; // cylinder field
+        let err = open_bytes(&dir, &ipf).unwrap_err();
+        assert!(err.0.contains("IMGE") && err.0.contains("CRC"), "{}", err.0);
+    }
+
+    #[test]
+    fn track_data_crc_mismatch_fails_only_that_track() {
+        let dir = tempdir();
+        let mut ipf = header();
+        ipf.extend(track(0, 0, 0x10, false));
+        ipf.extend(track(0, 1, 0x40, false));
+        let last = ipf.len() - 100; // inside the second track's element streams
+        ipf[last] ^= 0xFF;
+        let mut reader = open_bytes(&dir, &ipf).unwrap();
+        assert_eq!(reader.read_sector(0, 0, 0).unwrap(), vec![0x10; 512]);
+        let err = reader.read_sector(0, 1, 0).unwrap_err();
+        assert!(err.0.contains("CRC"), "{}", err.0);
+    }
+
+    #[test]
+    fn element_size_beyond_the_track_limit_is_an_error() {
+        let dir = tempdir();
+        // A fuzzy element claiming 2^32 bytes, which carries no payload.
+        let mut extra = [8 * 1088u32, 0, 0, 1, 1, 0, 0, 32]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect::<Vec<u8>>();
+        extra.extend([5 | 5 << 5, 1, 0, 0, 0, 0, 0]);
+        let mut ipf = header();
+        let image: Vec<u8> = [0u32, 0, 2, 1, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        ipf.extend(record(b"IMGE", &image));
+        let data: Vec<u8> = [extra.len() as u32, 0, crc32(&[&extra]), 1]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        ipf.extend(record(b"DATA", &data));
+        ipf.extend(extra);
+        let mut reader = open_bytes(&dir, &ipf).unwrap();
+        let err = reader.read_sector(0, 0, 0).unwrap_err();
+        assert!(err.0.contains("MFM cells"), "{}", err.0);
+    }
+
+    /// A record length far beyond the end of the file is rejected before
+    /// anything is allocated for it.
     #[test]
     fn test_chunk_size_exceeding_file_length_is_rejected() {
         let dir = tempdir();
         let mut buf = Vec::new();
         buf.extend_from_slice(b"CAPS");
         buf.extend_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
-        buf.extend_from_slice(&[0, 0, 0, 1]); // a few real bytes follow, nowhere near declared size
-        let path = dir.path().join("evil.ipf");
-        std::fs::write(&path, &buf).unwrap();
-
-        let result = NativeIpfBackend::open(&path);
-        assert!(result.is_err());
+        buf.extend_from_slice(&[0, 0, 0, 1]);
+        let err = open_bytes(&dir, &buf).unwrap_err();
+        assert!(err.0.contains("invalid length"), "{}", err.0);
     }
 
     #[test]
     fn test_missing_caps() {
         let dir = tempdir();
-        let mut buf = Vec::new();
-        let info_data: Vec<u8> = [80u16, 2, 0, 0]
-            .iter()
-            .flat_map(|v| v.to_be_bytes())
-            .collect();
-        write_chunk(&mut buf, b"INFO", &info_data);
-        let path = dir.path().join("bad.ipf");
-        std::fs::write(&path, buf).unwrap();
-        let err = NativeIpfBackend::open(&path).unwrap_err();
-        assert!(err.0.contains("missing CAPS"));
+        let info = header().split_off(12);
+        let err = open_bytes(&dir, &info).unwrap_err();
+        assert!(err.0.contains("missing CAPS"), "{}", err.0);
     }
 
     #[test]
     fn test_missing_info() {
         let dir = tempdir();
-        let mut buf = Vec::new();
-        write_chunk(&mut buf, b"CAPS", &[0, 0, 0, 1]);
-        let path = dir.path().join("bad.ipf");
-        std::fs::write(&path, buf).unwrap();
-        let err = NativeIpfBackend::open(&path).unwrap_err();
-        assert!(err.0.contains("missing INFO"));
-    }
-
-    #[test]
-    fn test_read_sector_raises_floppy_error_for_invalid_data() {
-        let dir = tempdir();
-        let mut buf = Vec::new();
-        write_chunk(&mut buf, b"CAPS", &[0, 0, 0, 1]);
-        let info_data: Vec<u8> = [80u16, 2, 0, 0]
-            .iter()
-            .flat_map(|v| v.to_be_bytes())
-            .collect();
-        write_chunk(&mut buf, b"INFO", &info_data);
-        let mut trck_data = vec![0u8, 0, 0, 0];
-        trck_data.extend(vec![0u8; 100]);
-        write_chunk(&mut buf, b"TRCK", &trck_data);
-        let path = dir.path().join("test.ipf");
-        std::fs::write(&path, buf).unwrap();
-
-        let mut reader = NativeIpfBackend::open(&path).unwrap();
-        assert!(reader.read_sector(0, 0, 0).is_err());
+        let err = open_bytes(&dir, &record(b"CAPS", &[])).unwrap_err();
+        assert!(err.0.contains("missing INFO"), "{}", err.0);
     }
 
     #[test]
@@ -338,105 +655,6 @@ mod tests {
         let path = dir.path().join("nonexistent.ipf");
         let err = NativeIpfBackend::open(&path).unwrap_err();
         assert!(err.0.contains("File not found"));
-    }
-
-    // Regression test for the same track-number/side bug fixed in uae.rs:
-    // decode_track_sectors must pass the raw Amiga track number
-    // (track*2+side) to MfmDecoder, not the TRCK chunk's own logical track
-    // field, since real MFM sector headers encode the combined value.
-    // Built with a real MFM-encoded sector (not the all-zero placeholder
-    // track the other tests here use), which never exercises the
-    // track-number comparison.
-
-    fn encode_mfm_long(value: u32) -> (u32, u32) {
-        let odd = (value & 0xAAAA_AAAA) >> 1;
-        let even = value & 0x5555_5555;
-        (odd, even)
-    }
-
-    fn build_valid_sector(
-        raw_track: u32,
-        sector: u32,
-        sectors_to_end: u32,
-        data: &[u8],
-    ) -> Vec<u8> {
-        const SECTOR_RAW_SIZE: usize = 1088;
-        let mut sector_raw = vec![0u8; SECTOR_RAW_SIZE];
-
-        sector_raw[0..2].copy_from_slice(&0xAAAAu16.to_be_bytes());
-        sector_raw[2..4].copy_from_slice(&0xAAAAu16.to_be_bytes());
-        sector_raw[4..6].copy_from_slice(&0x4489u16.to_be_bytes());
-        sector_raw[6..8].copy_from_slice(&0x4489u16.to_be_bytes());
-
-        let info_value = (0xFFu32 << 24) | (raw_track << 16) | (sector << 8) | sectors_to_end;
-        let (info_odd, info_even) = encode_mfm_long(info_value);
-        sector_raw[0x08..0x0C].copy_from_slice(&info_odd.to_be_bytes());
-        sector_raw[0x0C..0x10].copy_from_slice(&info_even.to_be_bytes());
-
-        let checksum = (info_odd ^ info_even) & 0x5555_5555;
-        let (cksum_odd, cksum_even) = encode_mfm_long(checksum);
-        sector_raw[0x30..0x34].copy_from_slice(&cksum_odd.to_be_bytes());
-        sector_raw[0x34..0x38].copy_from_slice(&cksum_even.to_be_bytes());
-
-        let mut data_odd = vec![0u8; 512];
-        let mut data_even = vec![0u8; 512];
-        for (i, &byte) in data.iter().enumerate() {
-            data_odd[i] = (byte & 0xAA) >> 1;
-            data_even[i] = byte & 0x55;
-        }
-        let mut data_checksum = 0u32;
-        for i in 0..512 / 4 {
-            data_checksum ^= u32::from_be_bytes(data_odd[i * 4..i * 4 + 4].try_into().unwrap());
-            data_checksum ^= u32::from_be_bytes(data_even[i * 4..i * 4 + 4].try_into().unwrap());
-        }
-        data_checksum &= 0x5555_5555;
-        let (data_cksum_odd, data_cksum_even) = encode_mfm_long(data_checksum);
-        sector_raw[0x38..0x3C].copy_from_slice(&data_cksum_odd.to_be_bytes());
-        sector_raw[0x3C..0x40].copy_from_slice(&data_cksum_even.to_be_bytes());
-
-        sector_raw[0x40..0x40 + 512].copy_from_slice(&data_odd);
-        sector_raw[0x240..0x240 + 512].copy_from_slice(&data_even);
-        sector_raw
-    }
-
-    /// Build a TRCK chunk payload: 4-byte (track,side) header followed by a
-    /// raw MFM bitstream keyed by the raw Amiga track number (track*2+side),
-    /// as it would appear in a real capture.
-    fn build_trck_data(track: u32, side: u32, data_byte: u8) -> Vec<u8> {
-        let mut trck = Vec::new();
-        trck.extend_from_slice(&(track as u16).to_be_bytes());
-        trck.extend_from_slice(&(side as u16).to_be_bytes());
-        for _ in 0..20 {
-            trck.extend_from_slice(&0xAAAAu16.to_be_bytes());
-        }
-        let raw_track = track * 2 + side;
-        trck.extend(build_valid_sector(raw_track, 0, 1, &[data_byte; 512]));
-        trck
-    }
-
-    #[test]
-    fn test_read_sector_both_sides_with_real_mfm_headers() {
-        let dir = tempdir();
-        let mut buf = Vec::new();
-        write_chunk(&mut buf, b"CAPS", &[0, 0, 0, 1]);
-        let info_data: Vec<u8> = [80u16, 2, 0, 0]
-            .iter()
-            .flat_map(|v| v.to_be_bytes())
-            .collect();
-        write_chunk(&mut buf, b"INFO", &info_data);
-        // track 0, side 0 -> raw_track 0; track 0, side 1 -> raw_track 1.
-        write_chunk(&mut buf, b"TRCK", &build_trck_data(0, 0, 0x11));
-        write_chunk(&mut buf, b"TRCK", &build_trck_data(0, 1, 0x22));
-        let path = dir.path().join("test.ipf");
-        std::fs::write(&path, buf).unwrap();
-
-        let mut reader = NativeIpfBackend::open(&path).unwrap();
-
-        let side0 = reader.read_sector(0, 0, 0).unwrap();
-        assert_eq!(side0, vec![0x11u8; 512]);
-
-        let side1 = reader.read_sector(0, 1, 0).unwrap();
-        assert_eq!(side1, vec![0x22u8; 512]);
     }
 
     fn tempdir() -> TempDir {
