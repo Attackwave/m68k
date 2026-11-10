@@ -118,9 +118,8 @@ pub fn generate_prg<F>(base: &Assembler, reassemble: F) -> Result<Vec<u8>, AsmEr
 where
     F: Fn(u32, &[(SectionKind, u32)]) -> Result<Assembler, AsmError>,
 {
-    let (text_len, data_len, bss_len) = segment_lengths(base)?;
     let origin = base.origin();
-    let laid_out = |at: u32| -> Result<(Assembler, Vec<u8>), AsmError> {
+    let laid_out = |at: u32, (text_len, data_len, _): (u32, u32, u32)| {
         let overrides = [
             (SectionKind::Data, at.wrapping_add(text_len)),
             (
@@ -128,16 +127,39 @@ where
                 at.wrapping_add(text_len).wrapping_add(data_len),
             ),
         ];
-        let asm = reassemble(at, &overrides)?;
+        reassemble(at, &overrides)
+    };
+    // The lengths are measured where the segments end up: an alignment
+    // (CNOP, EVEN) pads differently once DATA follows TEXT instead of
+    // starting at the origin. Moving a segment by its own new length can
+    // change the padding again, so lay out until the lengths settle.
+    let mut lengths = segment_lengths(base)?;
+    let mut laid = laid_out(origin, lengths)?;
+    for _ in 0..8 {
+        let settled = segment_lengths(&laid)?;
+        if settled == lengths {
+            break;
+        }
+        lengths = settled;
+        laid = laid_out(origin, lengths)?;
+    }
+    if segment_lengths(&laid)? != lengths {
+        return Err(AsmError::new(
+            "segment sizes do not settle: alignment in DATA or BSS depends on where \
+             the segment is placed",
+        ));
+    }
+    let (text_len, data_len, bss_len) = lengths;
+    let image_of = |asm: &Assembler| {
         let mut image = segment_bytes(asm.sections.get_section(&SectionKind::Text), text_len);
         image.extend(segment_bytes(
             asm.sections.get_section(&SectionKind::Data),
             data_len,
         ));
-        Ok((asm, image))
+        image
     };
-    let (laid, mut image) = laid_out(origin)?;
-    let (_, moved) = laid_out(origin.wrapping_add(RELOC_PROBE)).map_err(|e| AsmError {
+    let mut image = image_of(&laid);
+    let moved = laid_out(origin.wrapping_add(RELOC_PROBE), lengths).map_err(|e| AsmError {
         message: format!(
             "{} (the value depends on the program's load address, which a TOS program \
              can only hold in a full 32-bit field)",
@@ -145,6 +167,7 @@ where
         ),
         ..e
     })?;
+    let moved = image_of(&moved);
     if moved.len() != image.len() {
         return Err(AsmError::new(
             "program changes size when relocated; TOS programs cannot use \
@@ -321,5 +344,17 @@ mod tests {
             "{}",
             err.message
         );
+    }
+
+    /// DATA is measured where it is placed: a CNOP that pads differently
+    /// after TEXT than at the origin cut the last word off.
+    #[test]
+    fn data_alignment_is_measured_after_text() {
+        let src =
+            " section text\n nop\n rts\n nop\n section data\n cnop 0,4\nval: dc.l $12345678\n";
+        let file = prg(src).unwrap();
+        let loaded = read_prg(&file, 0x20000).unwrap();
+        assert_eq!((loaded.text_len, loaded.data_len), (6, 6));
+        assert_eq!(&file[28 + 8..28 + 12], &[0x12, 0x34, 0x56, 0x78]);
     }
 }

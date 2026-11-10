@@ -173,7 +173,8 @@ impl Default for SRecordWriter {
 
 impl std::fmt::Display for SRecordWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.records.join("\n"))
+        // One record per line, the last one terminated too.
+        self.records.iter().try_for_each(|r| writeln!(f, "{r}"))
     }
 }
 
@@ -185,19 +186,19 @@ impl SRecordWriter {
         }
     }
 
-    /// Add an S0 header record with module name.
+    /// Add an S0 header record with module name. The count byte covers
+    /// the 2-byte address, the name and the checksum, so a name is cut to
+    /// the 252 bytes that fit.
     pub fn header(&mut self, name: &str) {
-        let name_bytes = name.as_bytes();
-        let addr: u16 = 0x0000;
-        let mut data = Vec::new();
-        data.push((addr >> 8) as u8);
-        data.push((addr & 0xFF) as u8);
+        let name_bytes = &name.as_bytes()[..name.len().min(252)];
+        // Address 0000, then the name.
+        let mut data = vec![0, 0];
         data.extend_from_slice(name_bytes);
 
         let byte_count = (data.len() + 1) as u8; // +1 for checksum
         let checksum = compute_checksum_srec(byte_count, 0, &data);
 
-        let mut record = format!("S0{:02X}{:04X}", byte_count, addr);
+        let mut record = format!("S0{:02X}", byte_count);
         for b in &data {
             record.push_str(&format!("{:02X}", b));
         }
@@ -322,11 +323,7 @@ fn encode_srec(rec_type: SRecType, address: u32, data: &[u8]) -> String {
 }
 
 fn compute_checksum_srec(byte_count: u8, _record_type: u8, data: &[u8]) -> u8 {
-    let mut sum = byte_count as u16;
-    for b in data {
-        sum += *b as u16;
-    }
-    (!sum & 0xFF) as u8
+    !data.iter().fold(byte_count, |sum, b| sum.wrapping_add(*b))
 }
 
 /// Sums the byte pairs of an already-formatted S-Record body.
@@ -385,7 +382,8 @@ impl Default for IntelHexWriter {
 
 impl std::fmt::Display for IntelHexWriter {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.records.join("\n"))
+        // One record per line, the last one terminated too.
+        self.records.iter().try_for_each(|r| writeln!(f, "{r}"))
     }
 }
 
@@ -1021,6 +1019,33 @@ mod tests {
         assert!(output.contains("S9")); // Termination
     }
 
+    /// The S0 count covers address, name and checksum, and every record
+    /// sums to 0xFF with its checksum; the file ends with a newline.
+    #[test]
+    fn srecord_header_is_well_formed() {
+        let instructions = vec![make_instr(0x1000, vec![0x4E71])];
+        let output = generate_srecord(&instructions, "m68k-asm");
+        assert!(
+            output.starts_with("S00B00006D36386B2D61736D40\n"),
+            "{output}"
+        );
+        assert!(output.ends_with('\n'));
+        for record in output.lines() {
+            let bytes: Vec<u8> = (2..record.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&record[i..i + 2], 16).unwrap())
+                .collect();
+            assert_eq!(bytes[0] as usize, bytes.len() - 1, "{record}");
+            assert_eq!(
+                bytes.iter().fold(0u8, |a, b| a.wrapping_add(*b)),
+                0xFF,
+                "{record}"
+            );
+        }
+        let long = generate_srecord(&instructions, &"n".repeat(300));
+        assert!(long.starts_with("S0FF0000"), "{long}");
+    }
+
     #[test]
     fn test_srecord_checksum() {
         // S1040000FB -> byte_count=4, addr=0x0000, data=[0xFB], checksum should be 0xFF - (0x04+0x00+0x00+0xFB) + 1 = 0x00
@@ -1321,7 +1346,7 @@ mod rom_tests {
         let srec = generate_srecord(&asm.code, "t");
         let data: Vec<&str> = srec.lines().filter(|l| l.starts_with("S1")).collect();
         assert_eq!(data, ["S104000001FA", "S10501004E713A"]);
-        assert!(srec.ends_with("S9030100FB"), "{srec}");
+        assert!(srec.ends_with("S9030100FB\n"), "{srec}");
         let hex = generate_intel_hex(&asm.code);
         assert!(hex.contains(":0100000001FE"), "{hex}");
         assert!(hex.contains(":020100004E713E"), "{hex}");
