@@ -94,9 +94,8 @@ struct Program<'a> {
     /// with the stack height carried along.
     routines: Vec<(u32, String)>,
     entries: HashSet<u32>,
-    /// Frame size for every UNLK, from the nearest earlier LINK on the
-    /// same register.
-    unlk: HashMap<u32, i32>,
+    /// Bytes each routine pops off its caller's stack on return (RTD).
+    pops: HashMap<u32, i32>,
     /// Call targets declared `NORETURN`.
     noreturn: &'a HashSet<u32>,
 }
@@ -126,29 +125,20 @@ impl<'a> Program<'a> {
         routines.dedup_by_key(|(pc, _)| *pc);
         let entries = routines.iter().map(|(pc, _)| *pc).collect();
 
-        let mut frames: HashMap<u8, i32> = HashMap::new();
-        let mut unlk = HashMap::new();
-        for i in instrs {
-            match (i.mnemonic.as_str(), i.operands.first(), i.operands.get(1)) {
-                ("link", Some(Operand::AddrReg(r)), Some(Operand::Immediate(d))) => {
-                    frames.insert(*r, *d as i32);
-                }
-                ("unlk", Some(Operand::AddrReg(r)), _) => {
-                    if let Some(d) = frames.get(r) {
-                        unlk.insert(i.pc, 4 - *d);
-                    }
-                }
-                _ => {}
-            }
-        }
-        Self {
+        let mut prog = Self {
             instrs,
             by_pc,
             routines,
             entries,
-            unlk,
+            pops: HashMap::new(),
             noreturn,
-        }
+        };
+        prog.pops = prog
+            .routines
+            .iter()
+            .filter_map(|(entry, _)| Some((*entry, prog.callee_pop(*entry)?)))
+            .collect();
+        prog
     }
 
     /// Where control goes after `i`, with `NORETURN` applied: a call to
@@ -161,6 +151,38 @@ impl<'a> Program<'a> {
             Flow::Return if self.noreturn.contains(&entry) => Flow::ReturnUnchecked,
             f => f,
         }
+    }
+
+    /// Bytes a routine removes from its caller's stack on return: the
+    /// `n` of `RTD #n` when every return reachable from `entry` is one.
+    fn callee_pop(&self, entry: u32) -> Option<i32> {
+        let mut seen = HashSet::new();
+        let mut work = vec![entry];
+        let mut pop = None;
+        while let Some(pc) = work.pop() {
+            if !seen.insert(pc) {
+                continue;
+            }
+            let i = self.at(pc)?;
+            match flow(i) {
+                Flow::Next(next) => work.extend(
+                    next.into_iter()
+                        .filter(|n| !self.entries.contains(n) || *n == entry),
+                ),
+                Flow::Call(_) => work.push(i.pc + i.size),
+                Flow::Return => {
+                    let n = match (i.mnemonic.as_str(), i.operands.first()) {
+                        ("rtd", Some(Operand::Immediate(n))) => sized(*n, 2),
+                        _ => 0,
+                    };
+                    if *pop.get_or_insert(n) != n {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+        }
+        pop.filter(|n| *n != 0)
     }
 
     fn name_of(&self, entry: u32) -> &str {
@@ -227,6 +249,12 @@ fn jump_target(i: &InstrInfo) -> Option<u32> {
 fn flow(i: &InstrInfo) -> Flow {
     let fall = i.pc + i.size;
     match i.mnemonic.as_str() {
+        // FBcc/FDBcc: the FPU condition decides, so both ways are taken.
+        m if m.starts_with("fb") || m.starts_with("fdb") => {
+            let mut next = vec![fall];
+            next.extend(i.target);
+            Flow::Next(next)
+        }
         "bra" => Flow::Next(i.target.into_iter().collect()),
         "jmp" => match jump_target(i) {
             Some(t) => Flow::Next(vec![t]),
@@ -245,6 +273,16 @@ fn flow(i: &InstrInfo) -> Flow {
     }
 }
 
+/// An immediate as the CPU sees it: a word operand (`adda.w #$fffc,sp`,
+/// `link a6,#$fff8`) is sign-extended to 32 bits before it reaches SP.
+fn sized(value: i64, op_size: u8) -> i32 {
+    if op_size == 4 {
+        value as i32
+    } else {
+        value as i16 as i32
+    }
+}
+
 fn is_sp(op: &Operand) -> bool {
     matches!(op, Operand::AddrReg(SP))
 }
@@ -260,7 +298,7 @@ fn push_size(op_size: u8) -> i32 {
 
 /// How the instruction moves SP, or why that cannot be told.
 /// `unlk_delta` is the frame size the matching LINK allocated.
-fn sp_delta(i: &InstrInfo, unlk_delta: Option<i32>) -> Result<i32, String> {
+fn sp_delta(i: &InstrInfo) -> Result<i32, String> {
     let m = i.mnemonic.as_str();
     let ops = &i.operands;
     let dst = ops.last();
@@ -269,14 +307,11 @@ fn sp_delta(i: &InstrInfo, unlk_delta: Option<i32>) -> Result<i32, String> {
         "pea" => return Ok(-4),
         "link" => {
             return match ops.get(1) {
-                Some(Operand::Immediate(d)) => Ok(-4 + *d as i32),
+                Some(Operand::Immediate(d)) => Ok(-4 + sized(*d, i.op_size)),
                 _ => Err("LINK with an unreadable displacement".into()),
             };
         }
-        "unlk" => {
-            return unlk_delta
-                .ok_or_else(|| "UNLK without a preceding LINK on this register".into());
-        }
+        "unlk" => return Err("UNLK without a preceding LINK on this register".into()),
         "lea" if dst.is_some_and(is_sp) => {
             return match ops.first() {
                 Some(Operand::AddrRegIndirectDisp(SP, d, _)) => Ok(*d),
@@ -287,7 +322,7 @@ fn sp_delta(i: &InstrInfo, unlk_delta: Option<i32>) -> Result<i32, String> {
         "adda" | "addq" | "add" | "suba" | "subq" | "sub" if dst.is_some_and(is_sp) => {
             return match ops.first() {
                 Some(Operand::Immediate(n)) => {
-                    let n = *n as i32;
+                    let n = sized(*n, i.op_size);
                     Ok(if m.starts_with("add") { n } else { -n })
                 }
                 _ => Err(format!(
@@ -362,11 +397,33 @@ fn analyze_routine(prog: &Program, entry: u32) -> Local {
         notes: Vec::new(),
     };
     let mut reported_unknown = false;
+    // SP before each LINK, per frame register: UNLK restores it, however
+    // much was pushed since. `None` when two LINKs on one register left
+    // different heights.
+    let mut links: HashMap<u8, Option<i32>> = HashMap::new();
 
     while let Some(pc) = work.pop() {
         let Some(i) = prog.at(pc) else { continue };
         let here = state[&pc].clone();
-        let out = match (&here, sp_delta(i, prog.unlk.get(&pc).copied())) {
+        let frame = match i.operands.first() {
+            Some(Operand::AddrReg(r)) => Some(*r),
+            _ => None,
+        };
+        if let (Sp::Known(o), "link", Some(r)) = (&here, i.mnemonic.as_str(), frame) {
+            let at = links.entry(r).or_insert(Some(*o));
+            if *at != Some(*o) {
+                *at = None;
+            }
+        }
+        let delta = match (&here, i.mnemonic.as_str(), frame) {
+            (Sp::Known(o), "unlk", Some(r)) => match links.get(&r) {
+                Some(Some(before)) => Ok(before - o),
+                Some(None) => Err("UNLK after LINKs at different stack heights".to_string()),
+                None => sp_delta(i),
+            },
+            _ => sp_delta(i),
+        };
+        let mut out = match (&here, delta) {
             (Sp::Known(o), Ok(d)) => Sp::Known(o + d),
             (Sp::Known(_), Err(why)) => Sp::Unknown(format!("{why} at {}", i.location)),
             (Sp::Unknown(why), _) => Sp::Unknown(why.clone()),
@@ -391,6 +448,10 @@ fn analyze_routine(prog: &Program, entry: u32) -> Local {
                 if let Sp::Known(o) = out {
                     local.calls.push((callee, o, false));
                     local.min_offset = local.min_offset.min(o - 4);
+                    // A callee ending in RTD #n also removes n bytes of
+                    // arguments the caller pushed.
+                    let pop = callee.and_then(|c| prog.pops.get(&c)).copied();
+                    out = Sp::Known(o + pop.unwrap_or(0));
                 }
                 if callee.is_none() {
                     local
@@ -667,6 +728,10 @@ fn ccr_effect(i: &InstrInfo) -> Ccr {
     }
     if is_special(i.operands.first(), "ccr") || is_special(i.operands.first(), "sr") {
         return Ccr::Reads;
+    }
+    // MOVE to or from USP leaves the condition codes alone.
+    if i.operands.iter().any(|o| is_special(Some(o), "usp")) {
+        return Ccr::Neutral;
     }
     match m {
         "bra" | "bsr" | "jmp" | "jsr" | "nop" | "lea" | "pea" | "link" | "unlk" | "exg"
@@ -951,6 +1016,50 @@ x:	dc.l 0
     #[test]
     fn flags_surviving_to_the_caller_are_live() {
         let (_, dead) = analyze("f:\ttst.l d0\n\tmovea.l a0,a1\n\trts\n");
+        assert!(dead.is_empty(), "{dead:?}");
+    }
+
+    fn analyze_on(cpu: &str, src: &str) -> (Vec<RoutineReport>, Vec<DeadFlagSetter>) {
+        let mut asm = Assembler::new(0x1000);
+        asm.set_cpu(cpu);
+        asm.assemble(src).unwrap_or_else(|e| panic!("{e}"));
+        (asm.stack_analysis(), asm.dead_flag_setters())
+    }
+
+    #[test]
+    fn unlk_restores_the_height_before_link() {
+        // Arguments pushed after LINK are dropped by UNLK.
+        let (r, _) =
+            analyze("f:\tlink a6,#-4\n\tmove.l d0,-(sp)\n\tbsr g\n\tunlk a6\n\trts\ng:\trts\n");
+        assert_eq!(report(&r, "f").balanced, Some(true), "{r:?}");
+        // A push after UNLK is still off.
+        let (r, _) = analyze("f:\tlink a6,#-4\n\tunlk a6\n\tmove.l d0,-(sp)\n\trts\n");
+        assert_eq!(report(&r, "f").balanced, Some(false), "{r:?}");
+    }
+
+    #[test]
+    fn word_immediates_on_sp_are_sign_extended() {
+        let (r, _) = analyze("f:\tadda.w #$fffc,sp\n\taddq.l #4,sp\n\trts\n");
+        assert_eq!(report(&r, "f").balanced, Some(true), "{r:?}");
+        let (r, _) = analyze("f:\tlink.w a6,#$fff8\n\tunlk a6\n\trts\n");
+        assert_eq!(report(&r, "f").depth, Depth::Exact(12), "{r:?}");
+    }
+
+    #[test]
+    fn fpu_branches_and_rtd_are_followed() {
+        let (r, _) = analyze_on(
+            "68020",
+            "f:\tmove.l d0,-(sp)\n\tfbeq x\n\taddq.l #4,sp\n\trts\nx:\trts\n",
+        );
+        assert_eq!(report(&r, "f").balanced, Some(false), "{r:?}");
+        let (r, _) = analyze_on("68020", "f:\tmove.l d0,-(sp)\n\tbsr g\n\trts\ng:\trtd #4\n");
+        assert_eq!(report(&r, "f").balanced, Some(true), "{r:?}");
+    }
+
+    #[test]
+    fn move_usp_keeps_the_condition_codes() {
+        let (_, dead) =
+            analyze("f:\ttst.l d0\n\tmove.l a0,usp\n\tbeq x\n\trts\nx:\tmoveq #1,d0\n\trts\n");
         assert!(dead.is_empty(), "{dead:?}");
     }
 }
