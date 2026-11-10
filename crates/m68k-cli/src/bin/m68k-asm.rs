@@ -202,7 +202,7 @@ fn parse_number(s: &str) -> Result<u32, String> {
     };
     let value = if let Some(hex) = digits.strip_prefix('$') {
         u32::from_str_radix(hex, 16)
-    } else if let Some(hex) = digits.strip_prefix("0x") {
+    } else if let Some(hex) = digits.strip_prefix("0x").or(digits.strip_prefix("0X")) {
         u32::from_str_radix(hex, 16)
     } else {
         digits.parse::<u32>()
@@ -684,12 +684,11 @@ fn write_auxiliary_outputs(asm: &Assembler, args: &Args, input_name: &str) -> Re
             let bytes_str: Vec<String> = instr
                 .words
                 .iter()
-                .flat_map(|w| {
-                    vec![
-                        format!("{:02X}", (w >> 8) as u8),
-                        format!("{:02X}", (w & 0xFF) as u8),
-                    ]
-                })
+                .flat_map(|w| w.to_be_bytes())
+                // Words are padded to even length; only the bytes the line
+                // really emits (`dc.b 1` is one) belong in the listing.
+                .take(instr.size_bytes())
+                .map(|b| format!("{b:02X}"))
                 .collect();
             // Only the trailing whitespace goes: an instruction without operands
             // moved to column 0 would read as a label and lose its cycles.

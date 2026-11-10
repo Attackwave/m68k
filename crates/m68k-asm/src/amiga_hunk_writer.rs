@@ -99,11 +99,7 @@ pub fn generate_relocatable_hunk_exe<F>(
 where
     F: Fn(u32, &[(SectionKind, u32)]) -> Result<Assembler, AsmError>,
 {
-    let ordered: Vec<(&SectionKind, &Section)> = base
-        .sections
-        .iter_sections()
-        .filter(|(_, s)| !s.is_empty())
-        .collect();
+    let ordered = hunk_sections(&base.sections, &base.symbols);
     let origin = base.origin();
     let mut relocs: Vec<HunkRelocs> = vec![Vec::new(); ordered.len()];
 
@@ -223,6 +219,25 @@ fn push_line_debug(out: &mut Vec<u8>, section: &Section, line_of: LineOf) {
     }
 }
 
+/// The sections that become hunks, in declaration order: every one that
+/// holds code, data or reserved space, and an empty one a label is defined
+/// in. Dropping that one too would leave the label following the code
+/// section, so a reference to it was relocated into hunk 0.
+fn hunk_sections<'a>(
+    sections: &'a SectionManager,
+    symbols: &SymbolTable,
+) -> Vec<(&'a SectionKind, &'a Section)> {
+    sections
+        .iter_sections()
+        .filter(|(kind, s)| {
+            !s.is_empty()
+                || symbols
+                    .iter()
+                    .any(|(_, e)| e.defined && e.section.as_deref() == Some(kind.name()))
+        })
+        .collect()
+}
+
 fn write_hunk_exe(
     sections: &SectionManager,
     symbols: &SymbolTable,
@@ -239,10 +254,7 @@ fn write_hunk_exe(
     // to alphabetical: `SECTION zdata,DATA` before `SECTION acode,CODE`
     // would put a data hunk at index 0, which is where `LoadSeg()` enters.
     // The reference assembler emits declaration order (verified).
-    let ordered: Vec<(&SectionKind, &Section)> = sections
-        .iter_sections()
-        .filter(|(_, s)| !s.is_empty())
-        .collect();
+    let ordered = hunk_sections(sections, symbols);
     if ordered.is_empty() {
         return Vec::new();
     }
@@ -567,5 +579,25 @@ len     equ 16
         let err = relocatable(" nop\n move.l #msg*2,d0\n rts\nmsg: dc.b 0\n").unwrap_err();
         assert!(err.message.contains("non-relocatable"), "{}", err.message);
         assert_eq!(err.line_no, Some(2));
+    }
+
+    /// A section that holds only a label still becomes a hunk: dropped,
+    /// its label followed the code section and was relocated into hunk 0.
+    #[test]
+    fn a_labelled_empty_section_is_a_hunk() {
+        let src = "
+    SECTION code,CODE
+start:
+    lea     marker,a0
+    rts
+    SECTION bs,BSS
+marker:
+";
+        let exe = relocatable(src).unwrap();
+        let loaded = read_hunk_executable(&exe, 0x2_0000).unwrap();
+        let [code, bss] = &loaded.sections[..] else {
+            panic!("expected two hunks");
+        };
+        assert_eq!(long_at(&code.data, 2), bss.address);
     }
 }
