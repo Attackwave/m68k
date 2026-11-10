@@ -4658,8 +4658,10 @@ impl Assembler {
                 parse_operand_text(&t, &self.symbols, pc).ok()
             })
             .collect();
-        let target = if is_branch_mnemonic(mnemonic) {
-            let op = if is_dbcc_mnemonic(mnemonic) {
+        let m = mnemonic.to_ascii_lowercase();
+        let fpu_branch = m.starts_with("fb") || m.starts_with("fdb");
+        let target = if is_branch_mnemonic(mnemonic) || fpu_branch {
+            let op = if is_dbcc_mnemonic(mnemonic) || m.starts_with("fdb") {
                 operands.get(1)
             } else {
                 operands.first()
