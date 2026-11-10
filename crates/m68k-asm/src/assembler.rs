@@ -2040,6 +2040,108 @@ fn build_directive_args(
 /// ");
 /// let bytes = result.unwrap();
 /// ```
+/// Replace every occurrence of the identifier `word` (any case) in `line`
+/// with `with`; occurrences inside a longer identifier stay.
+fn replace_word(line: &str, word: &str, with: &str) -> String {
+    let is_ident = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '@' | '\\');
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    let mut prev: Option<char> = None;
+    while !rest.is_empty() {
+        let matched = rest
+            .get(..word.len())
+            .is_some_and(|h| h.eq_ignore_ascii_case(word));
+        if matched
+            && !prev.is_some_and(is_ident)
+            && !rest[word.len()..].chars().next().is_some_and(is_ident)
+        {
+            out.push_str(with);
+            prev = with.chars().last();
+            rest = &rest[word.len()..];
+            continue;
+        }
+        let c = rest.chars().next().unwrap();
+        out.push(c);
+        prev = Some(c);
+        rest = &rest[c.len_utf8()..];
+    }
+    out
+}
+
+/// Collect the body of a REPT/IRP/IRPC block starting at `lines[*i]`, the
+/// line after the opening directive, up to its ENDR (or ENDM, which
+/// Devpac-style sources close a REPT with as well). A nested REPT, IRP,
+/// IRPC or MACRO nests, since its own terminator must not end the block.
+/// Leaves `*i` after the terminator; `None` when the source never closes
+/// the block.
+fn collect_block(lines: &[&str], i: &mut usize) -> Option<Vec<(String, usize)>> {
+    let mut body = Vec::new();
+    let mut depth = 1;
+    while *i < lines.len() {
+        let (_, mne, _, _) = split_line(lines[*i]);
+        if mne == "endr" || mne == "endm" {
+            depth -= 1;
+            if depth == 0 {
+                *i += 1;
+                return Some(body);
+            }
+        } else if matches!(mne.as_str(), "rept" | "irp" | "irpc" | "macro") {
+            depth += 1;
+        }
+        body.push((lines[*i].to_string(), *i));
+        *i += 1;
+    }
+    None
+}
+
+/// IF/ELSE/ENDC nesting. Each frame remembers whether the block around
+/// it was assembled, so an ELSE inside a skipped block stays skipped.
+#[derive(Debug, Default)]
+struct CondStack(Vec<CondFrame>);
+
+#[derive(Debug)]
+struct CondFrame {
+    outer: bool,
+    taken: bool,
+    seen_else: bool,
+    line: usize,
+}
+
+impl CondStack {
+    fn active(&self) -> bool {
+        self.0.last().is_none_or(|f| f.outer && f.taken)
+    }
+
+    fn push(&mut self, taken: bool, line: usize) {
+        let outer = self.active();
+        self.0.push(CondFrame {
+            outer,
+            taken,
+            seen_else: false,
+            line,
+        });
+    }
+
+    fn flip(&mut self) -> Result<(), &'static str> {
+        let frame = self.0.last_mut().ok_or("ELSE without IF")?;
+        if frame.seen_else {
+            return Err("second ELSE for the same IF");
+        }
+        frame.seen_else = true;
+        frame.taken = !frame.taken;
+        Ok(())
+    }
+
+    fn pop(&mut self) -> Result<(), &'static str> {
+        self.0.pop().map(|_| ()).ok_or("ENDIF without IF")
+    }
+
+    /// The line of the innermost IF still open at the end of the source.
+    fn unclosed(&self) -> Option<usize> {
+        self.0.last().map(|f| f.line)
+    }
+}
+
 pub struct Assembler {
     /// Origin address (start of code).
     pub origin: u32,
@@ -2062,8 +2164,11 @@ pub struct Assembler {
     line_pcs: Vec<(usize, u32)>, // (line_no, pc)
     /// Root directory for resolving INCLUDE/INCBIN paths.
     pub source_root: PathBuf,
-    /// Conditional assembly nesting stack. true = currently including code.
-    conditional_stack: Vec<bool>,
+    /// Conditional assembly nesting.
+    conditional_stack: CondStack,
+    /// Errors found while expanding macros, each with the 0-based line of
+    /// the text the current expansion round produces.
+    expansion_errors: Vec<(String, usize)>,
     /// Macro definitions collected during pre-processing.
     pub macro_definitions: HashMap<String, MacroDefinition>,
     /// Unique counter for \@ local label generation.
@@ -2274,7 +2379,8 @@ impl Assembler {
             noreturn: std::collections::HashSet::new(),
             recursion: std::collections::HashMap::new(),
             jump_table_lines: std::collections::HashSet::new(),
-            conditional_stack: Vec::new(),
+            conditional_stack: CondStack::default(),
+            expansion_errors: Vec::new(),
             macro_definitions: HashMap::new(),
             macro_unique_counter: 0,
             sections: SectionManager::new(origin),
@@ -2334,8 +2440,27 @@ impl Assembler {
     }
 
     /// Check if the current conditional nesting allows code generation.
+    /// Report an error on line `input` (0-based) of the text a macro
+    /// expansion round reads. Diagnostics number the lines of the fully
+    /// expanded source, which later rounds still change, so the line is
+    /// replaced by a placeholder that carries the error to the end of
+    /// expansion (see [`Self::macro_preprocess`]).
+    fn error_at_input(
+        &mut self,
+        message: String,
+        input: usize,
+        output: &mut Vec<String>,
+        trace: &mut Vec<(usize, Option<String>)>,
+    ) {
+        // A comment, not an empty line: `str::lines` drops an empty last
+        // line, and the error with it.
+        output.push(";".to_string());
+        trace.push((input, None));
+        self.expansion_errors.push((message, output.len() - 1));
+    }
+
     fn is_conditional_active(&self) -> bool {
-        self.conditional_stack.last().copied().unwrap_or(true)
+        self.conditional_stack.active()
     }
 
     /// Evaluate a conditional directive name and its argument.
@@ -2637,6 +2762,15 @@ impl Assembler {
     /// since comparing successive outputs for equality doesn't by itself
     /// distinguish "fully expanded" from "still changing forever".
     fn macro_preprocess(&mut self, source: &str) -> String {
+        self.expansion_errors.clear();
+        let expanded = self.macro_preprocess_rounds(source);
+        for (message, line) in std::mem::take(&mut self.expansion_errors) {
+            self.errors.error(message, Some(line + 1));
+        }
+        expanded
+    }
+
+    fn macro_preprocess_rounds(&mut self, source: &str) -> String {
         const MAX_MACRO_EXPANSION_DEPTH: usize = 64;
         // Definitions must persist across passes, not just within one:
         // a macro's `MACRO...ENDM` block is consumed (removed from the
@@ -2691,6 +2825,8 @@ impl Assembler {
     /// whether another pass could find newly exposed invocations: a macro
     /// body or a REPT/IRP/IRPC body can hold a nested REPT or a macro call.
     fn macro_preprocess_pass(&mut self, source: &str) -> (String, bool) {
+        // Errors of earlier rounds point at lines of this round's input.
+        let carried = std::mem::take(&mut self.expansion_errors);
         let mut any_macro_invoked = false;
         let mut consts = SymbolTable::new();
         let mut output: Vec<String> = Vec::new();
@@ -2708,7 +2844,7 @@ impl Assembler {
             }
             let raw = lines[i];
             // Check for MACRO definition via proper parsing
-            let (lbl1, mnemonic1, _, operands1) = split_line(raw);
+            let (lbl1, mnemonic1, size1, operands1) = split_line(raw);
             // Constants defined so far, for REPT counts: pass 1 has not run
             // yet, so `n EQU 3 / REPT n` needs its own small table.
             if let Some(name) = &lbl1
@@ -2721,14 +2857,24 @@ impl Assembler {
                 && let Some(mname) = lbl1
             {
                 let params: Vec<String> = operands1;
+                let macro_line = i;
                 i += 1;
+                // The body ends at the first line whose mnemonic is ENDM,
+                // so a label or a comment on that line does not hide it.
                 let mut body = Vec::new();
-                while i < lines.len() && lines[i].trim().to_lowercase() != "endm" {
+                while i < lines.len() && split_line(lines[i]).1 != "endm" {
                     body.push(lines[i].to_string());
                     i += 1;
                 }
                 if i < lines.len() {
                     i += 1; // skip ENDM
+                } else {
+                    self.error_at_input(
+                        format!("MACRO {mname} without ENDM"),
+                        macro_line,
+                        &mut output,
+                        &mut trace,
+                    );
                 }
                 // A macro named like a directive can never be invoked:
                 // the expansion check below skips anything that parses as
@@ -2759,18 +2905,15 @@ impl Assembler {
                 continue;
             }
 
-            // Check for ENDM (standalone)
-            if mnemonic1 == "endm" {
-                output.push(raw.to_string());
-                trace.push((i, None));
-                i += 1;
-                continue;
-            }
-
-            // Check for ENDR (standalone outside REPT/IRP/IRPC)
-            if mnemonic1 == "endr" {
-                output.push(raw.to_string());
-                trace.push((i, None));
+            // A terminator that no MACRO/REPT/IRP/IRPC above consumed
+            // closes nothing: most likely its opening line is misspelt.
+            if mnemonic1 == "endm" || mnemonic1 == "endr" {
+                self.error_at_input(
+                    format!("{} without MACRO or REPT", mnemonic1.to_uppercase()),
+                    i,
+                    &mut output,
+                    &mut trace,
+                );
                 i += 1;
                 continue;
             }
@@ -2787,13 +2930,16 @@ impl Assembler {
                 {
                     Some(n) => n,
                     None => {
-                        self.errors.error(
+                        self.error_at_input(
                             format!("invalid REPT count: '{}'", operands1[0]),
-                            Some(i + 1),
+                            i,
+                            &mut output,
+                            &mut trace,
                         );
-                        output.push(raw.to_string());
-                        trace.push((i, None));
+                        // Skip the body too, or its ENDR is reported as
+                        // closing nothing.
                         i += 1;
+                        let _ = collect_block(&lines, &mut i);
                         continue;
                     }
                 };
@@ -2803,24 +2949,15 @@ impl Assembler {
                 // MACRO definition inside the body nests like a REPT,
                 // since its own ENDM must not end the block.
                 i += 1;
-                let mut body = Vec::new();
-                let mut depth = 1;
-                while i < lines.len() && depth > 0 {
-                    let (_, mne, _, _) = split_line(lines[i]);
-                    if mne == "endr" || mne == "endm" {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    } else if mne == "rept" || mne == "irp" || mne == "irpc" || mne == "macro" {
-                        depth += 1;
-                    }
-                    body.push((lines[i].to_string(), i));
-                    i += 1;
-                }
-                if i < lines.len() {
-                    i += 1; // skip ENDR
-                }
+                let Some(body) = collect_block(&lines, &mut i) else {
+                    self.error_at_input(
+                        format!("{} without ENDR", mnemonic1.to_uppercase()),
+                        repeat_line,
+                        &mut output,
+                        &mut trace,
+                    );
+                    continue;
+                };
 
                 if let Some(ref lbl) = lbl1 {
                     output.push(format!("{} EQU $", lbl));
@@ -2859,24 +2996,15 @@ impl Assembler {
                 let values: Vec<String> = operands1[1..].to_vec();
 
                 i += 1;
-                let mut body = Vec::new();
-                let mut depth = 1;
-                while i < lines.len() && depth > 0 {
-                    let (_, mne, _, _) = split_line(lines[i]);
-                    if mne == "endr" || mne == "endm" {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    } else if mne == "rept" || mne == "irp" || mne == "irpc" || mne == "macro" {
-                        depth += 1;
-                    }
-                    body.push((lines[i].to_string(), i));
-                    i += 1;
-                }
-                if i < lines.len() {
-                    i += 1;
-                }
+                let Some(body) = collect_block(&lines, &mut i) else {
+                    self.error_at_input(
+                        format!("{} without ENDR", mnemonic1.to_uppercase()),
+                        repeat_line,
+                        &mut output,
+                        &mut trace,
+                    );
+                    continue;
+                };
 
                 if let Some(ref lbl) = lbl1 {
                     output.push(format!("{} EQU $", lbl));
@@ -2914,24 +3042,15 @@ impl Assembler {
                 let chars: Vec<char> = operands1[1].chars().collect();
 
                 i += 1;
-                let mut body = Vec::new();
-                let mut depth = 1;
-                while i < lines.len() && depth > 0 {
-                    let (_, mne, _, _) = split_line(lines[i]);
-                    if mne == "endr" || mne == "endm" {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    } else if mne == "rept" || mne == "irp" || mne == "irpc" || mne == "macro" {
-                        depth += 1;
-                    }
-                    body.push((lines[i].to_string(), i));
-                    i += 1;
-                }
-                if i < lines.len() {
-                    i += 1;
-                }
+                let Some(body) = collect_block(&lines, &mut i) else {
+                    self.error_at_input(
+                        format!("{} without ENDR", mnemonic1.to_uppercase()),
+                        repeat_line,
+                        &mut output,
+                        &mut trace,
+                    );
+                    continue;
+                };
 
                 if let Some(ref lbl) = lbl1 {
                     output.push(format!("{} EQU $", lbl));
@@ -3014,6 +3133,10 @@ impl Assembler {
                 // unknown mnemonic and stopped the assembly. The reference
                 // substitutes `_000001` for the same reason.
                 subs.push(("\\@".to_string(), format!("_{:06}", unique_id)));
+                // \0 is the size the invocation was given (`m.w` -> `w`),
+                // \# its argument count (Devpac; NARG below is the same).
+                subs.push(("\\0".to_string(), size1.clone()));
+                subs.push(("\\#".to_string(), operands1.len().to_string()));
 
                 // Label on invocation line becomes an EQU
                 if let Some(ref lbl) = lbl1 {
@@ -3027,6 +3150,7 @@ impl Assembler {
                     for (from, to) in &subs {
                         expanded = expanded.replace(from.as_str(), to.as_str());
                     }
+                    let expanded = replace_word(&expanded, "narg", &operands1.len().to_string());
                     let (_lbl, mne, _, _) = split_line(&expanded);
                     if mne == "mexit" || mne == "exitm" {
                         break;
@@ -3052,6 +3176,13 @@ impl Assembler {
         }
 
         debug_assert_eq!(output.len(), trace.len());
+        // Follow each earlier error's line into this round's output. The
+        // line is a placeholder comment, passed through exactly once.
+        for (message, line) in carried {
+            if let Some(out) = trace.iter().position(|(input, _)| *input == line) {
+                self.expansion_errors.push((message, out));
+            }
+        }
         // Compose this pass's trace with the map built so far, so an
         // origin survives however many expansion rounds a source needs.
         if !self.source_map.is_empty() {
@@ -3353,7 +3484,7 @@ impl Assembler {
         self.rs_counter = 0;
         self.line_pcs.clear();
         self.branches.clear();
-        self.conditional_stack.clear();
+        self.conditional_stack = CondStack::default();
         self.current_global_label = None;
         self.symbols.set_local_scope(None);
 
@@ -3372,9 +3503,11 @@ impl Assembler {
                 match name.as_str() {
                     "ifc" | "ifnc" => {
                         let arg = args.join(",");
-                        let result = self.eval_conditional_pass1(name, &arg, line.line_no)?;
-                        let active = self.is_conditional_active() && result;
-                        self.conditional_stack.push(active);
+                        // A skipped block's condition is not evaluated: it
+                        // may name symbols that only its own branch defines.
+                        let result = self.is_conditional_active()
+                            && self.eval_conditional_pass1(name, &arg, line.line_no)?;
+                        self.conditional_stack.push(result, line.line_no);
                         if let Some(ref label) = line.label {
                             let name = self.qualify_label(label);
                             let section = self.sections.current_section().map(|s| s.kind.name());
@@ -3390,9 +3523,9 @@ impl Assembler {
                     "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef"
                     | "ifndef" | "ifd" | "ifnd" => {
                         let arg = args.first().map(|s| s.as_str()).unwrap_or("");
-                        let result = self.eval_conditional_pass1(name, arg, line.line_no)?;
-                        let active = self.is_conditional_active() && result;
-                        self.conditional_stack.push(active);
+                        let result = self.is_conditional_active()
+                            && self.eval_conditional_pass1(name, arg, line.line_no)?;
+                        self.conditional_stack.push(result, line.line_no);
                         if let Some(ref label) = line.label {
                             let name = self.qualify_label(label);
                             let section = self.sections.current_section().map(|s| s.kind.name());
@@ -3406,11 +3539,9 @@ impl Assembler {
                         continue;
                     }
                     "else" => {
-                        if let Some(top) = self.conditional_stack.last_mut() {
-                            *top = !*top;
-                        } else {
-                            return Err(AsmError::with_line("ELSE without IF", line.line_no));
-                        }
+                        self.conditional_stack
+                            .flip()
+                            .map_err(|e| AsmError::with_line(e, line.line_no))?;
                         if let Some(ref label) = line.label {
                             let name = self.qualify_label(label);
                             let section = self.sections.current_section().map(|s| s.kind.name());
@@ -3424,9 +3555,9 @@ impl Assembler {
                         continue;
                     }
                     "endif" | "endc" => {
-                        if self.conditional_stack.pop().is_none() {
-                            return Err(AsmError::with_line("ENDIF without IF", line.line_no));
-                        }
+                        self.conditional_stack
+                            .pop()
+                            .map_err(|e| AsmError::with_line(e, line.line_no))?;
                         if let Some(ref label) = line.label {
                             let name = self.qualify_label(label);
                             let section = self.sections.current_section().map(|s| s.kind.name());
@@ -3483,6 +3614,9 @@ impl Assembler {
             })?;
         }
 
+        if let Some(line) = self.conditional_stack.unclosed() {
+            return Err(AsmError::with_line("IF without ENDC", line));
+        }
         Ok(())
     }
 
@@ -4119,7 +4253,7 @@ impl Assembler {
         self.pc = self.origin;
         self.sections.restart_pass();
         self.rs_counter = 0;
-        let mut cond_stack: Vec<bool> = Vec::new();
+        let mut cond_stack = CondStack::default();
         // Rebuild the local-label scope from the top, as both passes do.
         self.current_global_label = None;
         self.symbols.set_local_scope(None);
@@ -4136,38 +4270,36 @@ impl Assembler {
                 match name.as_str() {
                     "ifc" | "ifnc" => {
                         let arg = args.join(",");
-                        let active = cond_stack.last().copied().unwrap_or(true);
-                        let result = self
-                            .eval_conditional_later(name, &arg, line.line_no)
-                            .unwrap_or(false);
-                        cond_stack.push(active && result);
+                        let result = cond_stack.active()
+                            && self
+                                .eval_conditional_later(name, &arg, line.line_no)
+                                .unwrap_or(false);
+                        cond_stack.push(result, line.line_no);
                         skip = true;
                     }
                     "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef"
                     | "ifndef" | "ifd" | "ifnd" => {
                         let arg = args.first().map(|s| s.as_str()).unwrap_or("");
-                        let active = cond_stack.last().copied().unwrap_or(true);
-                        let result = self
-                            .eval_conditional_later(name, arg, line.line_no)
-                            .unwrap_or(false);
-                        cond_stack.push(active && result);
+                        let result = cond_stack.active()
+                            && self
+                                .eval_conditional_later(name, arg, line.line_no)
+                                .unwrap_or(false);
+                        cond_stack.push(result, line.line_no);
                         skip = true;
                     }
                     "else" => {
-                        if let Some(top) = cond_stack.last_mut() {
-                            *top = !*top;
-                        }
+                        let _ = cond_stack.flip();
                         skip = true;
                     }
                     "endif" | "endc" => {
-                        cond_stack.pop();
+                        let _ = cond_stack.pop();
                         skip = true;
                     }
                     _ => {}
                 }
             }
 
-            if !skip && cond_stack.last().copied().unwrap_or(true) {
+            if !skip && cond_stack.active() {
                 // EQU/SET name a *value*, not a location, so they must be
                 // left alone here — overwriting them with the current PC
                 // turned every constant into its own address. Pass 1 has
@@ -4367,7 +4499,7 @@ impl Assembler {
         self.instr_infos.clear();
         self.noreturn.clear();
         self.recursion.clear();
-        self.conditional_stack.clear();
+        self.conditional_stack = CondStack::default();
         // Local labels resolve against the enclosing global label, so the
         // scope has to be rebuilt from the start of the source, exactly as
         // pass 1 built it.
@@ -4443,32 +4575,30 @@ impl Assembler {
             match name.as_str() {
                 "ifc" | "ifnc" => {
                     let arg = args.join(",");
-                    let result = self.eval_conditional_later(name, &arg, line.line_no)?;
-                    let active = self.is_conditional_active() && result;
-                    self.conditional_stack.push(active);
+                    let result = self.is_conditional_active()
+                        && self.eval_conditional_later(name, &arg, line.line_no)?;
+                    self.conditional_stack.push(result, line.line_no);
                     return Ok(());
                 }
                 "if" | "ifeq" | "ifne" | "ifgt" | "iflt" | "ifge" | "ifle" | "ifdef" | "ifndef"
                 | "ifd" | "ifnd" => {
                     let arg = args.first().map(|s| s.as_str()).unwrap_or("");
-                    let result = self.eval_conditional_later(name, arg, line.line_no)?;
-                    let active = self.is_conditional_active() && result;
-                    self.conditional_stack.push(active);
+                    let result = self.is_conditional_active()
+                        && self.eval_conditional_later(name, arg, line.line_no)?;
+                    self.conditional_stack.push(result, line.line_no);
                     return Ok(());
                 }
                 "else" => {
-                    if let Some(top) = self.conditional_stack.last_mut() {
-                        *top = !*top;
-                    } else {
-                        return Err(AsmError::with_line("ELSE without IF", line.line_no));
-                    }
-                    return Ok(());
+                    return self
+                        .conditional_stack
+                        .flip()
+                        .map_err(|e| AsmError::with_line(e, line.line_no));
                 }
                 "endif" | "endc" => {
-                    if self.conditional_stack.pop().is_none() {
-                        return Err(AsmError::with_line("ENDIF without IF", line.line_no));
-                    }
-                    return Ok(());
+                    return self
+                        .conditional_stack
+                        .pop()
+                        .map_err(|e| AsmError::with_line(e, line.line_no));
                 }
                 _ => {}
             }
@@ -8446,6 +8576,67 @@ n   SET 10
             let mut asm = Assembler::new(0);
             asm.set_cpu(cpu);
             assert!(asm.assemble(src).is_err(), "{src}");
+        }
+    }
+
+    /// Every block a source opens must be closed, and an ENDM is found
+    /// however the line around it looks.
+    #[test]
+    fn unbalanced_blocks_are_located_errors() {
+        let cases: &[(&str, usize, &str)] = &[
+            (" endr\n nop\n", 1, "ENDR without"),
+            (" nop\n rept 2\n dc.b 1\n", 2, "REPT without ENDR"),
+            (" nop\n irp x,1,2\n dc.b x\n", 2, "IRP without ENDR"),
+            (" nop\nm macro\n dc.b 1\n", 2, "MACRO m without ENDM"),
+            (" nop\n if 1\n nop\n", 2, "IF without ENDC"),
+            (" if 1\n else\n else\n endc\n", 3, "second ELSE"),
+            (" rept x\n dc.b 1\n endr\n nop\n", 1, "invalid REPT count"),
+            ("m macro\n endm\n m\n m\n endm\n", 5, "ENDM without"),
+        ];
+        for (src, line, message) in cases {
+            let mut asm = Assembler::new(0);
+            assert!(asm.assemble(src).is_err(), "{src}");
+            let diags = asm.diagnostics();
+            assert_eq!(diags.len(), 1, "{src}: {diags:?}");
+            assert_eq!(diags[0].line_no, Some(*line), "{src}: {diags:?}");
+            assert!(diags[0].message.contains(message), "{src}: {diags:?}");
+        }
+    }
+
+    #[test]
+    fn macro_end_and_conditionals_follow_the_source() {
+        let cases: &[(&str, &[u8])] = &[
+            // A comment or tab after ENDM used to hide it, so the rest of
+            // the file became the macro body and vanished.
+            (
+                "m macro\n dc.b 1\n endm ; done\n m\n rts\n",
+                &[1, 0, 0x4E, 0x75],
+            ),
+            (
+                "m macro\n dc.b 1\n endm\t\t;x\n m\n rts\n",
+                &[1, 0, 0x4E, 0x75],
+            ),
+            // ELSE inside a skipped IF stays skipped.
+            (
+                " if 0\n if 1\n dc.b 4\n else\n dc.b 5\n endc\n endc\n nop\n",
+                &[0x4E, 0x71],
+            ),
+            // A skipped block's condition is not evaluated.
+            (" if 0\n if undefined\n endc\n else\n dc.b 2\n endc\n", &[2]),
+            // Argument count (NARG, \#) and invocation size (\0).
+            (
+                "m macro\n dc.b NARG,\\#\n endm\n m 1,2,3\n m\n",
+                &[3, 3, 0, 0],
+            ),
+            (
+                "m macro\n move.\\0 d0,d1\n endm\n m.w\n m.l\n",
+                &[0x32, 0x00, 0x22, 0x00],
+            ),
+            // NARG only as a whole word.
+            ("m macro\n dc.b narg_x\n endm\nnarg_x equ 7\n m\n", &[7]),
+        ];
+        for (src, bytes) in cases {
+            assert_eq!(assemble_source_with_cpu(src, "68000"), *bytes, "{src}");
         }
     }
 
