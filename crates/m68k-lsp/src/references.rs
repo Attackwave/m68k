@@ -17,67 +17,50 @@ pub fn compute_references(
         None => return locations,
     };
 
-    let target_symbol = word_info.word.trim();
-    if target_symbol.is_empty() {
+    let target = word_info.word.trim();
+    if target.is_empty() {
         return locations;
     }
-
-    // Strip local dot prefix for comparison if necessary
-    let clean_target = target_symbol.trim_start_matches('.');
+    // A local label is the same symbol only within its own scope.
+    let key = doc.key_at(target, word_info.line_idx);
+    let declaration = doc.symbols.get(&key);
+    let is_ident = |c: char| c.is_alphanumeric() || matches!(c, '_' | '.' | '$');
 
     for (line_idx, line) in doc.lines.iter().enumerate() {
+        if doc.key_at(target, line_idx) != key {
+            continue;
+        }
         let code_end = code_length(line);
-        let mut search_start = 0;
-        while let Some(found_idx) = line[search_start..].find(clean_target) {
-            let actual_idx = search_start + found_idx;
-            search_start = actual_idx + clean_target.len();
+        for (actual_idx, _) in line.match_indices(target) {
             // A name inside a comment or a string literal is text, not a
             // reference: renaming it would rewrite data the program emits.
             if actual_idx >= code_end || inside_quotes(&line[..actual_idx]) {
                 continue;
             }
-
-            // Verify word boundary before and after
-            let is_boundary_before = if actual_idx == 0 {
-                true
-            } else {
-                let prev = line.as_bytes()[actual_idx - 1] as char;
-                !prev.is_alphanumeric() && prev != '_' && prev != '.' && prev != '$'
-            };
-
-            let is_boundary_after = if actual_idx + clean_target.len() >= line.len() {
-                true
-            } else {
-                let next = line.as_bytes()[actual_idx + clean_target.len()] as char;
-                !next.is_alphanumeric() && next != '_' && next != '$'
-            };
-
-            if is_boundary_before && is_boundary_after {
-                // Check if this is the declaration line and if we should filter it
-                let is_declaration = doc
-                    .symbols
-                    .get(target_symbol)
-                    .map(|s| s.line_idx == line_idx && s.character == actual_idx)
-                    .unwrap_or(false);
-
-                if is_declaration && !include_declaration {
-                    continue;
-                }
-
-                locations.push(Location {
-                    uri: doc.uri.clone(),
-                    range: Range {
-                        start: Position {
-                            line: line_idx as u32,
-                            character: byte_to_utf16_col(line, actual_idx),
-                        },
-                        end: Position {
-                            line: line_idx as u32,
-                            character: byte_to_utf16_col(line, actual_idx + clean_target.len()),
-                        },
-                    },
-                });
+            let end = actual_idx + target.len();
+            let whole_word = !line[..actual_idx].chars().next_back().is_some_and(is_ident)
+                && !line[end..].chars().next().is_some_and(is_ident);
+            if !whole_word {
+                continue;
             }
+            let is_declaration =
+                declaration.is_some_and(|s| s.line_idx == line_idx && s.character == actual_idx);
+            if is_declaration && !include_declaration {
+                continue;
+            }
+            locations.push(Location {
+                uri: doc.uri.clone(),
+                range: Range {
+                    start: Position {
+                        line: line_idx as u32,
+                        character: byte_to_utf16_col(line, actual_idx),
+                    },
+                    end: Position {
+                        line: line_idx as u32,
+                        character: byte_to_utf16_col(line, end),
+                    },
+                },
+            });
         }
     }
 
@@ -119,6 +102,56 @@ fn inside_quotes(prefix: &str) -> bool {
 mod tests {
     use super::*;
     use tower_lsp::lsp_types::Url;
+
+    /// Each routine's `.loop` is its own symbol: definition, references,
+    /// rename and completion stay within the routine the cursor is in.
+    #[test]
+    fn local_labels_are_scoped_to_their_routine() {
+        let uri = Url::parse("file:///test.s").unwrap();
+        let src = "A:\n.loop:\tbra.s\t.loop\nB:\n.loop:\tdbra\td0,.loop\nV:\tdc.l\tA\n";
+        let doc = Document::new(uri.clone(), 1, src.to_string());
+        let at = |line, character| Position { line, character };
+
+        let def = crate::definition::compute_definition(&doc, at(1, 14), None);
+        let Some(tower_lsp::lsp_types::GotoDefinitionResponse::Scalar(loc)) = def else {
+            panic!("{def:?}");
+        };
+        assert_eq!(loc.range.start.line, 1);
+
+        let lines: Vec<u32> = compute_references(&doc, at(1, 2), true)
+            .iter()
+            .map(|l| l.range.start.line)
+            .collect();
+        assert_eq!(lines, [1, 1]);
+
+        let symbols = crate::symbols::compute_document_symbols(&doc);
+        let tower_lsp::lsp_types::DocumentSymbolResponse::Nested(symbols) = symbols else {
+            panic!();
+        };
+        let mut loops: Vec<u32> = symbols
+            .iter()
+            .filter(|s| s.name == ".loop")
+            .map(|s| s.range.start.line)
+            .collect();
+        loops.sort();
+        assert_eq!(loops, [1, 3]);
+
+        // Renaming onto a name already defined would merge two symbols.
+        assert!(crate::rename::compute_rename(&doc, at(4, 1), "B").is_none());
+        assert!(crate::rename::compute_rename(&doc, at(4, 1), "W").is_some());
+
+        let tower_lsp::lsp_types::CompletionResponse::Array(items) =
+            crate::completion::compute_completion(&doc, at(3, 10))
+        else {
+            panic!();
+        };
+        let locals: Vec<&str> = items
+            .iter()
+            .map(|i| i.label.as_str())
+            .filter(|l| l.contains("loop"))
+            .collect();
+        assert_eq!(locals, [".loop"]);
+    }
 
     #[test]
     fn test_compute_references() {

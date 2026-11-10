@@ -18,7 +18,7 @@ pub fn compute_definition(
     }
 
     // Lookup in symbols map
-    if let Some(sym) = doc.symbols.get(clean_word) {
+    if let Some(sym) = doc.lookup(clean_word, word_info.line_idx) {
         let loc = Location {
             uri: doc.uri.clone(),
             range: Range {

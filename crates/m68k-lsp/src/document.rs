@@ -88,8 +88,13 @@ pub struct Document {
     pub text: String,
     pub lines: Vec<String>,
     pub parsed_lines: Vec<ParsedSourceLine>,
+    /// Symbols by name; a local label under `Global@name`, the global
+    /// label it belongs to and its name without the dot.
     pub symbols: HashMap<String, SymbolDef>,
     pub macros: HashMap<String, SymbolDef>,
+    /// The global label in effect on each line: the scope its local
+    /// labels belong to.
+    pub scopes: Vec<Option<String>>,
 }
 
 impl Document {
@@ -103,6 +108,7 @@ impl Document {
             parsed_lines: Vec::new(),
             symbols: HashMap::new(),
             macros: HashMap::new(),
+            scopes: Vec::new(),
         };
         doc.update_text(version, text);
         doc
@@ -121,6 +127,7 @@ impl Document {
         self.parsed_lines.clear();
         self.symbols.clear();
         self.macros.clear();
+        self.scopes.clear();
 
         let mut current_global_label: Option<String> = None;
 
@@ -131,16 +138,10 @@ impl Document {
                 let char_idx = raw_line.find(lbl).unwrap_or(0);
                 let is_local = is_local_label(lbl);
 
-                let qualified_name = if is_local {
-                    if let Some(ref global) = current_global_label {
-                        format!("{}@{}", global, lbl.trim_start_matches('.'))
-                    } else {
-                        lbl.clone()
-                    }
-                } else {
+                if !is_local {
                     current_global_label = Some(lbl.clone());
-                    lbl.clone()
-                };
+                }
+                let qualified_name = local_key(current_global_label.as_deref(), lbl);
 
                 let sym_kind = if mnemonic.eq_ignore_ascii_case("equ") || mnemonic == "=" {
                     SymbolDefKind::Equate
@@ -169,12 +170,9 @@ impl Document {
                 if sym_kind == SymbolDefKind::Macro {
                     self.macros.insert(lbl.to_ascii_lowercase(), sym.clone());
                 }
-                self.symbols.insert(qualified_name.clone(), sym.clone());
-                if is_local {
-                    // Also allow lookup by unqualified local label within same file
-                    self.symbols.insert(lbl.clone(), sym);
-                }
+                self.symbols.insert(qualified_name, sym);
             }
+            self.scopes.push(current_global_label.clone());
 
             self.parsed_lines.push(ParsedSourceLine {
                 line_idx: idx,
@@ -185,6 +183,19 @@ impl Document {
                 raw: raw_line.clone(),
             });
         }
+    }
+
+    /// The symbol `name` means on line `line_idx`: a local label is looked
+    /// up in the scope of that line, so two routines can each have a
+    /// `.loop` of their own.
+    pub fn lookup(&self, name: &str, line_idx: usize) -> Option<&SymbolDef> {
+        self.symbols.get(&self.key_at(name, line_idx))
+    }
+
+    /// The key `name` has in [`Self::symbols`] when used on `line_idx`.
+    pub fn key_at(&self, name: &str, line_idx: usize) -> String {
+        let scope = self.scopes.get(line_idx).cloned().flatten();
+        local_key(scope.as_deref(), name)
     }
 
     /// Retrieve the word and its semantic context at a given position.
@@ -286,6 +297,16 @@ impl Document {
 }
 
 /// Check if a lowercase string is a 68k register name.
+/// Key of `name` in [`Document::symbols`] within the scope of `global`.
+fn local_key(global: Option<&str>, name: &str) -> String {
+    match global {
+        Some(global) if is_local_label(name) => {
+            format!("{global}@{}", name.trim_start_matches('.'))
+        }
+        _ => name.to_string(),
+    }
+}
+
 pub fn is_register(s: &str) -> bool {
     matches!(
         s,
@@ -366,7 +387,8 @@ mod tests {
 
         assert_eq!(doc.lines.len(), 5);
         assert!(doc.symbols.contains_key("START"));
-        assert!(doc.symbols.contains_key(".loop"));
+        assert!(doc.symbols.contains_key("START@loop"));
+        assert_eq!(doc.lookup(".loop", 3).unwrap().line_idx, 2);
     }
 
     #[test]

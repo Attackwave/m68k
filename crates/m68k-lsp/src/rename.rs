@@ -32,6 +32,13 @@ pub fn compute_rename(doc: &Document, pos: Position, new_name: &str) -> Option<W
 
     // Verify renameable
     let _ = prepare_rename(doc, pos)?;
+    // A name already defined where the symbol lives would merge the two.
+    let line = pos.line as usize;
+    if doc.lookup(new_name, line).is_some()
+        || doc.macros.contains_key(&new_name.to_ascii_lowercase())
+    {
+        return None;
+    }
 
     let references = compute_references(doc, pos, true);
     if references.is_empty() {
