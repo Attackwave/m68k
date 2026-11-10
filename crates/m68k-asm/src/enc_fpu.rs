@@ -172,32 +172,8 @@ pub fn enc_fmove(
             words.extend(ext_words);
             Ok(words)
         }
-        (Operand::FpCtrlList(mask), ea_op) => {
-            let (mode, reg, ext_words) = encode_ea(
-                ea_op,
-                "l",
-                ext_pc,
-                ea::CONTROL_ALT | ea::APREDEC | ea::DREG | fpiar_areg(*mask),
-                cpu,
-            )?;
-            let ext = (5 << 13) | ((*mask as u16) << 10);
-            let mut words = vec![0xF200 | ((mode as u16) << 3) | (reg as u16), ext];
-            words.extend(ext_words);
-            Ok(words)
-        }
-        (ea_op, Operand::FpCtrlList(mask)) => {
-            let (mode, reg, ext_words) = encode_ea(
-                ea_op,
-                "l",
-                ext_pc,
-                ea::CONTROL | ea::APOSTINC | ea::DREG | single_source(*mask),
-                cpu,
-            )?;
-            let ext = (4 << 13) | ((*mask as u16) << 10);
-            let mut words = vec![0xF200 | ((mode as u16) << 3) | (reg as u16), ext];
-            words.extend(ext_words);
-            Ok(words)
-        }
+        (Operand::FpCtrlList(mask), ea_op) => enc_fmovem_ctrl_to_mem(*mask, ea_op, ext_pc, cpu),
+        (ea_op, Operand::FpCtrlList(mask)) => enc_fmovem_mem_to_ctrl(ea_op, *mask, ext_pc, cpu),
         _ => Err(AsmError::new("invalid FMOVE operands")),
     }
 }
@@ -211,7 +187,12 @@ fn fpiar_areg(mask: u8) -> u16 {
 /// Sources a single control register also accepts: An for FPIAR, and an
 /// immediate long for any one of them.
 fn single_source(mask: u8) -> u16 {
-    fpiar_areg(mask) | if mask.count_ones() == 1 { ea::IMM } else { 0 }
+    fpiar_areg(mask) | single_dreg(mask) | if mask.count_ones() == 1 { ea::IMM } else { 0 }
+}
+
+/// A data register holds one long, so it moves exactly one control register.
+fn single_dreg(mask: u8) -> u16 {
+    if mask.count_ones() == 1 { ea::DREG } else { 0 }
 }
 
 /// Encode FMOVECR #rom_offset,FPn: load a ROM constant into an FPU register.
@@ -370,7 +351,13 @@ pub fn enc_fmovem_ctrl_to_mem(
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
     check_fpu_cpu(cpu)?;
-    let (mode, reg, ext_words) = encode_ea(dst, "l", ext_pc, ea::CONTROL_ALT | ea::APREDEC, cpu)?;
+    let (mode, reg, ext_words) = encode_ea(
+        dst,
+        "l",
+        ext_pc,
+        ea::CONTROL_ALT | ea::APREDEC | single_dreg(ctrl_mask) | fpiar_areg(ctrl_mask),
+        cpu,
+    )?;
     let ext = (5u16 << 13) | ((ctrl_mask as u16) << 10);
     let mut words = vec![0xF200 | ((mode as u16) << 3) | (reg as u16), ext];
     words.extend(ext_words);
@@ -385,7 +372,13 @@ pub fn enc_fmovem_mem_to_ctrl(
     cpu: &str,
 ) -> Result<Vec<u16>, AsmError> {
     check_fpu_cpu(cpu)?;
-    let (mode, reg, ext_words) = encode_ea(src, "l", ext_pc, ea::CONTROL | ea::APOSTINC, cpu)?;
+    let (mode, reg, ext_words) = encode_ea(
+        src,
+        "l",
+        ext_pc,
+        ea::CONTROL | ea::APOSTINC | single_source(ctrl_mask),
+        cpu,
+    )?;
     let ext = (4u16 << 13) | ((ctrl_mask as u16) << 10);
     let mut words = vec![0xF200 | ((mode as u16) << 3) | (reg as u16), ext];
     words.extend(ext_words);

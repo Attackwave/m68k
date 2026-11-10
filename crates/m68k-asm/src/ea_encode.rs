@@ -332,13 +332,13 @@ fn encode_full_ea(
     }
     // The PC as base: the value of the PC is the address of the extension
     // word (`ext_pc - 2`, the same reference point as `(d16,PC)`).
-    let base_disp = if mi.base_is_pc {
+    let base_disp = if mi.base_is_pc && !mi.zpc {
         mi.base_disp
             .map(|target| target.wrapping_sub(ext_pc as i32 - 2))
     } else {
         mi.base_disp
     };
-    let base_suppress = mi.base_reg.is_none() && !mi.base_is_pc;
+    let base_suppress = mi.zpc || (mi.base_reg.is_none() && !mi.base_is_pc);
     let index_suppress = mi.index_reg.is_none();
 
     // PRM BD SIZE field: 00=reserved, 01=null displacement, 10=word, 11=long -
