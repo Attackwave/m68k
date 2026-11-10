@@ -28,6 +28,11 @@ pub struct LinterConfig {
     /// Report TST/CMP/BTST whose condition codes nothing reads (the
     /// assembler's `--flag-check`) as warnings.
     pub flag_check: bool,
+    /// Assemble with the assembler's `--optimize`, so branches and JSR/JMP
+    /// relaxed by the build are not reported out of range.
+    pub optimize: bool,
+    /// Origin the build assembles at (the assembler's `--origin`).
+    pub origin: u32,
 }
 
 impl Default for LinterConfig {
@@ -38,6 +43,8 @@ impl Default for LinterConfig {
             main_file: None,
             stack_check: false,
             flag_check: false,
+            optimize: false,
+            origin: 0,
         }
     }
 }
@@ -163,8 +170,9 @@ fn analyze(asm: &mut Assembler, assembled: bool, config: &LinterConfig) {
 }
 
 fn new_assembler(config: &LinterConfig) -> Assembler {
-    let mut asm = Assembler::new(0);
+    let mut asm = Assembler::new(config.origin);
     asm.set_cpu(config.cpu.name());
+    asm.set_optimize(config.optimize);
     for dir in &config.include_paths {
         asm.add_include_path(dir.clone());
     }
@@ -343,6 +351,27 @@ mod tests {
         );
         assert!(diags[0].message.contains("TST"), "{}", diags[0].message);
         assert!(diags[1].message.starts_with("f: "), "{}", diags[1].message);
+    }
+
+    /// `--optimize` shortens absolute addresses, which brings a BSR.S
+    /// target into range: an error without it, none with it, in the
+    /// editor as in the build.
+    #[test]
+    fn optimize_is_passed_to_the_assembly() {
+        let uri = Url::parse("file:///test.s").unwrap();
+        let src = format!(" bsr.s far\n{}far: rts\n", " move.w $1234,d0\n".repeat(25));
+        let doc = Document::new(uri, 1, src);
+        let plain = compute_diagnostics(&doc, &LinterConfig::default());
+        assert!(
+            plain.iter().any(|d| d.message.contains("bsr.s")),
+            "{plain:?}"
+        );
+        let optimized = LinterConfig {
+            optimize: true,
+            ..LinterConfig::default()
+        };
+        let diags = compute_diagnostics(&doc, &optimized);
+        assert!(diags.is_empty(), "{diags:?}");
     }
 
     #[test]

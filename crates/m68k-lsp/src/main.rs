@@ -38,9 +38,23 @@ struct Cli {
     #[arg(long)]
     flag_check: bool,
 
+    /// Check with the assembler's size-changing optimizations, as a build
+    /// with `m68k-asm --optimize` assembles the program
+    #[arg(long)]
+    optimize: bool,
+
+    /// Origin address the build assembles at (hex with $ or 0x, or decimal)
+    #[arg(long, default_value = "0", value_parser = parse_origin)]
+    origin: u32,
+
     /// Communicate via stdio (default mode for LSP clients)
     #[arg(long, default_value = "true")]
     stdio: bool,
+}
+
+fn parse_origin(s: &str) -> Result<u32, String> {
+    let value = m68k_core::utils::parse_number(s)?;
+    u32::try_from(value).map_err(|_| format!("origin {s} does not fit in 32 bits"))
 }
 
 #[tokio::main]
@@ -72,6 +86,8 @@ async fn main() {
             main_file: args.main.clone(),
             stack_check: args.stack_check,
             flag_check: args.flag_check,
+            optimize: args.optimize,
+            origin: args.origin,
         };
         let config_slot = backend.config.clone();
         let workspace = backend.workspace.clone();

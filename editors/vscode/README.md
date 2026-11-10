@@ -84,6 +84,7 @@ running on port 2345.
 | `m68k.cpu` | `68000` | Target CPU for diagnostics and builds |
 | `m68k.includePaths` | `[]` | Extra `INCLUDE` directories (`-I`), relative to the workspace folder |
 | `m68k.mainFile` | | Main source of a program built from `INCLUDE`s; checked as one unit, built and debugged by F5 |
+| `m68k.optimize` | `false` | Size-changing optimizations (`--optimize`) for diagnostics and builds |
 | `m68k.stackCheck` | `false` | Stack balance and reachability errors (`--stack-check`) |
 | `m68k.flagCheck` | `false` | Warnings about condition codes nothing reads (`--flag-check`) |
 | `m68k.toolsPath` | | Use tools from this directory instead of the bundled ones |

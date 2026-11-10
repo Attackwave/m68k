@@ -15,9 +15,11 @@ function tool(context: vscode.ExtensionContext, name: string): string {
   return exe;
 }
 
-/// Program analyses switched on in the settings, as m68k-asm/m68k-lsp flags.
+/// Settings that m68k-asm and m68k-lsp share, as flags, so diagnostics check
+/// what the build assembles.
 function analysisFlags(cfg: vscode.WorkspaceConfiguration): string[] {
   const flags = [];
+  if (cfg.get<boolean>('optimize')) flags.push('--optimize');
   if (cfg.get<boolean>('stackCheck')) flags.push('--stack-check');
   if (cfg.get<boolean>('flagCheck')) flags.push('--flag-check');
   return flags;
@@ -203,7 +205,7 @@ export async function activate(context: vscode.ExtensionContext) {
       await startClient(context);
     }),
     vscode.workspace.onDidChangeConfiguration((e) => {
-      const keys = ['m68k.cpu', 'm68k.toolsPath', 'm68k.includePaths', 'm68k.mainFile', 'm68k.stackCheck', 'm68k.flagCheck'];
+      const keys = ['m68k.cpu', 'm68k.toolsPath', 'm68k.includePaths', 'm68k.mainFile', 'm68k.stackCheck', 'm68k.flagCheck', 'm68k.optimize'];
       if (keys.some((k) => e.affectsConfiguration(k))) {
         vscode.commands.executeCommand('m68k.restartServer');
       }
