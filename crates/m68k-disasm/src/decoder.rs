@@ -800,6 +800,10 @@ fn parse_operands(
         }
         ParserType::ImmCcr => {
             let imm = stream.read_word()?;
+            // A byte immediate: the high byte of its word must be zero.
+            if imm & 0xFF00 != 0 {
+                return Err("reserved bits set in the CCR immediate".into());
+            }
             operands.push(DecodedOperand::from_ea(EAOperand::Immediate(
                 imm as u64,
                 "w".into(),
@@ -824,6 +828,12 @@ fn parse_operands(
                 return Err("invalid size code".into());
             }
             let size = ["b", "w", "l"][size_code as usize];
+            // 68000/68010: data alterable only. 68020+ adds An (word and
+            // long), PC-relative and immediate (PRM TST).
+            let wide = mode == 1 || (mode == 7 && reg >= 2);
+            if wide && (m68k_core::addressing::cpu_level(cpu) < 2 || (mode == 1 && size == "b")) {
+                return Err("addressing mode not allowed for TST on this CPU".into());
+            }
             let ea = decode_ea(mode, reg, size, stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(ea));
             Ok((format!("{}.{}", name, size), operands, target_addr))
@@ -1078,6 +1088,10 @@ fn parse_operands(
             // MULU.L/MULS.L (68020+): ext word bit 11 = signed,
             // bit 10 = 64-bit (Dh:Dl) form, bits 14-12 = Dq, bits 2-0 = Dr.
             let ext = stream.read_word()?;
+            // Reserved bits must be zero, or this is no MUL.L.
+            if ext & 0x03F8 != 0 {
+                return Err("reserved bits set in the MUL.L extension word".into());
+            }
             let dq = (ext >> 12) & 0x7;
             let signed = (ext >> 11) & 1 != 0;
             let is_64 = (ext >> 10) & 1 != 0;
@@ -1104,6 +1118,10 @@ fn parse_operands(
             // the case where the 64-bit bit is clear yet Dr != Dq. With
             // both bits clear and Dr == Dq it's a plain DIVx.L.
             let ext = stream.read_word()?;
+            // Reserved bits must be zero, or this is no DIV.L.
+            if ext & 0x03F8 != 0 {
+                return Err("reserved bits set in the DIV.L extension word".into());
+            }
             let dq = (ext >> 12) & 0x7;
             let signed = (ext >> 11) & 1 != 0;
             let is_64 = (ext >> 10) & 1 != 0;
@@ -1135,6 +1153,10 @@ fn parse_operands(
                 _ => return Err("invalid size for MOVES".into()),
             };
             let ext = stream.read_word()?;
+            // Reserved bits must be zero, or this is no MOVES.
+            if ext & 0x07FF != 0 {
+                return Err("reserved bits set in the MOVES extension word".into());
+            }
             let is_addr = (ext >> 15) & 1 != 0;
             let regnum = (ext >> 12) & 0x7;
             let to_memory = (ext >> 11) & 1 != 0;
@@ -1221,6 +1243,10 @@ fn parse_operands(
                 _ => return Err("invalid size for CHK2/CMP2".into()),
             };
             let ext = stream.read_word()?;
+            // Reserved bits must be zero, or this is no CHK2/CMP2.
+            if ext & 0x07FF != 0 {
+                return Err("reserved bits set in the CHK2/CMP2 extension word".into());
+            }
             let is_addr = (ext >> 15) & 1 != 0;
             let regnum = (ext >> 12) & 0x7;
             let is_chk2 = (ext >> 11) & 1 != 0;
@@ -1284,6 +1310,10 @@ fn parse_operands(
             // with each other, not with the hardware. The reference
             // assembler settles it — `callm #4,(a0)` = `06d0 0004`.
             let ext = stream.read_word()?;
+            // Reserved bits must be zero, or this is no CALLM.
+            if ext & 0xFF00 != 0 {
+                return Err("reserved bits set in the CALLM extension word".into());
+            }
             let mode = ((op >> 3) & 0x7) as u8;
             let reg = (op & 0x7) as u8;
             let ea = decode_ea(mode, reg, "b", stream, inst_pc, cpu)?;
@@ -1332,6 +1362,15 @@ fn parse_operands(
             let is_restore = (op >> 6) & 1 != 0;
             let mode = ((op >> 3) & 0x7) as u8;
             let reg = (op & 0x7) as u8;
+            use m68k_core::ea_categories::ea;
+            let allowed = if is_restore {
+                ea::CONTROL | ea::APOSTINC
+            } else {
+                ea::CONTROL_ALT | ea::APREDEC
+            };
+            if !m68k_core::ea_categories::ea_matches(mode, reg, allowed) {
+                return Err("addressing mode not allowed for PSAVE/PRESTORE".into());
+            }
             let ea = decode_ea(mode, reg, "b", stream, inst_pc, cpu)?;
             operands.push(DecodedOperand::from_ea(ea));
             Ok((
@@ -1345,6 +1384,7 @@ fn parse_operands(
             let cr = ext & 0xFFF;
             let reg = ((ext >> 12) & 0x7) as u8;
             let is_addr_reg = (ext >> 15) & 1 != 0;
+            check_movec_cpu(cr, cpu)?;
             let cr_name = control_reg_name(cr)?;
             operands.push(DecodedOperand::special(cr_name));
             operands.push(DecodedOperand::from_ea(if is_addr_reg {
@@ -1359,6 +1399,7 @@ fn parse_operands(
             let cr = ext & 0xFFF;
             let reg = ((ext >> 12) & 0x7) as u8;
             let is_addr_reg = (ext >> 15) & 1 != 0;
+            check_movec_cpu(cr, cpu)?;
             let cr_name = control_reg_name(cr)?;
             operands.push(DecodedOperand::from_ea(if is_addr_reg {
                 EAOperand::AddrReg(reg)
@@ -1412,9 +1453,10 @@ fn parse_operands(
             let ea_mode = ((op >> 3) & 0x7) as u8;
             let ea_reg = (op & 0x7) as u8;
             let sub = (op >> 8) & 0x7;
-            // Dn or a control mode; the modifying forms (BFCHG/BFCLR/
-            // BFSET/BFINS, even sub-opcodes from 2 on) cannot write PC-relative.
-            let category = if sub >= 2 && sub.is_multiple_of(2) {
+            // Dn or a control mode; the modifying forms (BFCHG/BFCLR/BFSET,
+            // even sub-opcodes from 2 on, and BFINS, 7) cannot write
+            // PC-relative.
+            let category = if matches!(sub, 2 | 4 | 6 | 7) {
                 m68k_core::ea_categories::ea::DREG | m68k_core::ea_categories::ea::CONTROL_ALT
             } else {
                 m68k_core::ea_categories::ea::DREG | m68k_core::ea_categories::ea::CONTROL
@@ -1424,6 +1466,12 @@ fn parse_operands(
             }
             let ea = decode_ea(ea_mode, ea_reg, "b", stream, inst_pc, cpu)?;
 
+            // Bit 15 is reserved; bits 14-12 name a register only for the
+            // forms that have one (BFEXTU/BFEXTS/BFFFO/BFINS, odd sub-opcodes).
+            let reg_bits = if sub % 2 == 1 { 0x8000 } else { 0xF000 };
+            if ext & reg_bits != 0 {
+                return Err("reserved bits set in the bitfield extension word".into());
+            }
             let (mnemonic, has_dst_reg, dst_reg_is_source) = match sub {
                 0 => ("bftst", false, false),
                 1 => ("bfextu", true, false),
@@ -1903,6 +1951,14 @@ fn decode_fpu_cpgen(
                 };
                 fpu_reg_list_text(mask)
             };
+            // Memory only: -(An) to store, (An)+ to load, nothing written
+            // to PC-relative or immediate.
+            let bad = ea_mode < 2
+                || (dr == 1 && (ea_mode == 3 || (ea_mode == 7 && ea_reg >= 2)))
+                || (dr == 0 && ea_mode == 4);
+            if bad {
+                return Err("addressing mode not allowed for FMOVEM".into());
+            }
             let ea = decode_ea(ea_mode, ea_reg, "x", stream, inst_pc, cpu)?;
             if dr == 1 {
                 operands.push(DecodedOperand::special(reg_list));
@@ -1918,6 +1974,17 @@ fn decode_fpu_cpgen(
             // (1 = ctrl -> EA, 0 = EA -> ctrl); bits12-10 are the control-register mask.
             let dr = (ext >> 13) & 1;
             let mask = (ext >> 10) & 0x7;
+            // At least one register; Dn and #imm hold one long, An only
+            // FPIAR; nothing is stored to PC-relative or immediate.
+            let single = mask.count_ones() == 1;
+            let bad = mask == 0
+                || (ea_mode == 0 && !single)
+                || (ea_mode == 1 && mask != 1)
+                || (ea_mode == 7 && ea_reg == 4 && !single)
+                || (dr == 1 && ea_mode == 7 && ea_reg >= 2);
+            if bad {
+                return Err("addressing mode not allowed for an FPU control register move".into());
+            }
             let reg_list = fpu_ctrl_list_name(mask);
             let ea = decode_ea(ea_mode, ea_reg, "l", stream, inst_pc, cpu)?;
             if dr == 1 {
@@ -1935,6 +2002,18 @@ fn decode_fpu_cpgen(
             let rm_dst = ((ext >> 7) & 0x7) as u8;
             let cmd = ext & 0x7F;
             let fmt = (ext >> 10) & 0x7;
+            // FMOVECR has no EA. Otherwise: no An, Dn only for the formats
+            // that fit in it (.l .s .w .b), and a store needs an alterable
+            // destination.
+            let is_fmovecr = group == 0b010 && fmt == 0b111;
+            let dn_fits = matches!(fmt, 0 | 1 | 4 | 6);
+            let bad = !is_fmovecr
+                && (ea_mode == 1
+                    || (ea_mode == 0 && !dn_fits)
+                    || (group == 0b011 && ea_mode == 7 && ea_reg >= 2));
+            if bad {
+                return Err("addressing mode not allowed for this FPU operation".into());
+            }
 
             if group == 0b010 && fmt == 0b111 {
                 // FMOVECR #rom_offset,FPn: no EA is consumed (bits 5-0 of op are ignored
@@ -2052,6 +2131,14 @@ fn decode_fpu_cpgen(
 /// round-trip instead of producing unparseable output.
 /// MOVEC control register name; `Err` for a code no 68k defines, which
 /// traps as an illegal instruction and has no assembler spelling.
+/// A control register the CPU lacks makes MOVEC an illegal instruction.
+fn check_movec_cpu(cr: u16, cpu: &str) -> Result<(), String> {
+    match m68k_core::cpu_gate::movec_min_level(cr) {
+        Some(min) if m68k_core::addressing::cpu_level(cpu) >= min => Ok(()),
+        _ => Err(format!("MOVEC control register ${cr:03x} not on the {cpu}")),
+    }
+}
+
 fn control_reg_name(cr: u16) -> Result<String, String> {
     Ok(match cr {
         0x000 => "sfc",
@@ -2205,6 +2292,51 @@ mod ea_validation_tests {
             Ok((_, DecodeResult::Instruction(i))) => i.mnemonic,
             Ok((_, DecodeResult::DataWord(_))) => "dc.w".to_string(),
             Err(e) => format!("error: {}", e),
+        }
+    }
+
+    /// Encodings the PRM rules out decode as data; their valid neighbours
+    /// still decode. `(cpu, bytes, expected mnemonic or "dc.w")`.
+    #[test]
+    fn operand_rules_follow_the_prm() {
+        let cases: &[(&str, &[u8], &str)] = &[
+            // MOVEM registers to memory: no PC-relative destination.
+            ("68000", &[0x48, 0xBA, 0x70, 0x10, 0x70, 0x20], "dc.w"),
+            // TST: PC-relative/immediate and An only from the 68020 on.
+            ("68000", &[0x4A, 0x3A, 0x00, 0x10], "dc.w"),
+            ("68020", &[0x4A, 0x3A, 0x00, 0x10], "tst.b"),
+            ("68020", &[0x4A, 0x48], "tst.w"),
+            ("68020", &[0x4A, 0x08], "dc.w"),
+            // BFINS writes: no PC-relative destination.
+            ("68020", &[0xEF, 0xFA, 0x00, 0x10, 0x00, 0x20], "dc.w"),
+            // Static BTST has no immediate destination.
+            ("68000", &[0x08, 0x3C, 0x00, 0x10, 0x00, 0x20], "dc.w"),
+            // PSAVE: control alterable or -(An); PRESTORE: control or (An)+.
+            ("68030", &[0xF1, 0x18], "dc.w"),
+            ("68030", &[0xF1, 0x10], "psave"),
+            ("68030", &[0xF1, 0x58], "prestore"),
+            // Reserved extension-word bits.
+            ("68020", &[0x4C, 0x00, 0x70, 0x10], "dc.w"),
+            ("68020", &[0x4C, 0x00, 0x18, 0x01], "muls.l"),
+            ("68020", &[0x00, 0xD0, 0x08, 0x01], "dc.w"),
+            ("68020", &[0xE8, 0xC0, 0x70, 0x10], "dc.w"),
+            ("68000", &[0x00, 0x3C, 0x70, 0x10], "dc.w"),
+            // FPU: no An operand, Dn only for .l/.s/.w/.b, a control
+            // register move needs a register and Dn holds one of them.
+            ("68040", &[0xF2, 0x08, 0x50, 0x22], "dc.w"),
+            ("68040", &[0xF2, 0x00, 0x54, 0x00], "dc.w"),
+            ("68040", &[0xF2, 0x00, 0x40, 0x00], "fmove.l"),
+            ("68040", &[0xF2, 0x00, 0x98, 0x00], "dc.w"),
+            ("68040", &[0xF2, 0x00, 0x80, 0x00], "dc.w"),
+            ("68040", &[0xF2, 0x00, 0xE0, 0xFF], "dc.w"),
+            // MOVEC control registers per CPU.
+            ("68010", &[0x4E, 0x7A, 0x00, 0x03], "dc.w"),
+            ("68040", &[0x4E, 0x7A, 0x00, 0x03], "movec"),
+            ("68040", &[0x4E, 0x7A, 0x08, 0x08], "dc.w"),
+            ("68060", &[0x4E, 0x7A, 0x08, 0x08], "movec"),
+        ];
+        for (cpu, bytes, expected) in cases {
+            assert_eq!(decode_one_on(bytes, cpu), *expected, "{cpu} {bytes:02x?}");
         }
     }
 

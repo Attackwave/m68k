@@ -497,7 +497,8 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x0800,
             mnemonic: "BTST",
             src_ea: IMM,
-            dst_ea: DATA,
+            // The static form has no immediate destination (PRM BTST).
+            dst_ea: DATA & !IMM,
             cpu: "68000",
             parser: ParserType::BitImm,
             fixed_size: None,
@@ -1144,7 +1145,8 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x4880,
             mnemonic: "MOVEM",
             src_ea: DREG,
-            dst_ea: MEMORY,
+            // Registers to memory: control alterable or predecrement.
+            dst_ea: CONTROL_ALT | APREDEC,
             cpu: "68000",
             parser: ParserType::MovemRm,
             fixed_size: None,
@@ -1722,7 +1724,9 @@ pub fn opcode_patterns() -> &'static [OpcodePattern] {
             value: 0x4A00,
             mnemonic: "TST",
             src_ea: 0,
-            dst_ea: DATA,
+            // Narrowed per CPU and size by the decoder (An, PC-relative and
+            // immediate are 68020+).
+            dst_ea: ALL,
             cpu: "68000",
             parser: ParserType::Tst,
             fixed_size: None,

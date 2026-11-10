@@ -527,6 +527,13 @@ fn parse_operand_text(
     };
     let paren_text = paren_text.as_ref();
 
+    // PC-relative with a sized base displacement: `(bd.l,PC)`,
+    // `(bd.w,PC,Xn)`, `(bd.l,PC,Xn)` ask for the 68020 full format,
+    // which reaches beyond the 16-bit and 8-bit brief forms.
+    if let Some(mi) = pc_with_sized_displacement(paren_text, symbols, current_pc) {
+        return Ok(Operand::MemoryIndirect(Box::new(mi)));
+    }
+
     // PC-relative with index: (d8,PC,Xn*scale) - before plain PC-relative
     if let Some((xn, target, scale, xn_is_long)) =
         parse_parens_disp_pc_index(paren_text, symbols, current_pc)
@@ -1114,6 +1121,43 @@ fn parse_parens_disp_pc(text: &str, symbols: &SymbolTable, pc: u32) -> Option<(i
 /// is not known here, so `encode_ea` performs the subtraction (same split
 /// as the non-indexed `(d,PC)` form). It is `None` for `(PC,Xn)`, which
 /// names no target.
+/// `(bd.l,PC)` or `(bd.size,PC,Xn)`: PC base, full-format extension word,
+/// the displacement size given by the suffix (so pass 1 knows the size).
+fn pc_with_sized_displacement(
+    text: &str,
+    symbols: &SymbolTable,
+    pc: u32,
+) -> Option<MemoryIndirectOperand> {
+    let inner = text.trim().strip_prefix('(')?.strip_suffix(')')?;
+    let parts: Vec<&str> = inner.split(',').map(str::trim).collect();
+    let (bd, xn) = match parts.as_slice() {
+        [bd, base] if base.eq_ignore_ascii_case("pc") => (*bd, None),
+        [bd, base, xn] if base.eq_ignore_ascii_case("pc") => (*bd, Some(*xn)),
+        _ => return None,
+    };
+    let (bd, forced) = split_displacement_size(bd);
+    // `(d16.w,PC)` is the ordinary 16-bit form.
+    if forced.is_none() || (forced == Some(false) && xn.is_none()) {
+        return None;
+    }
+    let (index_reg, index_scale, index_long) = match xn {
+        Some(xn) => {
+            let (name, scale, long) = parse_index_reg_and_scale(xn);
+            (Some(index_reg_num(&parse_register(&name)?)?), scale, long)
+        }
+        None => (None, 1, false),
+    };
+    Some(MemoryIndirectOperand {
+        base_is_pc: true,
+        base_disp: Some(evaluate_pc_target(bd, symbols, pc)),
+        bd_forced: forced,
+        index_reg,
+        index_scale,
+        index_long,
+        ..Default::default()
+    })
+}
+
 fn parse_parens_disp_pc_index(
     text: &str,
     symbols: &SymbolTable,
@@ -8445,6 +8489,39 @@ n   SET 10
         ] {
             let mut asm = Assembler::new(0);
             asm.set_cpu(cpu);
+            assert!(asm.assemble(src).is_err(), "{src}");
+        }
+    }
+
+    #[test]
+    fn third_audit_encodings() {
+        let cases: &[(&str, &str, &[u8])] = &[
+            // FPU conditions 011110/011111 are SNE and ST (PRM table 3-23).
+            (" fbsne *\n", "68040", &[0xF2, 0x9E, 0xFF, 0xFE]),
+            (" fbst *\n", "68040", &[0xF2, 0x9F, 0xFF, 0xFE]),
+            // A sized base displacement selects the full format with PC.
+            (
+                " tst.l (x.w,pc,d0.w)\nx: nop\n",
+                "68020",
+                &[0x4A, 0xBB, 0x01, 0x20, 0x00, 0x04, 0x4E, 0x71],
+            ),
+            (
+                "x: nop\n lea (x.l,pc),a0\n",
+                "68020",
+                &[0x4E, 0x71, 0x41, 0xFB, 0x01, 0x70, 0xFF, 0xFF, 0xFF, 0xFC],
+            ),
+        ];
+        for (src, cpu, expected) in cases {
+            assert_eq!(assemble_source_with_cpu(src, cpu), *expected, "{src}");
+        }
+        for src in [
+            " psave d0\n",
+            " psave (a0)+\n",
+            " prestore -(a0)\n",
+            " psave #1\n",
+        ] {
+            let mut asm = Assembler::new(0);
+            asm.set_cpu("68030");
             assert!(asm.assemble(src).is_err(), "{src}");
         }
     }
