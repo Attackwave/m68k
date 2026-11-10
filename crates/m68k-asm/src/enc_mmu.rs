@@ -314,7 +314,8 @@ pub fn enc_cpusha(cache: i64, cpu: &str) -> Result<Vec<u16>, AsmError> {
 /// diagram instead).
 pub fn enc_psave(ea_op: &Operand, ext_pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
-    let (mode, reg, ext_words) = encode_ea(ea_op, "b", ext_pc, ALL, cpu)?;
+    // Control alterable or predecrement (PRM PSAVE).
+    let (mode, reg, ext_words) = encode_ea(ea_op, "b", ext_pc, CONTROL_ALT | APREDEC, cpu)?;
     let mut words = vec![0xF100 | ((mode as u16) << 3) | (reg as u16)];
     words.extend(ext_words);
     Ok(words)
@@ -327,7 +328,8 @@ pub fn enc_psave(ea_op: &Operand, ext_pc: u32, cpu: &str) -> Result<Vec<u16>, As
 /// same caveat about verification.
 pub fn enc_prestore(ea_op: &Operand, ext_pc: u32, cpu: &str) -> Result<Vec<u16>, AsmError> {
     check_cpu(cpu, "68030")?;
-    let (mode, reg, ext_words) = encode_ea(ea_op, "b", ext_pc, ALL, cpu)?;
+    // Control or postincrement (PRM PRESTORE).
+    let (mode, reg, ext_words) = encode_ea(ea_op, "b", ext_pc, CONTROL | APOSTINC, cpu)?;
     let mut words = vec![0xF140 | ((mode as u16) << 3) | (reg as u16)];
     words.extend(ext_words);
     Ok(words)

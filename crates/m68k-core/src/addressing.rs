@@ -243,10 +243,16 @@ impl OperandTrait for MemoryIndirectOperand {
         // A null base displacement stays absent: `([pc])` has no bd word,
         // and naming its target would reassemble with one.
         let bd_str = if self.target_pc_rel && self.bd_present {
-            if let Some(label) = labels.get(&self.pc_rel_target) {
-                label.clone()
-            } else {
-                format!("${:08x}", self.pc_rel_target)
+            let target = match labels.get(&self.pc_rel_target) {
+                Some(label) => label.clone(),
+                None => format!("${:08x}", self.pc_rel_target),
+            };
+            // Unbracketed, only the size suffix tells the assembler to
+            // use the full format instead of `(d16,PC)`/`(d8,PC,Xn)`.
+            match (self.is_indirect, self.bd_long) {
+                (true, _) => target,
+                (false, true) => format!("{target}.l"),
+                (false, false) => format!("{target}.w"),
             }
         } else if self.bd_present {
             // `(bd,An)` with a long bd that would fit a word: without the

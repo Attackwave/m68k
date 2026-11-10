@@ -136,8 +136,8 @@ pub(crate) fn fpu_cc(cond: &str) -> Option<u16> {
         "NLT" => 0x1B,
         "NGE" => 0x1C,
         "NGT" => 0x1D,
-        "NEQ" => 0x1E,
-        "SSF" => 0x1F,
+        "SNE" => 0x1E,
+        "ST" => 0x1F,
         _ => return None,
     })
 }

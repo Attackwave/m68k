@@ -296,27 +296,15 @@ pub fn enc_rtd(displacement: u16) -> Result<Vec<u16>, AsmError> {
 /// with no diagnostic. Address registers were rejected outright, though
 /// `movec a0,vbr` and `movec a7,usp` are both valid and appear in real
 /// code.
-/// Lowest CPU level (68010 = 1 … 68060 = 5) that has MOVEC control
-/// register `cr`, or `None` for a code no 68k defines.
-fn movec_min_level(cr: u16) -> Option<u8> {
-    Some(match cr {
-        0x000 | 0x001 | 0x800 | 0x801 => 1, // SFC DFC USP VBR
-        0x002 | 0x802 | 0x803 | 0x804 => 2, // CACR CAAR MSP ISP
-        0x003..=0x007 | 0x805..=0x807 => 4, // TC ITTx DTTx MMUSR URP SRP
-        0x008 | 0x808 => 5,                 // BUSCR PCR
-        _ => return None,
-    })
-}
-
 pub fn enc_movec(src: &Operand, dst: &Operand, cpu: &str) -> Result<Vec<u16>, AsmError> {
     // A control register the selected CPU lacks makes MOVEC trap as an
     // illegal instruction, so it is an error here, not working output.
     let check = |cr: i64| -> Result<u16, AsmError> {
         let code = u16::try_from(cr)
             .ok()
-            .filter(|c| movec_min_level(*c).is_some())
+            .filter(|c| m68k_core::cpu_gate::movec_min_level(*c).is_some())
             .ok_or_else(|| AsmError::new(format!("unknown MOVEC control register ${cr:X}")))?;
-        let min = movec_min_level(code).unwrap_or(1);
+        let min = m68k_core::cpu_gate::movec_min_level(code).unwrap_or(1);
         if crate::ea_encode::cpu_level(cpu) < min {
             return Err(AsmError::new(format!(
                 "MOVEC control register ${code:03X} is not available on the {cpu}"

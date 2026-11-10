@@ -174,6 +174,18 @@ pub fn check_mnemonic_cpu(mnemonic: &str, cpu: &str) -> Result<(), String> {
     }
 }
 
+/// Lowest CPU level (68010 = 1 … 68060 = 5) that has MOVEC control
+/// register `cr`, or `None` for a code no 68k defines.
+pub fn movec_min_level(cr: u16) -> Option<u8> {
+    Some(match cr {
+        0x000 | 0x001 | 0x800 | 0x801 => 1, // SFC DFC USP VBR
+        0x002 | 0x802 | 0x803 | 0x804 => 2, // CACR CAAR MSP ISP
+        0x003..=0x007 | 0x805..=0x807 => 4, // TC ITTx DTTx MMUSR URP SRP
+        0x008 | 0x808 => 5,                 // BUSCR PCR
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
