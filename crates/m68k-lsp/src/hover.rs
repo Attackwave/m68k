@@ -20,7 +20,7 @@ pub fn compute_hover(doc: &Document, pos: Position) -> Option<Hover> {
     // Custom chip registers, by name or $DFFxxx address. A user EQU of the
     // same name is shown below the register documentation.
     if let Some(mut md) = crate::custom_regs::hover(doc, clean_word, word_info.line_idx) {
-        if let Some(symbol) = format_symbol_hover(doc, clean_word) {
+        if let Some(symbol) = format_symbol_hover(doc, clean_word, word_info.line_idx) {
             md.push_str("\n---\n\n");
             md.push_str(&symbol);
         }
@@ -49,7 +49,7 @@ pub fn compute_hover(doc: &Document, pos: Position) -> Option<Hover> {
         }
         WordKind::Register => format_register_hover(clean_word)?,
         WordKind::Lvo => format_lvo_hover(clean_word)?,
-        WordKind::Label => format_symbol_hover(doc, clean_word)?,
+        WordKind::Label => format_symbol_hover(doc, clean_word, word_info.line_idx)?,
         WordKind::Unknown => {
             // Try opcode first, then directive, then symbol
             if let Some(h) = format_opcode_hover(
@@ -61,7 +61,7 @@ pub fn compute_hover(doc: &Document, pos: Position) -> Option<Hover> {
             } else if let Some(h) = format_directive_hover(clean_word) {
                 h
             } else {
-                format_symbol_hover(doc, clean_word)?
+                format_symbol_hover(doc, clean_word, word_info.line_idx)?
             }
         }
     };
@@ -253,8 +253,8 @@ fn format_lvo_hover(lvo_name: &str) -> Option<String> {
     ))
 }
 
-fn format_symbol_hover(doc: &Document, name: &str) -> Option<String> {
-    if let Some(sym) = doc.symbols.get(name) {
+fn format_symbol_hover(doc: &Document, name: &str, line_idx: usize) -> Option<String> {
+    if let Some(sym) = doc.lookup(name, line_idx) {
         let kind_str = match sym.kind {
             crate::document::SymbolDefKind::Label => "Label",
             crate::document::SymbolDefKind::Equate => "Constant (EQU)",

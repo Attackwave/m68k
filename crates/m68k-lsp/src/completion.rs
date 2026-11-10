@@ -11,7 +11,7 @@ use crate::analysis::op_docs::lookup_opcode;
 use crate::document::Document;
 
 /// Generate completion items for a position in the document.
-pub fn compute_completion(doc: &Document, _pos: Position) -> CompletionResponse {
+pub fn compute_completion(doc: &Document, pos: Position) -> CompletionResponse {
     let mut items = Vec::new();
 
     // 1. Instruction mnemonics with snippets
@@ -70,8 +70,13 @@ pub fn compute_completion(doc: &Document, _pos: Position) -> CompletionResponse 
         });
     }
 
-    // 4. Document symbols (labels, equates, macros)
-    for (name, sym) in &doc.symbols {
+    // 4. Document symbols (labels, equates, macros); local labels only
+    // of the scope the cursor is in, under the name the source writes.
+    let line = pos.line as usize;
+    for (key, sym) in &doc.symbols {
+        if doc.key_at(&sym.name, line) != *key {
+            continue;
+        }
         let (kind, detail) = match sym.kind {
             crate::document::SymbolDefKind::Label => (
                 CompletionItemKind::FUNCTION,
@@ -92,7 +97,7 @@ pub fn compute_completion(doc: &Document, _pos: Position) -> CompletionResponse 
         };
 
         items.push(CompletionItem {
-            label: name.clone(),
+            label: sym.name.clone(),
             kind: Some(kind),
             detail: Some(detail),
             ..Default::default()
