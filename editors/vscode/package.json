@@ -81,6 +81,11 @@
           "default": "",
           "description": "Main source file of the program, relative to the workspace folder. The language server assembles it and checks every file it INCLUDEs as part of it, so an included file does not report the symbols and macros of its includer as undefined. F5 builds and debugs it instead of the active file."
         },
+        "m68k.optimize": {
+          "type": "boolean",
+          "default": false,
+          "description": "Assemble with size-changing optimizations (m68k-asm --optimize): short absolute addresses, short branches, JSR/JMP to BSR/BRA, LEA/PEA PC-relative. Applies to diagnostics and build tasks, so the editor reports what the build assembles."
+        },
         "m68k.stackCheck": {
           "type": "boolean",
           "default": false,
