@@ -839,6 +839,17 @@ mod tests {
         (asm.stack_analysis(), asm.dead_flag_setters())
     }
 
+    #[test]
+    fn analysis_off_records_nothing() {
+        let src = "main:\n moveq #1,d0\n moveq #2,d0\n rts\n";
+        let mut asm = Assembler::new(0x1000);
+        asm.set_analysis(false);
+        asm.assemble(src).unwrap();
+        assert!(asm.stack_analysis().is_empty());
+        assert!(asm.dead_flag_setters().is_empty());
+        assert!(!analyze(src).0.is_empty());
+    }
+
     fn report<'a>(r: &'a [RoutineReport], name: &str) -> &'a RoutineReport {
         r.iter()
             .find(|x| x.name == name)

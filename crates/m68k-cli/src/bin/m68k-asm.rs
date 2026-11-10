@@ -384,6 +384,7 @@ fn run(args: Args) -> Result<(), String> {
         let mut asm = Assembler::new(origin);
         asm.set_cpu(&args.cpu);
         asm.set_optimize(args.optimize);
+        asm.set_analysis(args.stack_check || args.flag_check || args.stack_report.is_some());
         for dir in &args.include_paths {
             asm.add_include_path(dir.clone());
         }
