@@ -2300,6 +2300,9 @@ pub struct Assembler {
     current_global_label: Option<String>,
     /// Errors pass 2 collects before giving up on the rest of the source.
     max_errors: usize,
+    /// Whether pass 2 records the per-instruction data the stack and flag
+    /// analyses read; see [`Self::set_analysis`].
+    analysis: bool,
 }
 
 /// Default for [`Assembler::set_max_errors`].
@@ -2405,6 +2408,7 @@ impl Assembler {
             branches: Vec::new(),
             cpu: "68000".to_string(),
             max_errors: MAX_PASS2_ERRORS,
+            analysis: true,
             errors: ErrorCollector::new(),
             pc: origin,
             line_pcs: Vec::new(),
@@ -2635,6 +2639,15 @@ impl Assembler {
     /// not just a readable report, raises it.
     pub fn set_max_errors(&mut self, max: usize) {
         self.max_errors = max;
+    }
+
+    /// Record what [`Self::stack_analysis`] and [`Self::dead_flag_setters`]
+    /// read (on by default). The record re-parses every operand and keeps
+    /// it for the whole program, roughly a quarter of the assembler's
+    /// memory on large sources; a caller that never asks for either
+    /// analysis turns it off. With it off both return nothing.
+    pub fn set_analysis(&mut self, on: bool) {
+        self.analysis = on;
     }
 
     /// Warn about immediates that encode cleanly but almost certainly do
@@ -4690,7 +4703,7 @@ impl Assembler {
         line: &ParsedLine,
         code_len_before: usize,
     ) {
-        if self.code.len() <= code_len_before {
+        if !self.analysis || self.code.len() <= code_len_before {
             return;
         }
         let last = &self.code[self.code.len() - 1];

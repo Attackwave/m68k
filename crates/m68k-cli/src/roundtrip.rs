@@ -88,6 +88,7 @@ pub fn make_reassemblable(
         let (text, owner) = render(lines, base);
         let mut asm = Assembler::new(base);
         asm.set_cpu(cpu);
+        asm.set_analysis(false);
         // Every failing line has to be seen in the same round, or a large
         // input with many of them needs more rounds than it gets.
         asm.set_max_errors(usize::MAX);
