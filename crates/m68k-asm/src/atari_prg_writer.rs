@@ -109,6 +109,31 @@ fn segment_bytes(section: Option<&Section>, len: u32) -> Vec<u8> {
     bytes
 }
 
+/// The TOS fixup table of `relocs` (sorted, even offsets from the
+/// image start, none of them 0): the first offset as a longword, 0 when
+/// there is none, then per further fixup one byte with the distance from
+/// the previous one, 1 for each step of 254 without a fixup on the way,
+/// and a 0 at the end.
+pub fn fixup_table(relocs: &[u32]) -> Vec<u8> {
+    let mut out = Vec::new();
+    match relocs.first() {
+        None => out.extend_from_slice(&0u32.to_be_bytes()),
+        Some(&first) => {
+            out.extend_from_slice(&first.to_be_bytes());
+            for pair in relocs.windows(2) {
+                let mut delta = pair[1] - pair[0];
+                while delta > 254 {
+                    out.push(1);
+                    delta -= 254;
+                }
+                out.push(delta as u8);
+            }
+            out.push(0);
+        }
+    }
+    out
+}
+
 /// Assembles `base`'s source laid out as a TOS program and returns the
 /// program file. `reassemble(origin, overrides)` must assemble the same
 /// source with the text section at `origin` and the listed sections at
@@ -224,21 +249,7 @@ where
     out.extend_from_slice(&image);
     out.extend_from_slice(&symbols);
 
-    match relocs.first() {
-        None => out.extend_from_slice(&0u32.to_be_bytes()),
-        Some(&first) => {
-            out.extend_from_slice(&first.to_be_bytes());
-            for pair in relocs.windows(2) {
-                let mut delta = pair[1] - pair[0];
-                while delta > 254 {
-                    out.push(1);
-                    delta -= 254;
-                }
-                out.push(delta as u8);
-            }
-            out.push(0);
-        }
-    }
+    out.extend_from_slice(&fixup_table(&relocs));
     Ok(out)
 }
 
