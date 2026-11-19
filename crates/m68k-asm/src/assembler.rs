@@ -4392,6 +4392,28 @@ impl Assembler {
                     self.symbols
                         .force_set_in_section(&name, self.pc, Some(line.line_no), section);
                 }
+                // An EQU is evaluated again each round as well: one that
+                // reads the location counter (`here EQU *`, the label a
+                // macro call's line carries) or a label (`len EQU
+                // end-start`) otherwise kept the address pass 1 estimated,
+                // before an instruction above it changed its size. Not one
+                // that reads a SET symbol: SET is not replayed here (the
+                // conditionals this loop evaluates read final values and
+                // need not take the blocks pass 1 took), so such an EQU
+                // keeps the value it got in pass 1, in source order. A
+                // failed evaluation keeps the previous value too.
+                if let Some(ref label) = line.label
+                    && let LineType::Directive { name, args } = &line.line_type
+                    && name == "equ"
+                    && let Some(expr) = args.first()
+                    && !expr
+                        .split(|c: char| !(c.is_alphanumeric() || matches!(c, '_' | '.' | '@')))
+                        .any(|word| self.symbols.is_set(word))
+                    && let Ok(value) = evaluate_expr_str(expr, &self.symbols, self.pc)
+                {
+                    self.symbols
+                        .force_set(label, value as u32, Some(line.line_no));
+                }
                 // estimate_line_size_with_branches (via estimate_line_size)
                 // updates self.pc directly for directives like ORG/SECTION
                 // that reposition the location counter rather than just
@@ -7515,6 +7537,40 @@ label: nopmac
         assert!(result.is_ok(), "assembly failed: {:?}", result.err());
         // label resolves to PC of NOP
         assert_eq!(asm.symbols.resolve("label").unwrap(), 0x1000);
+    }
+
+    #[test]
+    fn equ_and_set_follow_a_size_change_above_them() {
+        // `tab(PC,D4.W)` forward is estimated longer in pass 1 than it
+        // is (a brief extension word), so everything below moves down
+        // by two once relaxed. A label on a macro call's line (an EQU of
+        // the location counter), `EQU *`, an EQU of two labels and an
+        // EQU between two SETs of a name must all follow.
+        let mut asm = Assembler::new(0);
+        let result = asm.assemble(
+            "
+m   MACRO
+    DC.W \\1
+    ENDM
+    DCB.B 128,0
+    MOVE.W tab(PC,D4.W),D1
+tab: DC.W 1,2,3
+onmac: m $1111
+here EQU *
+len EQU here-tab
+x SET 1
+a EQU x
+x SET 2
+    DC.L onmac
+",
+        );
+        assert!(result.is_ok(), "assembly failed: {:?}", result.err());
+        assert_eq!(asm.symbols.resolve("tab").unwrap(), 132);
+        assert_eq!(asm.symbols.resolve("onmac").unwrap(), 138);
+        assert_eq!(asm.symbols.resolve("here").unwrap(), 140);
+        assert_eq!(asm.symbols.resolve("len").unwrap(), 8);
+        assert_eq!(asm.symbols.resolve("a").unwrap(), 1);
+        assert_eq!(asm.symbols.resolve("x").unwrap(), 2);
     }
 
     #[test]
