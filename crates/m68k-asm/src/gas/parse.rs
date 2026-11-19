@@ -256,6 +256,12 @@ struct FileParser {
     locals: HashSet<String>,
     /// Definitions seen so far of each numeric local label.
     numeric: HashMap<u32, u32>,
+    /// Where each label so far was defined: its section and how many
+    /// items other than labels preceded it there. Two labels with the same
+    /// place have nothing but labels between them.
+    places: HashMap<String, (usize, usize)>,
+    /// Items other than labels so far, per section.
+    counts: Vec<usize>,
     /// `.local` + `.comm`: `(name, size, align, line)`.
     local_commons: Vec<(String, u32, u32, usize)>,
     errors: LineErrors,
@@ -325,7 +331,50 @@ impl FileParser {
         &mut self.model.sections[i]
     }
 
+    /// The place the next item of the current section takes.
+    fn place(&self) -> (usize, usize) {
+        let i = self.current.unwrap_or(0);
+        (i, self.counts.get(i).copied().unwrap_or(0))
+    }
+
+    /// A `d(%an)` operand, or `(%an)` when GNU as knows `d` is 0 while
+    /// reading the line: a constant 0, or labels it has already seen at
+    /// one place, such as `.L2-.L1` with only labels between them. A
+    /// difference it cannot know yet (a label further down, an item
+    /// between) keeps the 16-bit form, as it does.
+    fn disp(&self, e: Expr, n: u8) -> Op {
+        let here = self.place();
+        let key = |(s, k): (usize, usize)| (s as i64) << 32 | k as i64;
+        let known = e
+            .eval(
+                &mut |name: &str| {
+                    self.places
+                        .get(name)
+                        .map(|&p| key(p))
+                        .ok_or_else(String::new)
+                },
+                Some(key(here)),
+            )
+            .ok()
+            .map(|lin| lin.terms.iter().map(|&(v, c)| v * c).sum::<i64>() + lin.k);
+        if known == Some(0) {
+            Op::Ind(n)
+        } else {
+            Op::Disp(e, n)
+        }
+    }
+
     fn push(&mut self, item: Item, line: usize) -> Result<(), String> {
+        if let Item::Label(name) = &item {
+            let place = self.place();
+            self.places.insert(name.clone(), place);
+        } else {
+            let i = self.current.unwrap_or(0);
+            if self.counts.len() <= i {
+                self.counts.resize(i + 1, 0);
+            }
+            self.counts[i] += 1;
+        }
         let sec = self.section();
         if sec.class == Class::Bss {
             let ok = match &item {
@@ -546,7 +595,9 @@ impl FileParser {
                     Some(f) => self.const_arg(f)?,
                     None => 0,
                 };
-                if fill == 0 {
+                if n == 0 {
+                    // GNU as ignores an empty fill; it is not an item.
+                } else if fill == 0 {
                     self.push(Item::Zero(n), line)?;
                 } else {
                     self.push(Item::Bytes(vec![fill as u8; n as usize]), line)?;
@@ -666,7 +717,7 @@ impl FileParser {
             [_] => Ok(match (base, disp) {
                 (None, _) => Op::PcDisp(disp_expr),
                 (Some(n), None) => Op::Ind(n),
-                (Some(n), Some(_)) => Op::Disp(disp_expr, n),
+                (Some(n), Some(_)) => self.disp(disp_expr, n),
             }),
             [_, x] => {
                 let (xn, long, scale) = index_register(x).ok_or_else(bad)?;
@@ -708,7 +759,7 @@ impl FileParser {
         let disp = self.expr(parts.first().ok_or_else(bad)?)?;
         match (parts.as_slice(), base) {
             ([_], None) => Ok(Op::PcDisp(disp)),
-            ([_], Some(n)) => Ok(Op::Disp(disp, n)),
+            ([_], Some(n)) => Ok(self.disp(disp, n)),
             ([_, x], base) => {
                 let (xn, long, scale) = index_register(x).ok_or_else(bad)?;
                 Ok(Op::Index {
@@ -799,6 +850,8 @@ pub fn parse_file(name: &str, text: &str) -> (FileModel, LineErrors) {
         discarding: false,
         locals: HashSet::new(),
         numeric: HashMap::new(),
+        places: HashMap::new(),
+        counts: Vec::new(),
         local_commons: Vec::new(),
         errors: Vec::new(),
     };
@@ -899,6 +952,33 @@ mod tests {
         assert_eq!(op("#0x10"), Op::Imm(Expr::Num(16)));
         assert_eq!(op("%d2-%d3/%a2"), Op::RegList(0x040C));
         assert_eq!(op("lf(%pc)"), Op::PcDisp(sym("lf")));
+    }
+
+    #[test]
+    fn known_zero_displacements_are_dropped() {
+        let src = "\tpea 0(%sp)\n\tpea %sp@(1-1)\n.La:\n.Lb:\n\ttst.l .Lb-.La(%a0)\n\
+                   \ttst.l .Ld-.Lc(%a0)\n.Lc:\n.Ld:\n.Le:\n\t.align 2\n.Lf:\n\ttst.l .Lf-.Le(%a0)\n\
+                   .Lg:\n\t.zero 0\n.Lh:\n\ttst.l .Lh-.Lg(%a0)\n\ttst.l 0(%a0,%d0.l)\n\ttst.l 0(%pc)\n";
+        let (m, e) = parse_file("t.s", src);
+        assert!(e.is_empty(), "{e:?}");
+        let ops: Vec<Op> = m.sections[0]
+            .items
+            .iter()
+            .filter_map(|i| match &i.0 {
+                Item::Insn(insn) => Some(insn.ops[0].clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ops[0], Op::Ind(7));
+        assert_eq!(ops[1], Op::Ind(7));
+        assert_eq!(ops[2], Op::Ind(0));
+        // Labels not seen yet, or an alignment between: GNU as keeps (d16,An).
+        assert!(matches!(ops[3], Op::Disp(..)));
+        assert!(matches!(ops[4], Op::Disp(..)));
+        // `.zero 0` is no item.
+        assert_eq!(ops[5], Op::Ind(0));
+        assert!(matches!(ops[6], Op::Index { .. }));
+        assert!(matches!(ops[7], Op::PcDisp(_)));
     }
 
     #[test]

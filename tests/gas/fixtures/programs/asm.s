@@ -47,6 +47,17 @@ entry:
 	move.l	%a1@+,%a0@-
 	move.w	%a2@(-6),%d3
 	move.l	(8,%sp,%d1.w),%d0
+	pea	0(%sp)			| a known zero displacement: (%sp)
+	move.l	(0,%a0),%d0
+	move.l	%a1@(0),%d0
+	move.l	0(%a0,%d0.l),%d0	| an index keeps its 8-bit field
+	move.l	0(%pc),%d0		| and %pc its 16-bit one
+.Lz1:
+.Lz2:
+	move.l	.Lz2-.Lz1(%a0),%d0	| labels already seen at one place
+	move.l	.Lz4-.Lz3(%a0),%d0	| not yet seen: 16-bit 0
+.Lz3:
+.Lz4:
 	move.w	.Ltab(%pc,%d0.w),%d0
 	jmp	%pc@(2,%d0:w)
 	.balignw 4,0x4e71
