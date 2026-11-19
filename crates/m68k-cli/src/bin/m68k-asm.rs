@@ -22,6 +22,18 @@ struct Args {
     /// Input assembly source file (use `-` to read from stdin)
     input: PathBuf,
 
+    /// Further source files, linked with the first into one image
+    /// (`--syntax gas` only)
+    #[arg(value_name = "MORE")]
+    more_inputs: Vec<PathBuf>,
+
+    /// Source syntax: `motorola` (default), or `gas` for GNU as syntax as
+    /// GCC emits it, where every input file is assembled and linked into
+    /// one flat binary image (text, read-only data, data; BSS not
+    /// stored) that `.reloc_table` can end with a fixup table
+    #[arg(long, value_enum, default_value = "motorola")]
+    syntax: SyntaxArg,
+
     /// Output file (use `-` for stdout; default: input with
     /// .bin/.srec/.hex extension)
     #[arg(short, long)]
@@ -120,6 +132,12 @@ struct Args {
     /// header word at $18E, which the console verifies at start-up
     #[arg(long, value_name = "SYSTEM", value_enum)]
     checksum: Option<ChecksumArg>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum SyntaxArg {
+    Motorola,
+    Gas,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -356,8 +374,70 @@ fn output_display(path: &Path) -> String {
     }
 }
 
+/// `--syntax gas`: every input assembled and linked into one binary
+/// image. The options that describe a single Motorola-syntax source
+/// (listings, symbol files, analyses, other formats) do not apply.
+fn run_gas(args: &Args) -> Result<(), String> {
+    let unsupported = [
+        (
+            args.format != OutputFormatArg::Binary,
+            "--format other than binary",
+        ),
+        (!args.include_paths.is_empty(), "-I"),
+        (args.optimize, "--optimize"),
+        (args.linedebug, "--linedebug"),
+        (args.listing.is_some(), "--listing"),
+        (args.sym.is_some(), "--sym"),
+        (args.map.is_some(), "--map"),
+        (args.stack_check, "--stack-check"),
+        (args.stack_report.is_some(), "--stack-report"),
+        (args.flag_check, "--flag-check"),
+        (args.depfile.is_some(), "--depfile"),
+    ];
+    if let Some((_, name)) = unsupported.iter().find(|(set, _)| *set) {
+        return Err(format!("{name} is not supported with --syntax gas"));
+    }
+    let origin = parse_number(&args.origin).map_err(|e| format!("--origin: {e}"))?;
+    let mut files = Vec::new();
+    for path in std::iter::once(&args.input).chain(&args.more_inputs) {
+        let name = path.to_string_lossy().to_string();
+        let text = if is_dash(path) {
+            let mut buf = String::new();
+            std::io::stdin()
+                .read_to_string(&mut buf)
+                .map_err(|e| format!("<stdin>: cannot read: {e}"))?;
+            buf
+        } else {
+            fs::read_to_string(path).map_err(|e| format!("{name}: cannot read: {e}"))?
+        };
+        files.push(m68k_asm::gas::SourceFile { name, text });
+    }
+    let image = m68k_asm::gas::assemble(&files, &args.cpu, origin).map_err(|errors| {
+        for e in &errors {
+            eprintln!("{e}");
+        }
+        format!("{} error(s), no output written", errors.len())
+    })?;
+    let output_path = match &args.output {
+        Some(p) => p.clone(),
+        None if is_dash(&args.input) => {
+            return Err("reading source from stdin requires an explicit -o/--output".into());
+        }
+        None => args.input.with_extension("bin"),
+    };
+    let mut bytes = image.image;
+    finish_rom_image(&mut bytes, args)?;
+    write_output(&output_path, &bytes)
+}
+
 fn run(args: Args) -> Result<(), String> {
     m68k_core::cpu_gate::validate_cpu_name(&args.cpu)?;
+    if args.syntax == SyntaxArg::Gas {
+        return run_gas(&args);
+    }
+    if !args.more_inputs.is_empty() {
+        return Err("several input files need --syntax gas".into());
+    }
     let origin = parse_number(&args.origin).map_err(|e| format!("--origin: {e}"))?;
     let reading_stdin = is_dash(&args.input);
     let input_name = if reading_stdin {

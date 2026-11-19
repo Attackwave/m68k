@@ -213,6 +213,7 @@ m68k-asm hello.s -f prg -o hello.prg          # Atari ST / TOS program
 - `--pad <size|pow2>`, `--fill <byte>` — pad a binary image to a fixed size (`$80000`, `512K`, `4M`) or the next power of two, the way a cartridge or EPROM image fills its chip; the filler is `$FF` unless `--fill` says otherwise.
 - `--checksum megadrive` — write the Mega Drive cartridge checksum (the word sum from `$200` to the end) into the header word at `$18E`, after padding.
 - `--linedebug` — add source line debug info to a `hunk-exe` (see below).
+- `--syntax gas` — read GNU as syntax and link every input file into one binary image (see below).
 
 #### Diagnostics
 
@@ -306,6 +307,39 @@ label, with names longer than 8 characters in the GST extended form that
 holds 22) and a relocation table so the program can be loaded at any
 address. The same rule as for `hunk-exe` applies: only full 32-bit
 address fields can be relocated. Named sections are not allowed.
+
+### GNU as syntax (C compiler output)
+
+`--syntax gas` assembles what GCC emits with `-S` for the 68000
+(`m68k-elf`/`m68k-linux-gnu`, `-m68000`), several files in one run, and
+links them into one flat binary image at the origin (0 by default):
+
+```bash
+m68k-gcc -m68000 -Os -fno-pic -fomit-frame-pointer -S main.c util.c
+m68k-asm --syntax gas -o prog.bin crt0.s main.s util.s crtend.s
+```
+
+The image holds every text section (`.text`, `.text.*`), then every
+read-only data section (`.rodata*`), then every data section (`.data*`),
+each in command-line order. BSS (`.bss*`, `.comm`) follows and is not
+stored. Symbols are local to their file unless `.globl`; identical strings
+in `"aMS"` sections are stored once. The layout, the relaxation of
+`jra`/`jbsr`/`jXX` (absolute `jmp`/`jsr` beyond 16-bit reach on a 68000)
+and every encoding match GNU as with `ld`; `tests/gas/` holds the
+comparison scripts. The link defines `__image_end`, `__bss_start` (the
+same address) and `__bss_end`; a difference of any two symbols is a plain
+number.
+
+`.reloc_table`, which must end the image (the data section of the file
+given last), emits the offsets of every longword that holds an image
+address, in the Atari TOS fixup format: the first offset as a longword
+(0: none), then a byte per further fixup with its distance from the
+previous one, 1 for a step of 254 without a fixup, 0 at the end. Start-up
+code adds the load address to each to run the image anywhere. An address
+in a field narrower than 32 bits, or at an odd offset, is an error.
+
+Only binary output, `--cpu 68000`/`68010` and the options that apply to
+a binary image are accepted in this mode.
 
 ### System includes
 
