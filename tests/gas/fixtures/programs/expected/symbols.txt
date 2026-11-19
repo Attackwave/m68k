@@ -1,0 +1,3 @@
+__image_end 29c
+__bss_start 29c
+__bss_end 2c4
