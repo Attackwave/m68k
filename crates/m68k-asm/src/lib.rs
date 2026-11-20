@@ -42,6 +42,8 @@
 //! - [`ea_encode`] — effective-address operand → (mode, register,
 //!   extension words) encoding.
 //! - [`output`] — Binary, S-Record, Intel Hex, and ELF32 output generation.
+//! - [`gas`] — GNU as syntax: several GCC `-S` files linked into one flat
+//!   image with a fixup table.
 //! - [`ieee695`] — IEEE-695 object output (verified against GNU binutils BFD
 //!   reader; see that module's docs for details).
 
@@ -60,5 +62,6 @@ pub mod enc_mmu;
 pub mod enc_move;
 pub mod encoder;
 mod extended;
+pub mod gas;
 pub mod ieee695;
 pub mod output;

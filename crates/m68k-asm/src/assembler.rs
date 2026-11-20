@@ -7771,8 +7771,8 @@ loop REPT 2
         );
         assert!(result.is_ok(), "assembly failed: {:?}", result.err());
         assert_eq!(asm.code.len(), 5);
-        for i in 0..4 {
-            assert_eq!(asm.code[i].words, vec![0x4E71]);
+        for item in asm.code.iter().take(4) {
+            assert_eq!(item.words, vec![0x4E71]);
         }
         assert_eq!(asm.code[4].words, vec![0x4E75]);
     }

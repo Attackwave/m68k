@@ -1,0 +1,3 @@
+__image_end 807c
+__bss_start 807c
+__bss_end 807c
