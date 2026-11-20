@@ -10,6 +10,8 @@ The files are linked by both, in the given order; m68k-asm gets the last
 file with `.reloc_table` appended to its .data, which ends the image. The image without the table
 must equal the GNU image byte for byte, and the table must list exactly
 the R_68K_32 relocations ld kept. Needs the GNU m68k binutils.
+
+M68K_CPU (default 68000) selects the CPU for both assemblers.
 """
 
 import os
@@ -40,7 +42,7 @@ def write_stubs(work, sources):
     defined, used = set(), set()
     for i, src in enumerate(sources):
         obj = os.path.join(work, f"stub{i}.o")
-        gnu_reference.run(gnu_reference.PREFIX + "as", "-m68000", "-o", obj, src)
+        gnu_reference.run(gnu_reference.PREFIX + "as", "-m" + gnu_reference.CPU, "-o", obj, src)
         for line in gnu_reference.output(gnu_reference.PREFIX + "nm", obj).splitlines():
             fields = line.split()
             if fields[-2] == "U":
@@ -74,7 +76,7 @@ def main():
         with open(os.path.join(work, "ref", "fixups.txt")) as f:
             ref_fixups = [int(x, 16) for x in f.read().split()]
         plain = os.path.join(work, "plain.bin")
-        subprocess.run([asm, "--syntax", "gas", "-o", plain, *args], check=True)
+        subprocess.run([asm, "--syntax", "gas", "--cpu", gnu_reference.CPU, "-o", plain, *args], check=True)
         with open(plain, "rb") as f:
             ours = f.read()
         # The table goes at the end of the last file's .data, which a file
@@ -84,7 +86,7 @@ def main():
         with open(args[-1]) as f, open(last, "w") as g:
             g.write(f.read() + "\n\t.data\n\t.reloc_table\n")
         out = os.path.join(work, "out.bin")
-        subprocess.run([asm, "--syntax", "gas", "-o", out, *args[:-1], last], check=True)
+        subprocess.run([asm, "--syntax", "gas", "--cpu", gnu_reference.CPU, "-o", out, *args[:-1], last], check=True)
         with open(out, "rb") as f:
             with_table = f.read()
     fixups, table_len = decode_table(with_table[len(ref):])

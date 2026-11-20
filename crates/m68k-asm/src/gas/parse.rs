@@ -7,6 +7,8 @@
 
 use std::collections::{HashMap, HashSet};
 
+use m68k_core::operands::BitfieldSpec;
+
 use super::expr::{Expr, is_sym_char, is_sym_start, parse_escape, parse_expr};
 
 /// What kind of output a section contributes to, in image order.
@@ -73,10 +75,22 @@ pub enum Op {
         long: bool,
         scale: u8,
     },
+    /// `(bd,%dn.l*4)`: an index with the base register suppressed, a
+    /// 68020 full-format extension word.
+    NoBaseIndex {
+        disp: Expr,
+        xn: u8,
+        long: bool,
+        scale: u8,
+    },
     Abs(Expr, Option<char>),
     Imm(Expr),
     /// A register list, bit 0 = %d0 .. bit 15 = %a7.
     RegList(u16),
+    /// `%dh:%dl` of a 64-bit multiply or divide.
+    RegPair(u8, u8),
+    /// `ea{offset:width}` of a bitfield instruction.
+    Bitfield(Box<Op>, BitfieldSpec, BitfieldSpec),
     Special(&'static str),
 }
 
@@ -642,8 +656,31 @@ impl FileParser {
         if let Some(imm) = t.strip_prefix('#') {
             return Ok(Op::Imm(self.expr(imm)?));
         }
+        if let Some(spec) = t.strip_suffix('}')
+            && let Some((ea, spec)) = spec.rsplit_once('{')
+        {
+            let (offset, width) = spec
+                .split_once(':')
+                .ok_or_else(|| format!("bad bitfield '{t}'"))?;
+            let field = |f: &str| match register(f) {
+                Some(Op::DReg(n)) => Ok(BitfieldSpec::DataReg(n)),
+                _ => f
+                    .trim()
+                    .strip_prefix('#')
+                    .and_then(|v| self.expr(v).ok()?.const_value())
+                    .map(BitfieldSpec::Immediate)
+                    .ok_or_else(|| format!("bad bitfield '{t}'")),
+            };
+            let ea = self.operand(ea)?;
+            return Ok(Op::Bitfield(Box::new(ea), field(offset)?, field(width)?));
+        }
         if let Some(r) = register(t) {
             return Ok(r);
+        }
+        if let Some((h, l)) = t.split_once(':')
+            && let (Some(Op::DReg(h)), Some(Op::DReg(l))) = (register(h), register(l))
+        {
+            return Ok(Op::RegPair(h, l));
         }
         if t.starts_with('%') && (t.contains('/') || t.contains('-')) && !t.contains('@') {
             return register_list(t)
@@ -705,6 +742,19 @@ impl FileParser {
             Some(d) => self.expr(d)?,
             None => Expr::Num(0),
         };
+        // A lone index register, `sym(%d0.l*4)` or `(%a1.l)`: no base.
+        if let [x] = regs
+            && !matches!(register(x), Some(Op::AReg(_)))
+            && !x.eq_ignore_ascii_case("%pc")
+        {
+            let (xn, long, scale) = index_register(x).ok_or_else(bad)?;
+            return Ok(Op::NoBaseIndex {
+                disp: disp_expr,
+                xn,
+                long,
+                scale,
+            });
+        }
         let base = match regs.first() {
             Some(r) if r.eq_ignore_ascii_case("%pc") => None,
             Some(r) => match register(r) {

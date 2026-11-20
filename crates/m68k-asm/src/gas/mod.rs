@@ -25,6 +25,12 @@
 //!
 //! Symbols are local to their file unless `.globl`; a name a file uses
 //! but does not define refers to the global one.
+//!
+//! The CPU is the one GCC compiled for (`-m68020` with `--cpu 68020`):
+//! from the 68020 on, `jbsr`/`jra`/`jXX` out of the word range or to
+//! another file become 32-bit branches (`bsr.l`, `bra.l`, `bcc.l`) instead
+//! of absolute jumps, and displacements wider than an index or `d16`
+//! takes use the full-format extension word, as GNU as does.
 
 mod expr;
 mod link;
@@ -82,12 +88,11 @@ pub fn assemble(files: &[SourceFile], cpu: &str, origin: u32) -> Result<GasImage
     if files.is_empty() {
         return fail("no input files".into());
     }
-    // GNU as relaxes out-of-range branches to absolute jumps only where
-    // the CPU has no 32-bit branch; that is the behaviour built here.
-    if !matches!(cpu, "68000" | "68010") {
-        return fail(format!(
-            "GAS syntax supports --cpu 68000 and 68010, not {cpu}"
-        ));
+    // The CPU decides how far branches reach (absolute jumps on the
+    // 68000/68010, 32-bit displacements from the 68020 on) and whether
+    // full-format indices exist; an unknown name would silently pick one.
+    if let Err(e) = m68k_core::cpu_gate::validate_cpu_name(cpu) {
+        return fail(e);
     }
     let mut models = Vec::new();
     let mut errors = Vec::new();

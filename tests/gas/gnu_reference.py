@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Build the reference for `m68k-asm --syntax gas` with the GNU tools.
 
-Every file is assembled on its own with `m68k-linux-gnu-as -m68000`,
+Every file is assembled on its own with `m68k-linux-gnu-as -m68000`
+(`-m$M68K_CPU` when that is set),
 the objects are linked with a script that gives the layout m68k-asm
 produces (text, read-only data, data in one stored section at 0, BSS
 behind it), and `objcopy -O binary` writes the image. The fixups are the
@@ -15,7 +16,8 @@ and OUT_DIR/symbols.txt (`__image_end`, `__bss_start`, `__bss_end`).
     gnu_reference.py --regen-fixtures
 
 rebuilds every fixture set under tests/gas/fixtures/ (each directory's
-`files.txt` lists its sources in link order).
+`files.txt` lists its sources in link order, an optional `cpu.txt` the
+CPU, 68000 without it).
 """
 
 import os
@@ -24,6 +26,8 @@ import sys
 import tempfile
 
 PREFIX = os.environ.get("M68K_GNU_PREFIX", "m68k-linux-gnu-")
+# The CPU both assemblers target: `-m<cpu>` for GNU as, `--cpu` for m68k-asm.
+CPU = os.environ.get("M68K_CPU", "68000")
 # readelf and nm are parsed: their messages must not be translated.
 os.environ["LC_ALL"] = "C"
 
@@ -52,13 +56,13 @@ def output(*cmd):
     return subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
 
 
-def reference(out_dir, sources):
+def reference(out_dir, sources, cpu=CPU):
     os.makedirs(out_dir, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=out_dir) as work:
         objects = []
         for i, src in enumerate(sources):
             obj = os.path.join(work, f"{i:03d}.o")
-            run(PREFIX + "as", "-m68000", "-o", obj, src)
+            run(PREFIX + "as", "-m" + cpu, "-o", obj, src)
             objects.append(obj)
         script = os.path.join(work, "image.ld")
         with open(script, "w") as f:
@@ -105,7 +109,11 @@ def regen_fixtures():
             continue
         with open(listing) as f:
             sources = [os.path.join(fixture, line.strip()) for line in f if line.strip()]
-        reference(os.path.join(fixture, "expected"), sources)
+        cpu = "68000"
+        if os.path.isfile(os.path.join(fixture, "cpu.txt")):
+            with open(os.path.join(fixture, "cpu.txt")) as f:
+                cpu = f.read().strip()
+        reference(os.path.join(fixture, "expected"), sources, cpu)
         print(f"{name}: {len(sources)} file(s)")
 
 
