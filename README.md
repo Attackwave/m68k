@@ -310,13 +310,17 @@ address fields can be relocated. Named sections are not allowed.
 
 ### GNU as syntax (C compiler output)
 
-`--syntax gas` assembles what GCC emits with `-S` for the 68000
-(`m68k-elf`/`m68k-linux-gnu`, `-m68000`), several files in one run, and
-links them into one flat binary image at the origin (0 by default):
+`--syntax gas` assembles what GCC emits with `-S` for the 68000 to
+68060 (`m68k-elf`/`m68k-linux-gnu`, `-m68000` … `-m68060`), several files
+in one run, and links them into one flat binary image at the origin (0 by
+default). `--cpu` names the CPU GCC compiled for:
 
 ```bash
 m68k-gcc -m68000 -Os -fno-pic -fomit-frame-pointer -S main.c util.c
 m68k-asm --syntax gas -o prog.bin crt0.s main.s util.s crtend.s
+
+m68k-gcc -m68020 -msoft-float -Os -fno-pic -fomit-frame-pointer -S main.c
+m68k-asm --syntax gas --cpu 68020 -o prog.bin crt0.s main.s crtend.s
 ```
 
 The image holds every text section (`.text`, `.text.*`), then every
@@ -324,8 +328,10 @@ read-only data section (`.rodata*`), then every data section (`.data*`),
 each in command-line order. BSS (`.bss*`, `.comm`) follows and is not
 stored. Symbols are local to their file unless `.globl`; identical strings
 in `"aMS"` sections are stored once. The layout, the relaxation of
-`jra`/`jbsr`/`jXX` (absolute `jmp`/`jsr` beyond 16-bit reach on a 68000)
-and every encoding match GNU as with `ld`; `tests/gas/` holds the
+`jra`/`jbsr`/`jXX` (beyond 16-bit reach or to another file: absolute
+`jmp`/`jsr` on a 68000/68010, `bra.l`/`bsr.l`/`bcc.l` from the 68020 on)
+and every encoding, including the 68020 full-format indices, match GNU as
+with `ld`; `tests/gas/` holds the
 comparison scripts. The link defines `__image_end`, `__bss_start` (the
 same address) and `__bss_end`; a difference of any two symbols is a plain
 number.
@@ -338,8 +344,9 @@ previous one, 1 for a step of 254 without a fixup, 0 at the end. Start-up
 code adds the load address to each to run the image anywhere. An address
 in a field narrower than 32 bits, or at an odd offset, is an error.
 
-Only binary output, `--cpu 68000`/`68010` and the options that apply to
-a binary image are accepted in this mode.
+Only binary output and the options that apply to a binary image are
+accepted in this mode. FPU instructions are not: compile with
+`-msoft-float` for the 68020 and later.
 
 ### System includes
 
