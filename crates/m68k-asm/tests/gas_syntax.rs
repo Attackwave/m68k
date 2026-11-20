@@ -1,7 +1,8 @@
 //! GNU as syntax: several files linked into one flat image.
 //!
 //! The fixture sets under `tests/gas/fixtures/` hold the image, fixups and
-//! link symbols that GNU as + ld produced for the same sources
+//! link symbols that GNU as + ld produced for the same sources, for the
+//! CPU in the set's `cpu.txt` (68000 without one)
 //! (`tests/gas/gnu_reference.py --regen-fixtures`); this test needs no
 //! GNU tools. The tests after them cover what GNU as cannot check
 //! because it assembles one object file at a time.
@@ -75,7 +76,8 @@ fn fixtures_match_gnu_as_and_ld() {
                 text: fs::read_to_string(dir.join(name)).unwrap(),
             })
             .collect();
-        let image = assemble(&files, "68000", 0).unwrap_or_else(|e| panic!("{dir:?}: {e:?}"));
+        let cpu = fs::read_to_string(dir.join("cpu.txt")).unwrap_or_else(|_| "68000".into());
+        let image = assemble(&files, cpu.trim(), 0).unwrap_or_else(|e| panic!("{dir:?}: {e:?}"));
         let expected = dir.join("expected");
         let bytes = fs::read(expected.join("image.bin")).unwrap();
         assert!(
@@ -104,7 +106,7 @@ fn fixtures_match_gnu_as_and_ld() {
         );
         sets += 1;
     }
-    assert!(sets >= 2, "fixture sets missing");
+    assert!(sets >= 3, "fixture sets missing");
 }
 
 /// What a C start-up file needs: sizes as differences of symbols in
@@ -256,15 +258,29 @@ fn unsupported_input_is_refused() {
         let e = errors(&[("a.s", src)]);
         assert!(e.iter().any(|m| m.contains(what)), "{src:?}: {e:?}");
     }
-    let cpu = assemble(
-        &[SourceFile {
-            name: "a.s".into(),
-            text: "\trts\n".into(),
-        }],
-        "68020",
-        0,
-    );
-    assert!(cpu.is_err());
+    let at = |cpu: &str, text: &str| {
+        assemble(
+            &[SourceFile {
+                name: "a.s".into(),
+                text: text.into(),
+            }],
+            cpu,
+            0,
+        )
+    };
+    assert!(at("68020", "\trts\n").is_ok());
+    assert!(at("68888", "\trts\n").is_err());
+    // 68020 forms on a 68000.
+    for text in [
+        "\tlea x(%d0.l*4),%a0\nx:\n",
+        "\tlea 1000(%a0,%d0.l),%a0\n",
+        "\tmove.l 100000(%a0),%d0\n",
+        "\tmuls.l %d1,%d2:%d3\n",
+        "\tbfextu %d0{#3:#5},%d1\n",
+    ] {
+        assert!(at("68000", text).is_err(), "{text:?}");
+        assert!(at("68020", text).is_ok(), "{text:?}");
+    }
 }
 
 #[test]

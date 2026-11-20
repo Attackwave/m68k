@@ -14,11 +14,11 @@
 
 use std::collections::HashMap;
 
-use m68k_core::operands::Operand;
+use m68k_core::operands::{MemoryIndirectOperand, Operand};
 
 use super::expr::{Expr, Linear};
 use super::parse::{Class, FileModel, Insn, Item, Op, SectionModel};
-use super::{GasError, GasImage};
+use super::{GasError, GasImage, GasSection, GasSymbol};
 use crate::encoder::encode_instruction;
 
 /// How far the probe encoding moves the image: a multiple of 4 KiB, so
@@ -59,14 +59,18 @@ struct Sym {
 enum Reach {
     Byte,
     Word,
-    /// `jmp`/`jsr` absolute long, around an inverted branch for a
-    /// condition, or behind a DBcc that skips over it.
+    /// 68020+: a 32-bit displacement (`bra.l`, `bsr.l`, `bcc.l`), behind
+    /// a DBcc that skips over it.
+    Long,
+    /// 68000/68010: `jmp`/`jsr` absolute long, around an inverted branch
+    /// for a condition, or behind a DBcc that skips over it.
     Abs,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BranchKind {
-    /// `jra`, `jbsr`, `jXX`: relaxed up to an absolute jump.
+    /// `jra`, `jbsr`, `jXX`: relaxed up to a 32-bit branch (68020+) or an
+    /// absolute jump.
     J,
     /// `bra`, `bsr`, `bXX`: byte or word, nothing further.
     B,
@@ -307,6 +311,15 @@ impl Linker {
         }
     }
 
+    /// How a branch reaches what a word displacement does not.
+    fn far_reach(&self) -> Reach {
+        if matches!(self.cpu.as_str(), "68000" | "68010") {
+            Reach::Abs
+        } else {
+            Reach::Long
+        }
+    }
+
     fn classify_insn(&self, sec: usize, insn: &Insn) -> Result<(Form, u32), String> {
         if let Some((kind, cc)) = branch_kind(&insn.mnemonic) {
             let target = match (kind, insn.ops.as_slice()) {
@@ -320,16 +333,18 @@ impl Linker {
                 (k, _) => k,
             };
             let local = self.local_target(sec, target);
+            let far = self.far_reach();
             let (reach, fixed) = match (kind, insn.size) {
                 (BranchKind::J, Some(_)) | (BranchKind::Db(_), Some(_)) => {
                     return Err(format!("{} takes no size suffix", insn.mnemonic));
                 }
                 (BranchKind::B, Some('s' | 'b')) => (Reach::Byte, true),
                 (BranchKind::B, Some('w')) => (Reach::Word, true),
+                (BranchKind::B, Some('l')) if far == Reach::Long => (Reach::Long, true),
                 (BranchKind::B, Some(_)) => return Err("a 32-bit branch needs a 68020".into()),
                 (BranchKind::B, None) if local.is_none() => (Reach::Word, true),
-                (BranchKind::J, None) if local.is_none() => (Reach::Abs, true),
-                (BranchKind::Db(_), None) if local.is_none() => (Reach::Abs, true),
+                (BranchKind::J, None) if local.is_none() => (far, true),
+                (BranchKind::Db(_), None) if local.is_none() => (far, true),
                 (BranchKind::Db(_), None) => (Reach::Word, false),
                 (_, None) => (Reach::Byte, false),
             };
@@ -404,7 +419,7 @@ impl Linker {
                         // Out of reach for `bra`: the encoder reports it.
                         Reach::Word
                     } else {
-                        Reach::Abs
+                        self.far_reach()
                     };
                     if needed > reach {
                         self.secs[si].forms[ii] = Form::Branch {
@@ -658,6 +673,60 @@ impl Linker {
         }
     }
 
+    /// The program's symbols at their final addresses: no `.L…` (GCC's
+    /// own labels, numeric locals) and none that is only referenced.
+    fn symbol_list(&self, layout: &Layout) -> Vec<GasSymbol> {
+        let mut owner = vec![None; self.syms.len()];
+        for (f, locals) in self.locals.iter().enumerate() {
+            for &id in locals.values() {
+                owner[id] = Some(f);
+            }
+        }
+        self.syms
+            .iter()
+            .enumerate()
+            .filter(|(_, sym)| !sym.name.starts_with(".L"))
+            .filter_map(|(id, sym)| {
+                let address = self.address(layout, sym.def?).ok()?;
+                Some(GasSymbol {
+                    name: sym.name.clone(),
+                    file: owner[id].map(|f| self.files[f].name.clone()),
+                    address,
+                })
+            })
+            .collect()
+    }
+
+    /// The non-empty input sections at their final place, by address.
+    fn section_list(&self, layout: &Layout) -> Vec<GasSection> {
+        let mut out: Vec<GasSection> = (0..self.secs.len())
+            .filter_map(|si| {
+                let sec = &self.secs[si];
+                let size = if sec.model.class == Class::Bss {
+                    sec.size
+                } else {
+                    self.stored_size(si)
+                };
+                (size > 0).then(|| GasSection {
+                    file: Some(self.files[sec.file].name.clone()),
+                    name: sec.model.name.clone(),
+                    start: layout.base[si],
+                    size,
+                })
+            })
+            .collect();
+        if let Some(&start) = layout.common.first() {
+            out.push(GasSection {
+                file: None,
+                name: "COMMON".into(),
+                start,
+                size: layout.linker[2] - start,
+            });
+        }
+        out.sort_by_key(|s| s.start);
+        out
+    }
+
     fn address(&self, layout: &Layout, def: Def) -> Result<u32, String> {
         Ok(match def {
             Def::Item { sec, item } if self.secs[sec].model.merge_strings => {
@@ -716,7 +785,14 @@ impl Linker {
         let long_field = size == Some('l');
         let movem_predec = mnemonic == "MOVEM" && matches!(insn.ops.get(1), Some(Op::PreDec(_)));
         let mut ops = Vec::with_capacity(2);
+        let full_format = !matches!(self.cpu.as_str(), "68000" | "68010");
         for (i, op) in insn.ops.iter().enumerate() {
+            // A bitfield wraps its effective address; translated below,
+            // then wrapped again.
+            let (op, field) = match op {
+                Op::Bitfield(ea, offset, width) => (&**ea, Some((offset, width))),
+                _ => (op, None),
+            };
             let narrow = |v: Val, what: &str| -> Result<i64, String> {
                 match v.weight {
                     0 => Ok(v.value),
@@ -742,7 +818,7 @@ impl Linker {
                     _ => Err("expression is neither a number nor an address".into()),
                 }
             };
-            ops.push(match op {
+            let operand = match op {
                 Op::DReg(n) => Operand::DataReg(*n),
                 Op::AReg(n) => Operand::AddrReg(*n),
                 Op::Ind(n) => Operand::AddrRegIndirect(*n),
@@ -750,12 +826,19 @@ impl Linker {
                 Op::PreDec(n) => Operand::AddrRegPreDec(*n),
                 Op::Special(s) => Operand::Special((*s).to_string()),
                 Op::RegList(m) => Operand::Immediate(i64::from(*m)),
+                Op::RegPair(h, l) => Operand::RegPair(*h, *l),
+                Op::Bitfield(..) => return Err("a bitfield inside a bitfield".into()),
                 Op::Disp(e, n) => {
-                    let d = narrow(ev(e)?, "16-bit displacement")?;
-                    if !(-32768..=32767).contains(&d) {
-                        return Err(format!("displacement {d} does not fit 16 bits"));
+                    let v = ev(e)?;
+                    if full_format && (v.weight != 0 || !(-32768..=32767).contains(&v.value)) {
+                        full_ea(Some(*n), None, v)?
+                    } else {
+                        let d = narrow(v, "16-bit displacement")?;
+                        if !(-32768..=32767).contains(&d) {
+                            return Err(format!("displacement {d} does not fit 16 bits"));
+                        }
+                        Operand::AddrRegIndirectDisp(*n, d as i32, false)
                     }
-                    Operand::AddrRegIndirectDisp(*n, d as i32, false)
                 }
                 Op::PcDisp(e) => Operand::PcRelativeDisp(pc_target(ev(e)?)?, false),
                 Op::Index {
@@ -765,10 +848,26 @@ impl Linker {
                     long,
                     scale,
                 } => {
-                    let d = narrow(ev(disp)?, "8-bit displacement")?;
-                    let d = i8::try_from(d)
-                        .map_err(|_| format!("displacement {d} does not fit 8 bits"))?;
-                    Operand::AddrRegIndirectIndex(*n, *xn, d, *scale, *long)
+                    let v = ev(disp)?;
+                    if full_format && (v.weight != 0 || !(-128..=127).contains(&v.value)) {
+                        full_ea(Some(*n), Some((*xn, *long, *scale)), v)?
+                    } else {
+                        let d = narrow(v, "8-bit displacement")?;
+                        let d = i8::try_from(d)
+                            .map_err(|_| format!("displacement {d} does not fit 8 bits"))?;
+                        Operand::AddrRegIndirectIndex(*n, *xn, d, *scale, *long)
+                    }
+                }
+                Op::NoBaseIndex {
+                    disp,
+                    xn,
+                    long,
+                    scale,
+                } => {
+                    if !full_format {
+                        return Err("an index without a base register needs a 68020".into());
+                    }
+                    full_ea(None, Some((*xn, *long, *scale)), ev(disp)?)?
                 }
                 Op::Index {
                     base: None,
@@ -813,6 +912,14 @@ impl Linker {
                         Operand::Immediate(v)
                     }
                 }
+            };
+            ops.push(match field {
+                Some((offset, width)) => Operand::Bitfield(
+                    Box::new(operand),
+                    Box::new(offset.clone()),
+                    Box::new(width.clone()),
+                ),
+                None => operand,
             });
         }
         if ops.len() > 2 {
@@ -837,6 +944,15 @@ impl Linker {
             && words.len() > 1
         {
             words[1] = *v as u16;
+        }
+        // `muls.l <ea>,%dn` (32-bit product): the CPU ignores the Dh field
+        // of the extension word; GNU as leaves it 0 where the Motorola
+        // encoding repeats Dl.
+        if matches!(mnemonic.as_str(), "MULS" | "MULU")
+            && long_field
+            && matches!(ops.get(1), Some(Operand::DataReg(_)))
+        {
+            words[1] &= !7;
         }
         Ok(words)
     }
@@ -963,6 +1079,37 @@ impl Linker {
     }
 }
 
+/// A 68020 full-format effective address without memory indirection:
+/// `(bd,An,Xn)`, `(bd,An)` with the index suppressed, `(bd,Xn)` with the
+/// base suppressed. As GNU as does it, an address gets a 32-bit `bd`, a
+/// number the smaller size that holds it, and a 0 without a base none.
+fn full_ea(base: Option<u8>, index: Option<(u8, bool, u8)>, bd: Val) -> Result<Operand, String> {
+    if !matches!(bd.weight, 0 | 1) {
+        return Err("expression is neither a number nor an address".into());
+    }
+    let value = long32(bd.value)?;
+    let null = base.is_none() && bd.weight == 0 && bd.value == 0;
+    let long = bd.weight != 0 || !(-32768..=32767).contains(&bd.value);
+    let (index_reg, index_long, index_scale) = match index {
+        Some((xn, long, scale)) => (Some(xn), long, scale),
+        None => (None, false, 1),
+    };
+    Ok(Operand::MemoryIndirect(Box::new(MemoryIndirectOperand {
+        base_reg: base,
+        base_is_pc: false,
+        base_disp: (!null).then_some(value),
+        index_reg,
+        index_long,
+        index_scale,
+        outer_disp: None,
+        is_postindexed: false,
+        is_indirect: false,
+        bd_forced: Some(long),
+        od_forced: None,
+        zpc: false,
+    })))
+}
+
 fn long32(v: i64) -> Result<i32, String> {
     if (-0x8000_0000..=0xFFFF_FFFF).contains(&v) {
         Ok(v as u32 as i32)
@@ -1035,7 +1182,8 @@ fn branch_size(kind: BranchKind, cc: u8, reach: Reach) -> u32 {
     match (reach, kind) {
         (Reach::Byte, _) => 2,
         (Reach::Word, _) => 4,
-        (Reach::Abs, BranchKind::Db(_)) => 12,
+        (Reach::Long | Reach::Abs, BranchKind::Db(_)) => 12,
+        (Reach::Long, _) => 6,
         (Reach::Abs, _) if cc <= 1 => 6,
         (Reach::Abs, _) => 8,
     }
@@ -1065,6 +1213,19 @@ fn branch_words(
             vec![0x50C8 | (u16::from(cc) << 8) | u16::from(r), disp as u16]
         }
         (Reach::Word, _) => vec![op(cc), disp as u16],
+        (Reach::Long, BranchKind::Db(r)) => {
+            // The `bra.l` behind `dbcc` and `bra.s` is 6 bytes further on.
+            let d = (disp - 6) as u32;
+            vec![
+                0x50C8 | (u16::from(cc) << 8) | u16::from(r),
+                4,
+                0x6006,
+                0x60FF,
+                (d >> 16) as u16,
+                d as u16,
+            ]
+        }
+        (Reach::Long, _) => vec![op(cc) | 0xFF, (disp >> 16) as u16, disp as u16],
         (Reach::Abs, BranchKind::Db(r)) => {
             let mut w = vec![0x50C8 | (u16::from(cc) << 8) | u16::from(r), 4, 0x6006];
             w.extend(abs(0x4EF9));
@@ -1266,6 +1427,8 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
             image_end: layout.linker[0],
             bss_start: layout.linker[1],
             bss_end: layout.linker[2],
+            symbols: l.symbol_list(&layout),
+            sections: l.section_list(&layout),
         });
     }
     l.error(0, 0, "the relocation table does not settle");
