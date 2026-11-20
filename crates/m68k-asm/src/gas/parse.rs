@@ -85,12 +85,22 @@ pub enum Op {
     },
     Abs(Expr, Option<char>),
     Imm(Expr),
+    /// `#0x…` wider than 63 bits: the bit pattern of a floating-point
+    /// constant, as GCC writes them (`.d` 64, `.x` 96 bits).
+    ImmBits(u128),
     /// A register list, bit 0 = %d0 .. bit 15 = %a7.
     RegList(u16),
     /// `%dh:%dl` of a 64-bit multiply or divide.
     RegPair(u8, u8),
     /// `ea{offset:width}` of a bitfield instruction.
     Bitfield(Box<Op>, BitfieldSpec, BitfieldSpec),
+    /// `%fp0`..`%fp7`.
+    FpReg(u8),
+    /// `%fp2-%fp4/%fp6`, bit n = `%fpn`.
+    FpRegList(u8),
+    /// `%fpcr`, `%fpsr`, `%fpiar` or a list of them: FPIAR 1, FPSR 2,
+    /// FPCR 4.
+    FpCtrl(u8),
     Special(&'static str),
 }
 
@@ -202,6 +212,52 @@ fn register(text: &str) -> Option<Op> {
             }
         }
     })
+}
+
+/// An FPU data register `%fpn`.
+fn fp_register(text: &str) -> Option<u8> {
+    let name = text.trim().strip_prefix('%')?.to_ascii_lowercase();
+    name.strip_prefix("fp")?
+        .parse::<u8>()
+        .ok()
+        .filter(|&n| n < 8)
+}
+
+/// An FPU control register's bit: FPIAR 1, FPSR 2, FPCR 4.
+fn fp_control(text: &str) -> Option<u8> {
+    match text.trim().strip_prefix('%')?.to_ascii_lowercase().as_str() {
+        "fpiar" => Some(1),
+        "fpsr" => Some(2),
+        "fpcr" => Some(4),
+        _ => None,
+    }
+}
+
+/// `%fp2-%fp4/%fp6` or `%fpcr/%fpsr`.
+fn fp_list(text: &str) -> Option<Op> {
+    let mut data = 0u8;
+    let mut control = 0u8;
+    for part in text.split('/') {
+        if let Some(bit) = fp_control(part) {
+            control |= bit;
+            continue;
+        }
+        let (lo, hi) = match part.split_once('-') {
+            Some((a, b)) => (fp_register(a)?, fp_register(b)?),
+            None => (fp_register(part)?, fp_register(part)?),
+        };
+        if lo > hi {
+            return None;
+        }
+        for r in lo..=hi {
+            data |= 1 << r;
+        }
+    }
+    match (data, control) {
+        (d, 0) => Some(Op::FpRegList(d)),
+        (0, c) => Some(Op::FpCtrl(c)),
+        _ => None,
+    }
 }
 
 fn reg_number(op: &Op) -> Option<u8> {
@@ -636,6 +692,10 @@ impl FileParser {
     fn instruction(&self, mnemonic: &str, args: &str) -> Result<Insn, String> {
         let (base, size) = match mnemonic.rsplit_once('.') {
             Some((b, s)) if matches!(s, "b" | "w" | "l" | "s") => (b, s.chars().next()),
+            // The FPU's double, extended and packed formats.
+            Some((b, s)) if b.starts_with('f') && matches!(s, "d" | "x" | "p") => {
+                (b, s.chars().next())
+            }
             Some(_) => return Err(format!("bad size suffix in '{mnemonic}'")),
             None => (mnemonic, None),
         };
@@ -654,7 +714,26 @@ impl FileParser {
     fn operand(&self, text: &str) -> Result<Op, String> {
         let t = text.trim();
         if let Some(imm) = t.strip_prefix('#') {
+            // A hex literal beyond i64 is a floating-point bit pattern.
+            if let Some(hex) = imm.trim().strip_prefix("0x")
+                && i64::from_str_radix(hex, 16).is_err()
+                && let Ok(bits) = u128::from_str_radix(hex, 16)
+            {
+                return Ok(Op::ImmBits(bits));
+            }
             return Ok(Op::Imm(self.expr(imm)?));
+        }
+        if let Some(n) = fp_register(t) {
+            return Ok(Op::FpReg(n));
+        }
+        if let Some(bit) = fp_control(t) {
+            return Ok(Op::FpCtrl(bit));
+        }
+        if t.to_ascii_lowercase().starts_with("%fp")
+            && (t.contains('/') || t.contains('-'))
+            && let Some(list) = fp_list(t)
+        {
+            return Ok(list);
         }
         if let Some(spec) = t.strip_suffix('}')
             && let Some((ea, spec)) = spec.rsplit_once('{')

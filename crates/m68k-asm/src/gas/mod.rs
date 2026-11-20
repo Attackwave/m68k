@@ -30,7 +30,10 @@
 //! from the 68020 on, `jbsr`/`jra`/`jXX` out of the word range or to
 //! another file become 32-bit branches (`bsr.l`, `bra.l`, `bcc.l`) instead
 //! of absolute jumps, and displacements wider than an index or `d16`
-//! takes use the full-format extension word, as GNU as does.
+//! takes use the full-format extension word, as GNU as does. FPU code
+//! (68881/68882, and the 68040's rounding-precision forms) takes its
+//! floating-point constants as the bit patterns GCC writes (`#0x…`);
+//! `fjXX` relaxes from a word to a 32-bit `fbcc`, `fbXX` stays a word.
 
 mod expr;
 mod link;
