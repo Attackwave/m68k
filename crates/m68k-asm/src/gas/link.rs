@@ -18,7 +18,7 @@ use m68k_core::operands::{MemoryIndirectOperand, Operand};
 
 use super::expr::{Expr, Linear};
 use super::parse::{Class, FileModel, Insn, Item, Op, SectionModel};
-use super::{GasError, GasImage};
+use super::{GasError, GasImage, GasSection, GasSymbol};
 use crate::encoder::encode_instruction;
 
 /// How far the probe encoding moves the image: a multiple of 4 KiB, so
@@ -671,6 +671,60 @@ impl Linker {
             common,
             linker: [image_end, image_end, dot],
         }
+    }
+
+    /// The program's symbols at their final addresses: no `.L…` (GCC's
+    /// own labels, numeric locals) and none that is only referenced.
+    fn symbol_list(&self, layout: &Layout) -> Vec<GasSymbol> {
+        let mut owner = vec![None; self.syms.len()];
+        for (f, locals) in self.locals.iter().enumerate() {
+            for &id in locals.values() {
+                owner[id] = Some(f);
+            }
+        }
+        self.syms
+            .iter()
+            .enumerate()
+            .filter(|(_, sym)| !sym.name.starts_with(".L"))
+            .filter_map(|(id, sym)| {
+                let address = self.address(layout, sym.def?).ok()?;
+                Some(GasSymbol {
+                    name: sym.name.clone(),
+                    file: owner[id].map(|f| self.files[f].name.clone()),
+                    address,
+                })
+            })
+            .collect()
+    }
+
+    /// The non-empty input sections at their final place, by address.
+    fn section_list(&self, layout: &Layout) -> Vec<GasSection> {
+        let mut out: Vec<GasSection> = (0..self.secs.len())
+            .filter_map(|si| {
+                let sec = &self.secs[si];
+                let size = if sec.model.class == Class::Bss {
+                    sec.size
+                } else {
+                    self.stored_size(si)
+                };
+                (size > 0).then(|| GasSection {
+                    file: Some(self.files[sec.file].name.clone()),
+                    name: sec.model.name.clone(),
+                    start: layout.base[si],
+                    size,
+                })
+            })
+            .collect();
+        if let Some(&start) = layout.common.first() {
+            out.push(GasSection {
+                file: None,
+                name: "COMMON".into(),
+                start,
+                size: layout.linker[2] - start,
+            });
+        }
+        out.sort_by_key(|s| s.start);
+        out
     }
 
     fn address(&self, layout: &Layout, def: Def) -> Result<u32, String> {
@@ -1373,6 +1427,8 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
             image_end: layout.linker[0],
             bss_start: layout.linker[1],
             bss_end: layout.linker[2],
+            symbols: l.symbol_list(&layout),
+            sections: l.section_list(&layout),
         });
     }
     l.error(0, 0, "the relocation table does not settle");

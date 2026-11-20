@@ -345,7 +345,10 @@ code adds the load address to each to run the image anywhere. An address
 in a field narrower than 32 bits, or at an odd offset, is an error.
 
 Only binary output and the options that apply to a binary image are
-accepted in this mode. FPU instructions are not: compile with
+accepted in this mode. `--sym` lists the program's symbols at their
+addresses in the image (labels other than GCC's `.L…`, commons and the
+link's own; a `static` whose name occurs more than once as
+`file.s:name`), `--map` every input section's place. FPU instructions are not: compile with
 `-msoft-float` for the 68020 and later.
 
 ### System includes

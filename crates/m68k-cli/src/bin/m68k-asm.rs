@@ -376,7 +376,8 @@ fn output_display(path: &Path) -> String {
 
 /// `--syntax gas`: every input assembled and linked into one binary
 /// image. The options that describe a single Motorola-syntax source
-/// (listings, symbol files, analyses, other formats) do not apply.
+/// (listings, analyses, other formats) do not apply; `--sym` and `--map`
+/// describe the linked image.
 fn run_gas(args: &Args) -> Result<(), String> {
     let unsupported = [
         (
@@ -387,8 +388,6 @@ fn run_gas(args: &Args) -> Result<(), String> {
         (args.optimize, "--optimize"),
         (args.linedebug, "--linedebug"),
         (args.listing.is_some(), "--listing"),
-        (args.sym.is_some(), "--sym"),
-        (args.map.is_some(), "--map"),
         (args.stack_check, "--stack-check"),
         (args.stack_report.is_some(), "--stack-report"),
         (args.flag_check, "--flag-check"),
@@ -425,9 +424,71 @@ fn run_gas(args: &Args) -> Result<(), String> {
         }
         None => args.input.with_extension("bin"),
     };
+    if let Some(path) = &args.sym {
+        fs::write(path, gas_symbol_table(&image.symbols))
+            .map_err(|e| format!("cannot write symbol table '{}': {}", path.display(), e))?;
+        eprintln!("Symbol table written -> {}", path.display());
+    }
+    if let Some(path) = &args.map {
+        fs::write(path, gas_memory_map(&image))
+            .map_err(|e| format!("cannot write memory map '{}': {}", path.display(), e))?;
+        eprintln!("Memory map written -> {}", path.display());
+    }
     let mut bytes = image.image;
     finish_rom_image(&mut bytes, args)?;
     write_output(&output_path, &bytes)
+}
+
+/// The `--sym` file of a GAS link, in the format of the Motorola mode. A
+/// file-local (`static`) symbol whose name another symbol also has is
+/// written `file:name`, with the file's name without its directory.
+fn gas_symbol_table(symbols: &[m68k_asm::gas::GasSymbol]) -> String {
+    let mut count: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for sym in symbols {
+        *count.entry(&sym.name).or_default() += 1;
+    }
+    let mut rows: Vec<(String, u32)> = symbols
+        .iter()
+        .map(|sym| {
+            let name = match &sym.file {
+                Some(file) if count[sym.name.as_str()] > 1 => {
+                    let base = Path::new(file)
+                        .file_name()
+                        .map_or_else(|| file.clone(), |b| b.to_string_lossy().into_owned());
+                    format!("{base}:{}", sym.name)
+                }
+                _ => sym.name.clone(),
+            };
+            (name, sym.address)
+        })
+        .collect();
+    rows.sort_by_cached_key(|(name, addr)| (name.to_lowercase(), name.clone(), *addr));
+    let mut out = String::from("; Symbol table (GNU as syntax, linked image)\n\n");
+    for (name, addr) in rows {
+        out.push_str(&format!("{name:<20} = ${addr:06X}\n"));
+    }
+    out
+}
+
+/// The `--map` file of a GAS link: every non-empty input section with
+/// its place in the image, in address order.
+fn gas_memory_map(image: &m68k_asm::gas::GasImage) -> String {
+    let mut out = String::from("; Memory map (GNU as syntax, linked image)\n\n");
+    for sec in &image.sections {
+        out.push_str(&format!(
+            "${:06X}-${:06X}  {:>6} bytes  {}  {}\n",
+            sec.start,
+            sec.start + sec.size - 1,
+            sec.size,
+            sec.file.as_deref().unwrap_or("-"),
+            sec.name
+        ));
+    }
+    out.push_str(&format!(
+        "\nImage end ${:06X}, BSS ${:06X}-${:06X}\n",
+        image.image_end, image.bss_start, image.bss_end
+    ));
+    out
 }
 
 fn run(args: Args) -> Result<(), String> {

@@ -55,6 +55,29 @@ pub struct GasImage {
     pub image_end: u32,
     pub bss_start: u32,
     pub bss_end: u32,
+    /// Every symbol of the program: labels other than GCC's `.L…`,
+    /// commons and the link's own, by symbol order.
+    pub symbols: Vec<GasSymbol>,
+    /// Where each non-empty input section went, in address order; the
+    /// global commons follow as one block with the section name `COMMON`
+    /// and no file.
+    pub sections: Vec<GasSection>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GasSymbol {
+    pub name: String,
+    /// The file of a symbol local to it (`static`); `None` for a global.
+    pub file: Option<String>,
+    pub address: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GasSection {
+    pub file: Option<String>,
+    pub name: String,
+    pub start: u32,
+    pub size: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
