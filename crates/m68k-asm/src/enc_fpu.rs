@@ -76,7 +76,19 @@ pub fn enc_fpu_arith(
 ) -> Result<Vec<u16>, AsmError> {
     check_fpu_cpu(cpu)?;
 
+    // FTST has no destination; its field stays 0 (`ftst fp3` is
+    // f200 0c3a), and `ftst <ea>` takes no FPn at all.
+    const FTST: u16 = 0x3A;
     match (src, dst) {
+        (Operand::FpReg(fp), None) if cmd == FTST => Ok(vec![0xF200, (*fp as u16) << 10 | cmd]),
+        (ea_op, None) if cmd == FTST => {
+            let fmt = size.unwrap_or("w");
+            let (mode, reg, ext_words) = encode_ea(ea_op, fmt, ext_pc, fpu_ea(fmt, ea::DATA), cpu)?;
+            let ext = (2 << 13) | (fmt_code(size) << 10) | cmd;
+            let mut words = vec![0xF200 | ((mode as u16) << 3) | (reg as u16), ext];
+            words.extend(ext_words);
+            Ok(words)
+        }
         // Single FPn operand: FPn is both source and destination.
         (Operand::FpReg(fp), None) => {
             let ext = (*fp as u16) << 10 | (*fp as u16) << 7 | cmd;
@@ -549,6 +561,19 @@ mod tests {
         let fp0 = Operand::FpReg(0);
         let words = enc_fpu_arith(0x3A, &fp0, None, None, 0, "68020").unwrap();
         assert_eq!(words, vec![0xF200, 0x003A]);
+    }
+
+    #[test]
+    fn test_ftst_leaves_the_destination_field_zero() {
+        // Reference: ftst.x fp3 -> f200 0c3a, ftst.s d5 -> f205 443a,
+        // ftst.d 8(a0) -> f228 543a 0008.
+        let words = enc_fpu_arith(0x3A, &Operand::FpReg(3), None, None, 0, "68020").unwrap();
+        assert_eq!(words, vec![0xF200, 0x0C3A]);
+        let words = enc_fpu_arith(0x3A, &Operand::DataReg(5), None, Some("s"), 0, "68020").unwrap();
+        assert_eq!(words, vec![0xF205, 0x443A]);
+        let ea = Operand::AddrRegIndirectDisp(0, 8, false);
+        let words = enc_fpu_arith(0x3A, &ea, None, Some("d"), 0, "68020").unwrap();
+        assert_eq!(words, vec![0xF228, 0x543A, 0x0008]);
     }
 
     #[test]

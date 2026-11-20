@@ -1811,3 +1811,42 @@ pub fn fpu_arith_mnemonic(code: u16) -> Option<&'static str> {
         .find(|(c, _)| *c == code)
         .map(|(_, n)| *n)
 }
+
+/// The 68040's rounding-precision forms (`FSxxx` single, `FDxxx` double),
+/// opclass/opmode codes like [`FPU_ARITH_OPS`]. One table for both
+/// directions; `FSABS`/`FDABS`/`FSNEG`/`FDNEG` were missing from the two
+/// copies it replaces. Verified against the reference assembler.
+pub const FPU_SHORT_OPS: &[(u16, &str)] = &[
+    (0x40, "fsmove"),
+    (0x41, "fssqrt"),
+    (0x44, "fdmove"),
+    (0x45, "fdsqrt"),
+    (0x58, "fsabs"),
+    (0x5A, "fsneg"),
+    (0x5C, "fdabs"),
+    (0x5E, "fdneg"),
+    (0x60, "fsdiv"),
+    (0x62, "fsadd"),
+    (0x63, "fsmul"),
+    (0x64, "fddiv"),
+    (0x66, "fdadd"),
+    (0x67, "fdmul"),
+    (0x68, "fssub"),
+    (0x6C, "fdsub"),
+];
+
+/// Opcode for a rounding-precision FPU mnemonic (case-insensitive).
+pub fn fpu_short_code(mnemonic: &str) -> Option<u16> {
+    FPU_SHORT_OPS
+        .iter()
+        .find(|(_, n)| n.eq_ignore_ascii_case(mnemonic))
+        .map(|(c, _)| *c)
+}
+
+/// Mnemonic for a rounding-precision FPU opcode.
+pub fn fpu_short_mnemonic(code: u16) -> Option<&'static str> {
+    FPU_SHORT_OPS
+        .iter()
+        .find(|(c, _)| *c == code)
+        .map(|(_, n)| *n)
+}

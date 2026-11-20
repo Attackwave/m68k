@@ -37,21 +37,7 @@ fn fpu_arith_cmd(mnemonic: &str) -> Option<u16> {
 
 /// "Short" (rounding-precision-forcing) FPU instruction opclass/opmode field, by mnemonic.
 fn fpu_short_cmd(mnemonic: &str) -> Option<u16> {
-    Some(match mnemonic {
-        "FSMOVE" => 0x40,
-        "FSSQRT" => 0x41,
-        "FDMOVE" => 0x44,
-        "FDSQRT" => 0x45,
-        "FSDIV" => 0x60,
-        "FSADD" => 0x62,
-        "FSMUL" => 0x63,
-        "FDDIV" => 0x64,
-        "FDADD" => 0x66,
-        "FDMUL" => 0x67,
-        "FSSUB" => 0x68,
-        "FDSUB" => 0x6C,
-        _ => return None,
-    })
+    m68k_core::opcodes::fpu_short_code(mnemonic)
 }
 
 /// Extract a branch target address from any operand variant
