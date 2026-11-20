@@ -76,6 +76,10 @@ enum BranchKind {
     B,
     /// `dbXX %dn,target`.
     Db(u8),
+    /// `fjXX`: an FPU branch, word or 32-bit as needed.
+    FJ,
+    /// `fbXX`: an FPU branch, word only unless a size is written.
+    FB,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -335,9 +339,14 @@ impl Linker {
             let local = self.local_target(sec, target);
             let far = self.far_reach();
             let (reach, fixed) = match (kind, insn.size) {
-                (BranchKind::J, Some(_)) | (BranchKind::Db(_), Some(_)) => {
+                (BranchKind::J | BranchKind::FJ | BranchKind::Db(_), Some(_)) => {
                     return Err(format!("{} takes no size suffix", insn.mnemonic));
                 }
+                (BranchKind::FB, Some('w')) | (BranchKind::FB, None) => (Reach::Word, true),
+                (BranchKind::FB, Some('l')) => (Reach::Long, true),
+                (BranchKind::FB, Some(_)) => return Err("bad size for an FPU branch".into()),
+                (BranchKind::FJ, None) if local.is_none() => (Reach::Long, true),
+                (BranchKind::FJ, None) => (Reach::Word, false),
                 (BranchKind::B, Some('s' | 'b')) => (Reach::Byte, true),
                 (BranchKind::B, Some('w')) => (Reach::Word, true),
                 (BranchKind::B, Some('l')) if far == Reach::Long => (Reach::Long, true),
@@ -410,7 +419,7 @@ impl Linker {
                     let disp = target - i64::from(off) - 2;
                     let needed = if (-128..=127).contains(&disp)
                         && disp != 0
-                        && !matches!(kind, BranchKind::Db(_))
+                        && !matches!(kind, BranchKind::Db(_) | BranchKind::FJ)
                     {
                         Reach::Byte
                     } else if (-32768..=32767).contains(&disp) {
@@ -418,6 +427,8 @@ impl Linker {
                     } else if kind == BranchKind::B {
                         // Out of reach for `bra`: the encoder reports it.
                         Reach::Word
+                    } else if kind == BranchKind::FJ {
+                        Reach::Long
                     } else {
                         self.far_reach()
                     };
@@ -776,8 +787,15 @@ impl Linker {
         pcrel: Option<(usize, bool)>,
     ) -> Result<Vec<u16>, String> {
         let (mnemonic, size) = gas_choice(insn)?;
+        let fpu = mnemonic.starts_with('F');
+        // The size of an FPU operand in memory or an immediate that holds
+        // a floating-point bit pattern.
+        // (FMOVEM's `.x` names the registers; its `#n` is their mask.)
+        let float_size = size.filter(|s| fpu && matches!(s, 's' | 'd' | 'x' | 'p'));
+        let float_imm = float_size.filter(|_| mnemonic != "FMOVEM");
         if let Some(s) = size
             && !matches!(s, 'b' | 'w' | 'l')
+            && float_size.is_none()
         {
             return Err(format!("bad size .{s} for {}", insn.mnemonic));
         }
@@ -827,6 +845,20 @@ impl Linker {
                 Op::Special(s) => Operand::Special((*s).to_string()),
                 Op::RegList(m) => Operand::Immediate(i64::from(*m)),
                 Op::RegPair(h, l) => Operand::RegPair(*h, *l),
+                Op::FpReg(n) => Operand::FpReg(*n),
+                Op::FpCtrl(m) => Operand::FpCtrlList(*m),
+                Op::FpRegList(m) => Operand::Immediate(i64::from(*m)),
+                Op::ImmBits(bits) => match float_imm {
+                    Some(s) => Operand::ImmediateWords(float_words(*bits, s)?),
+                    None => return Err("a constant wider than 63 bits needs .d, .x or .p".into()),
+                },
+                Op::Imm(e) if float_imm.is_some() => {
+                    let bits = e
+                        .const_value()
+                        .filter(|v| *v >= 0)
+                        .ok_or("a floating-point immediate must be a bit pattern (#0x...)")?;
+                    Operand::ImmediateWords(float_words(bits as u128, float_imm.unwrap_or('s'))?)
+                }
                 Op::Bitfield(..) => return Err("a bitfield inside a bitfield".into()),
                 Op::Disp(e, n) => {
                     let v = ev(e)?;
@@ -899,7 +931,13 @@ impl Linker {
                     } else {
                         narrow(v, "field narrower than 32 bits")?
                     };
-                    if mnemonic == "MOVEM" {
+                    if mnemonic == "FMOVEM" {
+                        // As for MOVEM, the mask as it is encoded: the
+                        // encoder reverses it for every mode but -(An).
+                        let raw = v as u8;
+                        let predec = matches!(insn.ops.get(1), Some(Op::PreDec(_)));
+                        Operand::Immediate(i64::from(if predec { raw } else { raw.reverse_bits() }))
+                    } else if mnemonic == "MOVEM" {
                         // GNU as takes the mask as it is encoded; the
                         // encoder wants bit 0 = %d0 in every mode.
                         let raw = v as u16;
@@ -1079,6 +1117,25 @@ impl Linker {
     }
 }
 
+/// The extension words of a floating-point immediate: the bit pattern of
+/// a single (32 bits), double (64) or extended/packed (96) value.
+fn float_words(bits: u128, size: char) -> Result<Vec<u16>, String> {
+    let width = match size {
+        's' => 32,
+        'd' => 64,
+        _ => 96,
+    };
+    if bits >> width != 0 {
+        return Err(format!(
+            "constant does not fit the {width}-bit .{size} format"
+        ));
+    }
+    Ok((0..width / 16)
+        .rev()
+        .map(|i| (bits >> (16 * i)) as u16)
+        .collect())
+}
+
 /// A 68020 full-format effective address without memory indirection:
 /// `(bd,An,Xn)`, `(bd,An)` with the index suppressed, `(bd,Xn)` with the
 /// base suppressed. As GNU as does it, an address gets a 32-bit `bd`, a
@@ -1160,6 +1217,15 @@ fn condition(name: &str) -> Option<u8> {
 /// 1 = subroutine for `bra`/`bsr`; for DBcc 0 = true, 1 = false).
 fn branch_kind(m: &str) -> Option<(BranchKind, u8)> {
     Some(match m {
+        _ if m.starts_with("fj") || m.starts_with("fb") => {
+            let cc = crate::encoder::fpu_cc(&m[2..].to_ascii_uppercase())? as u8;
+            let kind = if m.starts_with("fj") {
+                BranchKind::FJ
+            } else {
+                BranchKind::FB
+            };
+            (kind, cc)
+        }
         "jra" | "jbra" => (BranchKind::J, 0),
         "jbsr" => (BranchKind::J, 1),
         "bra" => (BranchKind::B, 0),
@@ -1208,6 +1274,12 @@ fn branch_words(
         }
         (Reach::Word, _) if !(-32768..=32767).contains(&disp) => {
             return Err(format!("branch displacement {disp} does not fit 16 bits"));
+        }
+        (Reach::Word, BranchKind::FJ | BranchKind::FB) => {
+            vec![0xF280 | u16::from(cc), disp as u16]
+        }
+        (Reach::Long, BranchKind::FJ | BranchKind::FB) => {
+            vec![0xF2C0 | u16::from(cc), (disp >> 16) as u16, disp as u16]
         }
         (Reach::Word, BranchKind::Db(r)) => {
             vec![0x50C8 | (u16::from(cc) << 8) | u16::from(r), disp as u16]

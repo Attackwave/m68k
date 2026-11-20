@@ -290,3 +290,35 @@ fn debug_sections_and_cfi_are_skipped() {
                \t.long 0x1234\n\t.uleb128 0x5\n\t.long .Ltext0\n\t.text\n\tnop\n";
     assert_eq!(ok(&[("a.s", src)]).image, [0x4E, 0x75, 0x4E, 0x71]);
 }
+
+#[test]
+fn fpu_code_is_checked() {
+    let at = |cpu: &str, text: &str| {
+        assemble(
+            &[SourceFile {
+                name: "a.s".into(),
+                text: format!("\t.text\n{text}"),
+            }],
+            cpu,
+            0,
+        )
+        .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    // No FPU on a 68000; the rounding-precision forms are the 68040's.
+    assert!(at("68000", "\tfmove.s #0x3f800000,%fp0\n").is_err());
+    assert!(at("68020", "\tfsabs.x %fp0,%fp1\n").is_err());
+    assert!(at("68040", "\tfsabs.x %fp0,%fp1\n").is_ok());
+    // A bit pattern wider than its format.
+    let e = at("68020", "\tfmove.s #0x1ffffffff,%fp0\n").unwrap_err();
+    assert!(e.iter().any(|m| m.contains("does not fit")), "{e:?}");
+    // `fbXX` stays a word branch: out of reach is an error, where GNU as
+    // silently truncates the displacement.
+    let e = at("68020", "\tfbne .Lfar\n\t.zero 40000\n.Lfar:\n\trts\n").unwrap_err();
+    assert!(
+        e.iter().any(|m| m.contains("does not fit 16 bits")),
+        "{e:?}"
+    );
+    // `fjXX` grows instead.
+    let image = at("68020", "\tfjne .Lfar\n\t.zero 40000\n.Lfar:\n\trts\n").unwrap();
+    assert_eq!(image.image[..6], [0xF2, 0xCE, 0, 0, 0x9C, 0x44]);
+}

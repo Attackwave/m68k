@@ -1,0 +1,3 @@
+__image_end 80f4
+__bss_start 80f4
+__bss_end 80f4

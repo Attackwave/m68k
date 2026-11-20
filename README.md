@@ -319,7 +319,7 @@ default). `--cpu` names the CPU GCC compiled for:
 m68k-gcc -m68000 -Os -fno-pic -fomit-frame-pointer -S main.c util.c
 m68k-asm --syntax gas -o prog.bin crt0.s main.s util.s crtend.s
 
-m68k-gcc -m68020 -msoft-float -Os -fno-pic -fomit-frame-pointer -S main.c
+m68k-gcc -m68020 -Os -fno-pic -fomit-frame-pointer -S main.c
 m68k-asm --syntax gas --cpu 68020 -o prog.bin crt0.s main.s crtend.s
 ```
 
@@ -329,8 +329,10 @@ each in command-line order. BSS (`.bss*`, `.comm`) follows and is not
 stored. Symbols are local to their file unless `.globl`; identical strings
 in `"aMS"` sections are stored once. The layout, the relaxation of
 `jra`/`jbsr`/`jXX` (beyond 16-bit reach or to another file: absolute
-`jmp`/`jsr` on a 68000/68010, `bra.l`/`bsr.l`/`bcc.l` from the 68020 on)
-and every encoding, including the 68020 full-format indices, match GNU as
+`jmp`/`jsr` on a 68000/68010, `bra.l`/`bsr.l`/`bcc.l` from the 68020 on;
+`fjXX` likewise to `fbcc.l`) and every encoding, including the 68020 full-format indices and the FPU
+(68881/68882 code from `-m68020`, the 68040's `fsxxx`/`fdxxx` forms from
+`-m68040` on, floating-point constants as bit patterns), match GNU as
 with `ld`; `tests/gas/` holds the
 comparison scripts. The link defines `__image_end`, `__bss_start` (the
 same address) and `__bss_end`; a difference of any two symbols is a plain
@@ -348,8 +350,7 @@ Only binary output and the options that apply to a binary image are
 accepted in this mode. `--sym` lists the program's symbols at their
 addresses in the image (labels other than GCC's `.L…`, commons and the
 link's own; a `static` whose name occurs more than once as
-`file.s:name`), `--map` every input section's place. FPU instructions are not: compile with
-`-msoft-float` for the 68020 and later.
+`file.s:name`), `--map` every input section's place.
 
 ### System includes
 

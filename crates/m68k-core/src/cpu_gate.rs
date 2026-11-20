@@ -106,6 +106,9 @@ pub fn min_cpu_for_mnemonic(mnemonic: &str) -> Option<MinCpu> {
         // FPU instructions (68881/68882, or on-chip from 68040 on with the
         // model treating FPU as available from 68020 upward — this tool
         // doesn't model a separate "has coprocessor" flag).
+        // The rounding-precision forms (FSMOVE, FDADD, ...) are the
+        // 68040's own; the 68881/68882 have no such opmodes.
+        m if crate::opcodes::fpu_short_code(m).is_some() => MinCpu::Mc68040,
         m if m.starts_with('F') && is_fpu_mnemonic(m) => MinCpu::Mc68020,
 
         // 68030+: PMMU (68851, or on-chip from 68030).

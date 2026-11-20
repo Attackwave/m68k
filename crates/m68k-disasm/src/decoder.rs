@@ -1840,23 +1840,13 @@ fn fpu_arith_name(cmd: u16) -> Option<&'static str> {
     m68k_core::opcodes::fpu_arith_mnemonic(cmd)
 }
 
+/// FTST's opmode: it has no destination register.
+const FTST: u16 = 0x3A;
+
 /// "Short" (rounding-precision-forcing) FPU opclass/opmode to mnemonic.
+/// Shares its table with the encoder, in `m68k-core`.
 fn fpu_short_name(cmd: u16) -> Option<&'static str> {
-    Some(match cmd {
-        0x40 => "fsmove",
-        0x41 => "fssqrt",
-        0x44 => "fdmove",
-        0x45 => "fdsqrt",
-        0x60 => "fsdiv",
-        0x62 => "fsadd",
-        0x63 => "fsmul",
-        0x64 => "fddiv",
-        0x66 => "fdadd",
-        0x67 => "fdmul",
-        0x68 => "fssub",
-        0x6C => "fdsub",
-        _ => return None,
-    })
+    m68k_core::opcodes::fpu_short_mnemonic(cmd)
 }
 
 /// FPU control-register mask (extension word bits 12-10) to register-list text,
@@ -2087,7 +2077,10 @@ fn decode_fpu_cpgen(
             };
             if group == 0b010 {
                 operands.push(DecodedOperand::from_ea(ea));
-                operands.push(DecodedOperand::special(format!("fp{}", rm_dst)));
+                // FTST has no destination; a 0 there is not one.
+                if !(cmd == FTST && rm_dst == 0) {
+                    operands.push(DecodedOperand::special(format!("fp{}", rm_dst)));
+                }
             } else {
                 operands.push(DecodedOperand::special(format!("fp{}", rm_dst)));
                 operands.push(DecodedOperand::from_ea(ea));
@@ -2116,7 +2109,9 @@ fn decode_fpu_cpgen(
                 .or_else(|| fpu_short_name(cmd))
                 .ok_or("unknown FPU arithmetic opclass/opmode")?;
             operands.push(DecodedOperand::special(format!("fp{}", src_reg)));
-            operands.push(DecodedOperand::special(format!("fp{}", dst_reg)));
+            if !(cmd == FTST && dst_reg == 0) {
+                operands.push(DecodedOperand::special(format!("fp{}", dst_reg)));
+            }
             Ok((mnemonic.into(), operands, target_addr))
         }
         _ => Err("unknown FPU cpGEN extension-word group".into()),
@@ -2629,6 +2624,22 @@ mod tests {
         let labels = HashMap::new();
         assert_eq!(inst.operands[0].format(&labels), "fp1");
         assert_eq!(inst.operands[1].format(&labels), "fp2:fp3");
+    }
+
+    #[test]
+    fn test_decode_ftst_and_the_68040_short_forms() {
+        // Reference encodings: ftst.x fp3 -> f2000c3a, ftst.s d5 -> f205443a,
+        // fsabs.x fp0,fp1 -> f20000d8, fdneg.d (a0),fp1 -> f21054de.
+        let labels = HashMap::new();
+        let text = |bytes: &[u8]| {
+            let inst = decode_one(bytes, "68040");
+            let ops: Vec<String> = inst.operands.iter().map(|o| o.format(&labels)).collect();
+            format!("{} {}", inst.mnemonic, ops.join(","))
+        };
+        assert_eq!(text(&[0xF2, 0x00, 0x0C, 0x3A]), "ftst fp3");
+        assert_eq!(text(&[0xF2, 0x05, 0x44, 0x3A]), "ftst.s d5");
+        assert_eq!(text(&[0xF2, 0x00, 0x00, 0xD8]), "fsabs fp0,fp1");
+        assert_eq!(text(&[0xF2, 0x10, 0x54, 0xDE]), "fdneg.d (a0),fp1");
     }
 
     #[test]
