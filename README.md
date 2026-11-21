@@ -352,6 +352,12 @@ addresses in the image (labels other than GCC's `.L…`, commons and the
 link's own; a `static` whose name occurs more than once as
 `file.s:name`), `--map` every input section's place.
 
+The stored image (text and data) is limited to 16 MiB, and image plus
+BSS must end below 4 GiB. Where GNU as reads input this mode refuses
+(`.previous`/`.pushsection`, `#0r` floating-point constants, a `d(%pc)`
+beyond 16 bits), the line is reported as an error; nothing is skipped
+silently.
+
 ### System includes
 
 `include/` holds hardware maps and OS interfaces for the systems the

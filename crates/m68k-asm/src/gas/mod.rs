@@ -41,6 +41,11 @@ mod parse;
 
 use std::fmt;
 
+/// The largest stored image (text and data, not BSS): 16 MiB, the whole
+/// address space of a 68000 and far above what these programs reach. It
+/// bounds the memory a link takes, which holds the image twice.
+pub(crate) const MAX_IMAGE: u32 = 16 << 20;
+
 /// One source file.
 #[derive(Debug, Clone)]
 pub struct SourceFile {
