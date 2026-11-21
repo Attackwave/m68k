@@ -326,7 +326,12 @@ m68k-asm --syntax gas --cpu 68020 -o prog.bin crt0.s main.s crtend.s
 The image holds every text section (`.text`, `.text.*`), then every
 read-only data section (`.rodata*`), then every data section (`.data*`),
 each in command-line order. BSS (`.bss*`, `.comm`) follows and is not
-stored. Symbols are local to their file unless `.globl`; identical strings
+stored. Symbols are local to their file unless `.globl` or `.weak`; a
+weak definition yields to one that is not, and a weak symbol nothing
+defines is 0. `.set`, `.equ` and `name = expr` define a symbol as an
+expression (the aliases libc code uses, or constants). A switch table
+entry (`.word a-b`) that does not fit 16 bits is pointed at a long jump
+placed after the table, as GNU as does it; identical strings
 in `"aMS"` sections are stored once. The layout, the relaxation of
 `jra`/`jbsr`/`jXX` (beyond 16-bit reach or to another file: absolute
 `jmp`/`jsr` on a 68000/68010, `bra.l`/`bsr.l`/`bcc.l` from the 68020 on;

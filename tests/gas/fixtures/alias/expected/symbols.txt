@@ -1,0 +1,3 @@
+__image_end 58
+__bss_start 58
+__bss_end 58

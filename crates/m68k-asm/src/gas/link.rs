@@ -9,20 +9,20 @@
 //! item is encoded with the final addresses.
 //!
 //! Relocations are found by encoding the image a second time at an
-//! address moved by [`PROBE`]: a longword that moves by exactly that much
+//! address moved by [`Linker::probe_step`]: a longword that moves by exactly that much
 //! holds an address of the image.
 
 use std::collections::HashMap;
 
-use m68k_core::operands::{MemoryIndirectOperand, Operand};
+use m68k_core::operands::{BitfieldSpec, MemoryIndirectOperand, Operand};
 
 use super::expr::{Expr, Linear};
 use super::parse::{Class, FileModel, Insn, Item, Op, SectionModel};
 use super::{GasError, GasImage, GasSection, GasSymbol, MAX_IMAGE};
 use crate::encoder::encode_instruction;
 
-/// How far the probe encoding moves the image: a multiple of 4 KiB, so
-/// alignment padding stays the same, that changes both words of a
+/// How far the probe encoding moves the image when no alignment is
+/// coarser than 4 KiB: a multiple of it that changes both words of a
 /// longword.
 const PROBE: u32 = 0x0001_1000;
 
@@ -52,6 +52,8 @@ enum Def {
     },
     Common(usize),
     Linker(usize),
+    /// `.set`: the value of an expression, in [`Linker::aliases`].
+    Alias(usize),
 }
 
 struct Sym {
@@ -92,6 +94,8 @@ enum Form {
     Fixed,
     Align,
     Table,
+    /// Long jumps for `.word a-b` that overflow, in [`Linker::stubs`].
+    Stub(usize),
     Branch {
         kind: BranchKind,
         cc: u8,
@@ -135,6 +139,31 @@ struct Val {
     weight: i64,
 }
 
+/// What GNU as does for `.word a-b` that does not fit 16 bits (its
+/// "broken words"): at the first label after the words, a `bra.w` over
+/// one long jump per overflowing target, and the word holds the distance
+/// to that jump instead.
+struct Stub {
+    /// Where the jumps go: section and item.
+    at: (usize, usize),
+    /// The words, newest first as GNU as lists them: section and item.
+    words: Vec<(usize, usize)>,
+    /// Per word, the labels `a` and `b` of `a-b+n` in one section, and `n`.
+    parts: Vec<Option<(usize, usize, usize, i64)>>,
+    /// Per word: 0 fits, 1 has a jump, 2 uses the jump of word `jump`.
+    added: Vec<u8>,
+    jump: Vec<usize>,
+}
+
+impl Stub {
+    fn size(&self) -> u32 {
+        match self.added.iter().filter(|&&a| a == 1).count() {
+            0 => 0,
+            n => 4 + 6 * n as u32,
+        }
+    }
+}
+
 struct Linker {
     files: Vec<FileModel>,
     secs: Vec<Sec>,
@@ -143,6 +172,15 @@ struct Linker {
     locals: Vec<HashMap<String, SymId>>,
     /// Global commons: `(symbol, size, align)`.
     commons: Vec<(SymId, u32, u32)>,
+    /// `.set` expressions with the file they are read in.
+    aliases: Vec<(usize, Expr)>,
+    /// Global symbols whose definition is weak: another one replaces it.
+    weak_defs: std::collections::HashSet<SymId>,
+    stubs: Vec<Stub>,
+    /// A word of a stub: the stub and the word's place in it.
+    word_stub: HashMap<(usize, usize), (usize, usize)>,
+    /// The first section of each file.
+    sec_base: Vec<usize>,
     cpu: String,
     errors: Vec<GasError>,
     /// Items already reported as wrong, not encoded again.
@@ -193,6 +231,12 @@ impl Linker {
             self.globals.insert(name.into(), id);
         }
         let mut pending = Vec::new();
+        for f in 0..self.files.len() {
+            for (name, expr, line) in std::mem::take(&mut self.files[f].sets) {
+                pending.push((f, line, name, Def::Alias(self.aliases.len())));
+                self.aliases.push((f, expr));
+            }
+        }
         for (si, sec) in self.secs.iter().enumerate() {
             for (ii, (item, line)) in sec.model.items.iter().enumerate() {
                 if let Item::Label(name) = item {
@@ -207,6 +251,7 @@ impl Linker {
         }
         for (file, line, name, def) in pending {
             let global = self.files[file].globals.contains(&name);
+            let weak = global && self.files[file].weak.contains(&name);
             let existing = if global {
                 self.globals.get(&name)
             } else {
@@ -218,6 +263,14 @@ impl Linker {
                 } else {
                     "is already defined"
                 };
+                if self.syms[id].def.is_some() && weak {
+                    // A weak definition yields to one there already is.
+                    continue;
+                }
+                if self.syms[id].def.is_some() && self.weak_defs.remove(&id) {
+                    self.syms[id].def = Some(def);
+                    continue;
+                }
                 if self.syms[id].def.is_some() {
                     self.error(
                         file,
@@ -232,10 +285,30 @@ impl Linker {
                 name: name.clone(),
                 def: Some(def),
             });
+            if weak {
+                self.weak_defs.insert(id);
+            }
             if global {
                 self.globals.insert(name, id);
             } else {
                 self.locals[file].insert(name, id);
+            }
+        }
+        // A weak symbol nothing defines is 0, as ld makes it.
+        for f in 0..self.files.len() {
+            let mut names: Vec<String> = self.files[f].weak.iter().cloned().collect();
+            names.sort();
+            for name in names {
+                if self.globals.contains_key(&name) {
+                    continue;
+                }
+                let id = self.syms.len();
+                self.syms.push(Sym {
+                    name: name.clone(),
+                    def: Some(Def::Alias(self.aliases.len())),
+                });
+                self.aliases.push((f, Expr::Num(0)));
+                self.globals.insert(name, id);
             }
         }
         // A common is a definition only where nothing else defines the
@@ -290,8 +363,21 @@ impl Linker {
         let (name, addend) = expr.symbol_plus_const()?;
         let file = self.secs[sec].file;
         let id = *self.locals[file].get(name)?;
+        self.item_behind(sec, id, addend, 0)
+    }
+
+    /// The label of section `sec` that symbol `id` (plus `addend`) is,
+    /// looking through local `.set` aliases as GNU as does: GCC aliases a
+    /// function to an identical one (`-fipa-icf`).
+    fn item_behind(&self, sec: usize, id: SymId, addend: i64, depth: u32) -> Option<(SymId, i64)> {
         match self.syms[id].def? {
             Def::Item { sec: s, .. } if s == sec => Some((id, addend)),
+            Def::Alias(a) if depth < 64 => {
+                let (file, expr) = &self.aliases[a];
+                let (name, more) = expr.symbol_plus_const()?;
+                let inner = self.lookup(*file, name).ok()?;
+                self.item_behind(sec, inner, addend.checked_add(more)?, depth + 1)
+            }
             _ => None,
         }
     }
@@ -312,6 +398,10 @@ impl Linker {
                     Item::Data { width, .. } => (Form::Fixed, u32::from(*width)),
                     Item::Align { .. } => (Form::Align, 0),
                     Item::RelocTable => (Form::Table, 0),
+                    Item::WordStub(words) => {
+                        let idx = self.new_stub(si, ii, words);
+                        (Form::Stub(idx), 0)
+                    }
                     Item::Insn(insn) => match self.classify_insn(si, insn) {
                         Ok(fs) => fs,
                         Err(e) => {
@@ -387,8 +477,10 @@ impl Linker {
             _ => None,
         });
         let candidate = candidates.next();
+        let file = self.secs[sec].file;
         let sizing = |op: Option<(usize, bool)>| -> Result<u32, String> {
-            let words = self.encode_insn(insn, 0, &mut |e: &Expr| sizing_value(e), op)?;
+            let words =
+                self.encode_insn(insn, 0, &mut |e: &Expr| self.sizing_value(file, e, 0), op)?;
             Ok(words.len() as u32 * 2)
         };
         if let Some((op, target)) = candidate
@@ -476,6 +568,7 @@ impl Linker {
                     };
                     // Only the relaxed operand is placed; the rest only
                     // has to have its size.
+                    let file = self.secs[si].file;
                     let mut at = |e: &Expr| {
                         if std::ptr::eq(e, cand) {
                             Ok(Val {
@@ -483,7 +576,7 @@ impl Linker {
                                 weight: 1,
                             })
                         } else {
-                            sizing_value(e)
+                            self.sizing_value(file, e, 0)
                         }
                     };
                     if self
@@ -500,10 +593,111 @@ impl Linker {
                         grew = true;
                     }
                 }
+                Form::Stub(idx) => {
+                    self.relax_stub(idx);
+                    let size = self.stubs[idx].size();
+                    if size != self.secs[si].sizes[ii] {
+                        self.secs[si].sizes[ii] = size;
+                        grew = true;
+                    }
+                }
                 _ => {}
             }
         }
         grew
+    }
+
+    fn new_stub(&mut self, si: usize, ii: usize, words: &[(usize, usize)]) -> usize {
+        let file = self.secs[si].file;
+        let base = self.sec_base[file];
+        let words: Vec<(usize, usize)> = words.iter().rev().map(|&(s, i)| (base + s, i)).collect();
+        let parts = words.iter().map(|&w| self.word_parts(w)).collect();
+        let idx = self.stubs.len();
+        for (k, &w) in words.iter().enumerate() {
+            self.word_stub.insert(w, (idx, k));
+        }
+        self.stubs.push(Stub {
+            at: (si, ii),
+            added: vec![0; words.len()],
+            jump: vec![0; words.len()],
+            words,
+            parts,
+        });
+        idx
+    }
+
+    /// `a-b+n` of a word, when `a` and `b` are labels of one section.
+    fn word_parts(&self, (si, ii): (usize, usize)) -> Option<(usize, usize, usize, i64)> {
+        let Item::Data { expr, .. } = &self.secs[si].model.items[ii].0 else {
+            return None;
+        };
+        let file = self.secs[si].file;
+        let lin: Linear<SymId> = expr.eval(&mut |name| self.lookup(file, name), None).ok()?;
+        let item = |c: i64| {
+            let id = lin.terms.iter().find(|t| t.1 == c)?.0;
+            match self.syms[id].def? {
+                Def::Item { sec, item } => Some((sec, item)),
+                _ => None,
+            }
+        };
+        let ((sa, a), (sb, b)) = (item(1)?, item(-1)?);
+        (lin.terms.len() == 2 && sa == sb).then_some((sa, a, b, lin.k))
+    }
+
+    /// One relaxation round of a stub, as GNU as does it: a word that
+    /// overflows gets a jump, shared by every word with the same target.
+    fn relax_stub(&mut self, idx: usize) {
+        let target = |l: &Linker, p: (usize, usize, usize, i64)| (p.0, l.secs[p.0].offs[p.1]);
+        for k in 0..self.stubs[idx].words.len() {
+            let stub = &self.stubs[idx];
+            let Some(p) = stub.parts[k] else { continue };
+            if stub.added[k] != 0 {
+                continue;
+            }
+            let offs = &self.secs[p.0].offs;
+            let off = i64::from(offs[p.1]) + p.3 - i64::from(offs[p.2]);
+            if off > -32768 && off < 32767 {
+                continue;
+            }
+            let t = target(self, p);
+            let same: Vec<usize> = (0..stub.words.len())
+                .filter(|&j| stub.parts[j].is_some_and(|q| target(self, q) == t))
+                .collect();
+            let stub = &mut self.stubs[idx];
+            for j in same {
+                stub.added[j] = 2;
+                stub.jump[j] = k;
+            }
+            stub.added[k] = 1;
+        }
+    }
+
+    /// How far the probe encoding moves the image: a multiple of every
+    /// alignment, so padding stays the same, that changes both 16-bit
+    /// halves of an address while the alignments allow it (below 64 KiB).
+    fn probe_step(&self) -> u32 {
+        let align = self
+            .secs
+            .iter()
+            .map(|s| s.model.align)
+            .chain(self.commons.iter().map(|c| c.2))
+            .max()
+            .unwrap_or(1);
+        match align {
+            0..=0x1000 => PROBE,
+            0x1001..=0xFFFF => 0x1_0000 + align,
+            _ => align,
+        }
+    }
+
+    /// The address of the jump word `k` of stub `idx` uses.
+    fn jump_address(&self, layout: &Layout, idx: usize, k: usize) -> u32 {
+        let stub = &self.stubs[idx];
+        let (si, ii) = stub.at;
+        let before = (0..stub.jump[k]).filter(|&j| stub.added[j] == 1).count() as u32;
+        layout.base[si]
+            .wrapping_add(self.secs[si].offs[ii])
+            .wrapping_add(4 + 6 * before)
     }
 
     /// Item offsets within section `si` from the current sizes.
@@ -778,17 +972,87 @@ impl Linker {
             Def::Item { sec, item } => layout.base[sec].wrapping_add(self.secs[sec].offs[item]),
             Def::Common(c) => layout.common[c],
             Def::Linker(i) => layout.linker[i],
+            Def::Alias(a) => {
+                let v = self.alias_value(layout, a, 0)?;
+                if !matches!(v.weight, 0 | 1) {
+                    return Err("expression is neither a number nor an address".into());
+                }
+                long32(v.value)? as u32
+            }
         })
+    }
+
+    /// For sizing an instruction: every address 0 with the weight as
+    /// written; a `.set` symbol stands for its expression, so a constant
+    /// keeps its value.
+    fn sizing_value(&self, file: usize, e: &Expr, depth: u32) -> Result<Val, String> {
+        if depth > 64 {
+            return Err("a .set symbol is defined in terms of itself".into());
+        }
+        // An undefined name sizes as an address; encoding reports it.
+        let lin: Linear<Option<SymId>> =
+            e.eval(&mut |name| Ok(self.lookup(file, name).ok()), Some(None))?;
+        let overflow = || "overflow in expression".to_string();
+        let mut v = Val {
+            value: lin.k,
+            weight: 0,
+        };
+        for (id, c) in lin.terms {
+            let term = match id.map(|id| self.syms[id].def) {
+                Some(Some(Def::Alias(a))) => {
+                    let (f, expr) = &self.aliases[a];
+                    self.sizing_value(*f, expr, depth + 1)?
+                }
+                _ => Val {
+                    value: 0,
+                    weight: 1,
+                },
+            };
+            v.weight = c
+                .checked_mul(term.weight)
+                .and_then(|w| w.checked_add(v.weight))
+                .ok_or_else(overflow)?;
+            v.value = c
+                .checked_mul(term.value)
+                .and_then(|x| x.checked_add(v.value))
+                .ok_or_else(overflow)?;
+        }
+        Ok(v)
+    }
+
+    /// The value of the `.set` expression `a`; `depth` counts the aliases
+    /// it is reached through.
+    fn alias_value(&self, layout: &Layout, a: usize, depth: u32) -> Result<Val, String> {
+        if depth > 64 {
+            return Err("a .set symbol is defined in terms of itself".into());
+        }
+        let (file, expr) = &self.aliases[a];
+        self.value_at(layout, *file, None, expr, depth + 1)
     }
 
     /// The value of `expr` in file `file` with `dot` the location of the
     /// item. A difference of two symbols of one section counts their
     /// distance in the section as written, as GNU as resolves it.
     fn value(&self, layout: &Layout, file: usize, dot: Def, expr: &Expr) -> Result<Val, String> {
-        let lin: Linear<SymId> = expr.eval(&mut |name| self.lookup(file, name), Some(DOT))?;
+        self.value_at(layout, file, Some(dot), expr, 0)
+    }
+
+    fn value_at(
+        &self,
+        layout: &Layout,
+        file: usize,
+        dot: Option<Def>,
+        expr: &Expr,
+        depth: u32,
+    ) -> Result<Val, String> {
+        let lin: Linear<SymId> =
+            expr.eval(&mut |name| self.lookup(file, name), dot.map(|_| DOT))?;
         let mut value = lin.k;
-        let mut weight = 0;
-        let def_of = |id: SymId| if id == DOT { Ok(dot) } else { self.sym_def(id) };
+        let mut weight = 0i64;
+        let def_of = |id: SymId| match dot {
+            Some(d) if id == DOT => Ok(d),
+            _ => self.sym_def(id),
+        };
         let overflow = || "overflow in expression".to_string();
         let mut by_sec: HashMap<usize, i64> = HashMap::new();
         for &(id, c) in &lin.terms {
@@ -799,6 +1063,18 @@ impl Linker {
         }
         for &(id, c) in &lin.terms {
             let def = def_of(id)?;
+            if let Def::Alias(a) = def {
+                let v = self.alias_value(layout, a, depth)?;
+                weight = c
+                    .checked_mul(v.weight)
+                    .and_then(|w| w.checked_add(weight))
+                    .ok_or_else(overflow)?;
+                value = c
+                    .checked_mul(v.value)
+                    .and_then(|v| v.checked_add(value))
+                    .ok_or_else(overflow)?;
+                continue;
+            }
             weight = c.checked_add(weight).ok_or_else(overflow)?;
             let addr = match def {
                 Def::Item { sec, item } if by_sec[&sec] == 0 => {
@@ -1029,22 +1305,38 @@ impl Linker {
                 Some((offset, width)) => Operand::Bitfield(
                     Box::new(operand),
                     Box::new(offset.clone()),
-                    Box::new(width.clone()),
+                    // GNU as reads a width of 0 as 32, which is how the
+                    // field encodes it; GCC writes `{#0:#0}`.
+                    Box::new(match width {
+                        BitfieldSpec::Immediate(0) => BitfieldSpec::Immediate(32),
+                        w => w.clone(),
+                    }),
                 ),
                 None => operand,
             });
         }
-        if ops.len() > 2 {
-            return Err(format!("{} takes at most two operands", insn.mnemonic));
+        let mut words = match (mnemonic.as_str(), ops.as_slice()) {
+            // `cas Dc,Du,<ea>`: the <ea> extension follows CAS's own word.
+            ("CAS", [dc, du, ea]) => crate::enc_logic::enc_cas(
+                dc,
+                du,
+                ea,
+                size_str.as_deref().unwrap_or("w"),
+                pc.wrapping_add(6),
+                &self.cpu,
+            ),
+            (_, [_, _, _, ..]) => {
+                return Err(format!("{} takes at most two operands", insn.mnemonic));
+            }
+            _ => encode_instruction(
+                &mnemonic,
+                size_str.as_deref(),
+                ops.first(),
+                ops.get(1),
+                pc,
+                &self.cpu,
+            ),
         }
-        let mut words = encode_instruction(
-            &mnemonic,
-            size_str.as_deref(),
-            ops.first(),
-            ops.get(1),
-            pc,
-            &self.cpu,
-        )
         .map_err(|e| e.message)?;
         m68k_core::cpu_gate::check_mnemonic_cpu(&mnemonic, &self.cpu)?;
         // GNU as stores a negative byte immediate sign-extended over its
@@ -1088,6 +1380,42 @@ impl Linker {
             (Item::Bytes(b), _) => b.clone(),
             (Item::Zero(n), _) => vec![0; *n as usize],
             (Item::RelocTable, _) => table.to_vec(),
+            (Item::WordStub(_), Form::Stub(idx)) => {
+                let stub = &self.stubs[idx];
+                if stub.size() == 0 {
+                    return Ok(Vec::new());
+                }
+                let n = (stub.size() - 4) / 6;
+                let mut w = vec![0x6000u16, (2 + 6 * n) as u16];
+                let long_branch = !matches!(self.cpu.as_str(), "68000" | "68010");
+                let mut at = pc.wrapping_add(4);
+                for k in (0..stub.words.len()).filter(|&k| stub.added[k] == 1) {
+                    let (s, a, _, n) = stub.parts[k].expect("only words with parts get a jump");
+                    let to = i64::from(self.address(layout, Def::Item { sec: s, item: a })?) + n;
+                    let (op, v) = if long_branch {
+                        (0x60FF, to - i64::from(at) - 2)
+                    } else {
+                        (0x4EF9, to)
+                    };
+                    w.extend([op, (v >> 16) as u16, v as u16]);
+                    at = at.wrapping_add(6);
+                }
+                w.iter().flat_map(|x| x.to_be_bytes()).collect()
+            }
+            (Item::WordStub(_), _) => Vec::new(),
+            (Item::Data { width: 2, .. }, _)
+                if self
+                    .word_stub
+                    .get(&(si, ii))
+                    .is_some_and(|&(idx, k)| self.stubs[idx].added[k] != 0) =>
+            {
+                // Redirected: the distance from `b` to the jump.
+                let (idx, k) = self.word_stub[&(si, ii)];
+                let (s, _, b, _) = self.stubs[idx].parts[k].expect("redirected words have parts");
+                let to = i64::from(self.jump_address(layout, idx, k));
+                let from = i64::from(self.address(layout, Def::Item { sec: s, item: b })?);
+                ((to - from) as u16).to_be_bytes().to_vec()
+            }
             (Item::Data { width, expr }, _) => {
                 let v = ev(expr)?;
                 let (lo, hi) = match width {
@@ -1136,9 +1464,22 @@ impl Linker {
                             Some(Op::Abs(t, None)) => ev(t)?,
                             _ => unreachable!("classified as a branch"),
                         };
-                        if target.weight != 1 {
+                        // A number is a target too: an undefined weak
+                        // symbol is 0, as ld resolves it.
+                        if !matches!(target.weight, 0 | 1) {
                             return Err("a branch needs a label as its target".into());
                         }
+                        // To a number, a 32-bit displacement would not
+                        // survive relocation; `jsr`/`jmp` absolute is as
+                        // long and does.
+                        let reach = match (reach, kind) {
+                            (Reach::Long, BranchKind::J | BranchKind::B)
+                                if target.weight == 0 && cc <= 1 =>
+                            {
+                                Reach::Abs
+                            }
+                            _ => reach,
+                        };
                         branch_words(kind, cc, reach, pc, target.value)?
                     }
                     Form::PcRel { op, long, .. } => {
@@ -1247,19 +1588,6 @@ fn long32(v: i64) -> Result<i32, String> {
     } else {
         Err(format!("value {v} does not fit 32 bits"))
     }
-}
-
-/// For sizing an instruction: every symbol 0, the weight as written.
-fn sizing_value(e: &Expr) -> Result<Val, String> {
-    let lin: Linear<u8> = e.eval(&mut |_| Ok(0), Some(0))?;
-    Ok(Val {
-        value: lin.k,
-        weight: lin
-            .terms
-            .iter()
-            .try_fold(0i64, |w, t| w.checked_add(t.1))
-            .ok_or("overflow in expression")?,
-    })
 }
 
 /// A numeric label `.L1\u{1}2` as the source wrote it.
@@ -1424,7 +1752,9 @@ fn gas_choice(insn: &Insn) -> Result<(String, Option<char>), String> {
 pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, Vec<GasError>> {
     let mut secs = Vec::new();
     let mut files = files;
+    let mut sec_base = Vec::with_capacity(files.len());
     for (f, file) in files.iter_mut().enumerate() {
+        sec_base.push(secs.len());
         for model in std::mem::take(&mut file.sections) {
             secs.push(Sec {
                 file: f,
@@ -1446,6 +1776,11 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
         syms: Vec::new(),
         globals: HashMap::new(),
         commons: Vec::new(),
+        aliases: Vec::new(),
+        weak_defs: Default::default(),
+        stubs: Vec::new(),
+        word_stub: HashMap::new(),
+        sec_base,
         cpu: cpu.to_string(),
         errors: Vec::new(),
         failed: Default::default(),
@@ -1463,11 +1798,15 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
     for si in 0..l.secs.len() {
         // Forms only grow, a branch at most twice, so every round but the
         // last grows one at least.
-        let relaxable = l.secs[si]
+        let relaxable: usize = l.secs[si]
             .forms
             .iter()
-            .filter(|f| matches!(f, Form::Branch { fixed: false, .. } | Form::PcRel { .. }))
-            .count();
+            .map(|f| match f {
+                Form::Branch { fixed: false, .. } | Form::PcRel { .. } => 1,
+                Form::Stub(idx) => l.stubs[*idx].words.len(),
+                _ => 0,
+            })
+            .sum();
         let mut rounds = 0;
         while l.relax_pass(si) {
             rounds += 1;
@@ -1486,6 +1825,7 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
         return Err(l.errors);
     }
     l.merge_strings();
+    let step = l.probe_step();
     let first = l.layout(origin);
     let (top, image_end) = (first.top, u64::from(first.linker[0]));
     if top > TOP {
@@ -1531,11 +1871,18 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
             return Err(l.errors);
         }
         // Moved down where moving up would pass `TOP` (only the stored
-        // part is encoded, at least `TOP - PROBE - MAX_IMAGE` up then).
-        let probe = if image_end + u64::from(PROBE) <= TOP {
-            PROBE
+        // part is encoded).
+        let probe = if image_end + u64::from(step) <= TOP {
+            step
+        } else if origin >= step {
+            step.wrapping_neg()
         } else {
-            PROBE.wrapping_neg()
+            l.error(
+                0,
+                0,
+                "an alignment this coarse leaves no room to find the fixups at this origin",
+            );
+            return Err(l.errors);
         };
         let (moved, _) = l.encode_image(origin.wrapping_add(probe), &table);
         if !l.errors.is_empty() {

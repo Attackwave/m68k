@@ -49,6 +49,10 @@ pub enum Item {
     },
     Insn(Insn),
     RelocTable,
+    /// Where GNU as may put long jumps for the `.word a-b` items listed
+    /// (section and item index in this file) that do not fit 16 bits: at
+    /// the first label after them. Empty unless one overflows.
+    WordStub(Vec<(usize, usize)>),
 }
 
 #[derive(Debug, Clone)]
@@ -109,6 +113,11 @@ pub struct FileModel {
     pub name: String,
     pub sections: Vec<SectionModel>,
     pub globals: HashSet<String>,
+    /// `.weak` names, also in `globals`: a definition elsewhere that is not
+    /// weak wins, and without any definition the symbol is 0.
+    pub weak: HashSet<String>,
+    /// `.set name,expr` and `name = expr`: `(name, expr, line)`.
+    pub sets: Vec<(String, Expr, usize)>,
     /// `.comm` symbols that are not `.local`: `(name, size, align, line)`.
     pub commons: Vec<(String, u32, u32, usize)>,
 }
@@ -342,6 +351,8 @@ struct FileParser {
     local_commons: Vec<(String, u32, u32, usize)>,
     /// Bytes of non-zero `.skip` fill so far, which are held in memory.
     filled: u64,
+    /// `.word a-b` items since the last label: `(section, item)`.
+    broken: Vec<(usize, usize)>,
     errors: LineErrors,
 }
 
@@ -438,6 +449,17 @@ impl FileParser {
         }
     }
 
+    /// `.set sym,expr`: `sym` stands for the value of `expr`, which may
+    /// name symbols defined anywhere.
+    fn set(&mut self, sym: &str, expr: &str, line: usize) -> Result<(), String> {
+        if !sym.bytes().next().is_some_and(is_sym_start) || !sym.bytes().all(is_sym_char) {
+            return Err(format!("bad symbol name '{sym}'"));
+        }
+        let expr = self.expr(expr)?;
+        self.model.sets.push((sym.to_string(), expr, line));
+        Ok(())
+    }
+
     fn push(&mut self, item: Item, line: usize) -> Result<(), String> {
         if let Item::Label(name) = &item {
             let place = self.place();
@@ -506,11 +528,30 @@ impl FileParser {
                 name.to_string()
             };
             if !self.discarding {
+                if !self.broken.is_empty() && self.section().class != Class::Bss {
+                    let words = std::mem::take(&mut self.broken);
+                    self.push(Item::WordStub(words), line)?;
+                }
                 self.push(Item::Label(name), line)?;
             }
         }
         if rest.is_empty() {
             return Ok(());
+        }
+        if let Some((sym, expr)) = rest.split_once('=')
+            && !expr.starts_with('=')
+            && !sym.trim().is_empty()
+            && sym.trim().bytes().all(is_sym_char)
+            && sym
+                .trim()
+                .as_bytes()
+                .first()
+                .is_some_and(|&c| is_sym_start(c))
+        {
+            if self.discarding {
+                return Ok(());
+            }
+            return self.set(sym.trim(), expr.trim(), line);
         }
         let (word, args) = match rest.find(|c: char| c.is_ascii_whitespace()) {
             Some(i) => (&rest[..i], rest[i..].trim()),
@@ -581,6 +622,18 @@ impl FileParser {
                     self.model.globals.insert(s.to_string());
                 }
             }
+            ".weak" => {
+                for s in a {
+                    self.model.globals.insert(s.to_string());
+                    self.model.weak.insert(s.to_string());
+                }
+            }
+            ".set" | ".equ" => {
+                let [sym, expr] = a.as_slice() else {
+                    return Err(format!("{name} needs a name and a value"));
+                };
+                self.set(sym, expr, line)?;
+            }
             ".local" => {
                 for s in a {
                     self.locals.insert(s.to_string());
@@ -649,6 +702,13 @@ impl FileParser {
                 }
                 for v in a {
                     let expr = self.expr(v)?;
+                    // A difference of two symbols in a word may not fit:
+                    // GNU as then redirects it through a jump.
+                    if width == 2 && is_difference(&expr) {
+                        let sec = self.current.unwrap_or(0);
+                        let item = self.model.sections[sec].items.len();
+                        self.broken.push((sec, item));
+                    }
                     self.push(Item::Data { width, expr }, line)?;
                 }
             }
@@ -724,7 +784,8 @@ impl FileParser {
             .map(|t| self.operand(t))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Insn {
-            mnemonic: base.to_string(),
+            // GNU as reads `mov` as `move`; GCC writes it at times.
+            mnemonic: if base == "mov" { "move" } else { base }.to_string(),
             size,
             ops,
         })
@@ -926,6 +987,29 @@ impl FileParser {
     }
 }
 
+/// `a-b` or `a-b+n` with two distinct symbols: what GNU as keeps as a
+/// difference (`O_subtract`) until the end.
+fn is_difference(e: &Expr) -> bool {
+    let mut names: Vec<String> = Vec::new();
+    let lin = e.eval(
+        &mut |name: &str| {
+            Ok(match names.iter().position(|n| n == name) {
+                Some(i) => i,
+                None => {
+                    names.push(name.to_string());
+                    names.len() - 1
+                }
+            })
+        },
+        None,
+    );
+    matches!(lin, Ok(l) if l.terms.len() == 2 && {
+        let mut c: Vec<i64> = l.terms.iter().map(|t| t.1).collect();
+        c.sort_unstable();
+        c == [-1, 1]
+    })
+}
+
 /// The start of the last top-level parenthesised group of `t`, which
 /// ends `t`.
 fn last_group(t: &str) -> Option<usize> {
@@ -1021,6 +1105,7 @@ pub fn parse_file(name: &str, text: &str) -> (FileModel, LineErrors) {
         counts: Vec::new(),
         local_commons: Vec::new(),
         filled: 0,
+        broken: Vec::new(),
         errors: Vec::new(),
     };
     // GNU as creates these three in every object, in this order.
@@ -1174,7 +1259,7 @@ mod tests {
     fn unknown_sections_and_directives_are_errors() {
         let (_, e) = parse_file(
             "t.s",
-            "\t.section .ctors\n\t.weak x\n\t.section .debug_info\n\t.uleb128 4\n",
+            "\t.section .ctors\n\t.symver x,y\n\t.section .debug_info\n\t.uleb128 4\n",
         );
         assert_eq!(e.len(), 2, "{e:?}");
     }
