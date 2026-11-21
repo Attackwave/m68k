@@ -210,9 +210,9 @@ fn global_commons_are_merged_and_follow_bss_in_order_of_appearance() {
 fn errors_name_file_and_line() {
     let e = errors(&[(
         "a.s",
-        "\t.text\n\tmove.w #x,%d0\nx:\t.word x\n\t.byte 1\n\t.long x\n\t.weak x\n\tjsr nowhere\n",
+        "\t.text\n\tmove.w #x,%d0\nx:\t.word x\n\t.byte 1\n\t.long x\n\t.uleb128 5\n\tjsr nowhere\n",
     )]);
-    let want = ["a.s:6: error: unsupported directive '.weak'"];
+    let want = ["a.s:6: error: unsupported directive '.uleb128'"];
     assert_eq!(e, want);
     let e = errors(&[(
         "a.s",
@@ -251,7 +251,10 @@ fn unsupported_input_is_refused() {
             "\t.section .rodata.cst4,\"aM\",@progbits,4\n",
             "only string merging",
         ),
-        ("\t.set x,4\n", "unsupported directive '.set'"),
+        (
+            "\t.pushsection .text\n",
+            "unsupported directive '.pushsection'",
+        ),
         ("\t.text\n\tbra.l x\nx:\n", "needs a 68020"),
         ("\t.text\n\tfoo %d0\n", "unknown mnemonic"),
     ] {
@@ -388,6 +391,9 @@ fn hostile_input_is_an_error_not_a_crash() {
         e.iter().any(|m| m.contains("32-bit address space")),
         "{e:?}"
     );
+    // An alignment coarser than the probe's 4 KiB step: found by fuzzing.
+    let image = at("68020", 0, "\tnop\n\t.p2align 15\nx:\t.long x\n").unwrap();
+    assert_eq!(image.fixups, [0x8000]);
     // Near the top the fixups are still found.
     for origin in [0xFFFE_EFF0, 0xFFFF_FEF0] {
         let image = at("68020", origin, "\ttst.l %d0\nx:\t.long x\n").unwrap();
@@ -415,4 +421,49 @@ fn branch_chains_relax_however_long() {
     let image = ok(&[("a.s", &src)]);
     // The first branch grew from a byte to a word.
     assert_eq!(image.image[..4], [0x60, 0, 0, 0x82]);
+}
+
+#[test]
+fn weak_symbols_and_aliases() {
+    let at = |cpu: &str, files: &[(&str, &str)]| {
+        let files: Vec<SourceFile> = files
+            .iter()
+            .map(|(name, text)| SourceFile {
+                name: name.to_string(),
+                text: text.to_string(),
+            })
+            .collect();
+        assemble(&files, cpu, 0).map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    // An undefined weak symbol is 0 and needs no fixup. Calling it
+    // becomes `jsr` absolute on a 68020 as well: a 32-bit displacement to
+    // a fixed address would not survive relocation.
+    let weak = "\t.text\n\tjbsr maybe\n\tlea maybe,%a0\n\trts\n\t.weak maybe\n";
+    for cpu in ["68000", "68020"] {
+        let image = at(cpu, &[("a.s", weak)]).unwrap();
+        assert_eq!(
+            image.image[..14],
+            [0x4E, 0xB9, 0, 0, 0, 0, 0x41, 0xF9, 0, 0, 0, 0, 0x4E, 0x75],
+            "{cpu}"
+        );
+        assert!(image.fixups.is_empty());
+    }
+    // A definition that is not weak wins, in either order; two weak ones
+    // keep the first.
+    let weak_def = "\t.text\n\t.weak f\nf:\tmoveq #1,%d0\n\trts\n";
+    let strong = "\t.text\n\t.globl f\nf:\tmoveq #2,%d0\n\trts\n";
+    let user = "\t.text\n\t.globl start\nstart:\tjbsr f\n";
+    for files in [
+        [("w.s", weak_def), ("s.s", strong), ("u.s", user)],
+        [("s.s", strong), ("w.s", weak_def), ("u.s", user)],
+    ] {
+        let image = at("68000", &files).unwrap();
+        let f = image.symbols.iter().find(|s| s.name == "f").unwrap();
+        assert_eq!(image.image[f.address as usize + 1], 2, "{files:?}");
+    }
+    let e = at("68000", &[("s.s", strong), ("t.s", strong)]).unwrap_err();
+    assert!(e.iter().any(|m| m.contains("already defined")), "{e:?}");
+    // `.set` in terms of itself.
+    let e = at("68000", &[("a.s", "\t.set a,b\n\t.set b,a+1\n\t.long a\n")]).unwrap_err();
+    assert!(e.iter().any(|m| m.contains("in terms of itself")), "{e:?}");
 }

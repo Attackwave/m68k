@@ -1,7 +1,8 @@
 | Forms GCC rarely writes but GNU as reads: index registers without a
 | size (long), displacements that cancel only partly, numeric PC
 | displacements behind a leading extension word, joined strings and
-| logical right shifts.
+| logical right shifts, a bitfield width of 0 (32) and CAS with its
+| three operands.
 	.text
 	.globl	start
 start:
@@ -32,6 +33,11 @@ c:	nop
 	move.l 100(%pc),%d0
 	movem.l #0xffff,-(%sp)
 	fmovem.x #0xff,-(%sp)
+	bfffo %d1{#0:#0},%d0
+	bfextu (%a0){#3:#0},%d2
+	cas.l %d0,%d1,(%a0)
+	cas.w %d2,%d3,8(%a1)
+	cas.b %d0,%d1,c
 	rts
 	.data
 	.ascii "ab" "cd"

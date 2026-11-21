@@ -92,7 +92,11 @@ def reference(out_dir, sources, cpu=CPU):
 
         symbols = {}
         for line in output(PREFIX + "nm", elf).splitlines():
-            value, _, name = line.split()
+            fields = line.split()
+            # An undefined (weak) symbol has no value column.
+            if len(fields) != 3:
+                continue
+            value, _, name = fields
             if name in ("__image_end", "__bss_start", "__bss_end"):
                 symbols[name] = int(value, 16)
         with open(os.path.join(out_dir, "symbols.txt"), "w") as f:

@@ -1,0 +1,3 @@
+__image_end 8118
+__bss_start 8118
+__bss_end 8118
