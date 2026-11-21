@@ -26,6 +26,11 @@ use crate::encoder::encode_instruction;
 /// longword.
 const PROBE: u32 = 0x0001_1000;
 
+/// The highest address a program may end at: the last 256 bytes of the
+/// address space stay free, since the encoder works with addresses past
+/// the instruction it encodes.
+const TOP: u64 = 0xFFFF_FF00;
+
 /// The symbols the link defines.
 const LINKER_SYMBOLS: [&str; 3] = ["__image_end", "__bss_start", "__bss_end"];
 
@@ -1447,6 +1452,14 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
     };
     l.define_symbols();
     l.classify();
+    // Before relaxation as well: it encodes at section offsets, which must
+    // stay far from 4 GiB.
+    for si in 0..l.secs.len() {
+        l.offsets(si);
+    }
+    if l.check_size().is_err() {
+        return Err(l.errors);
+    }
     for si in 0..l.secs.len() {
         // Forms only grow, a branch at most twice, so every round but the
         // last grows one at least.
@@ -1473,8 +1486,9 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
         return Err(l.errors);
     }
     l.merge_strings();
-    let top = l.layout(origin).top;
-    if top > u64::from(u32::MAX) {
+    let first = l.layout(origin);
+    let (top, image_end) = (first.top, u64::from(first.linker[0]));
+    if top > TOP {
         l.error(
             0,
             0,
@@ -1516,7 +1530,14 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
                 .sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
             return Err(l.errors);
         }
-        let (moved, _) = l.encode_image(origin.wrapping_add(PROBE), &table);
+        // Moved down where moving up would pass `TOP` (only the stored
+        // part is encoded, at least `TOP - PROBE - MAX_IMAGE` up then).
+        let probe = if image_end + u64::from(PROBE) <= TOP {
+            PROBE
+        } else {
+            PROBE.wrapping_neg()
+        };
+        let (moved, _) = l.encode_image(origin.wrapping_add(probe), &table);
         if !l.errors.is_empty() {
             return Err(l.errors);
         }
@@ -1535,7 +1556,7 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
                     .map(|s| u32::from_be_bytes(s.try_into().unwrap()))
             };
             if let (Some(a), Some(b)) = (word(&image), word(&moved))
-                && b.wrapping_sub(a) == PROBE
+                && b.wrapping_sub(a) == probe
             {
                 if !k.is_multiple_of(2) {
                     let (f, line) = loc_of(k);

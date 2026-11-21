@@ -343,6 +343,8 @@ fn hostile_input_is_an_error_not_a_crash() {
         (".zero 0x80000000\n.zero 0x80000000\n", "larger than"),
         ("\tnop\n.p2align 30\n", "larger than"),
         (".skip 0xffffffff,1\n", "bytes of fill"),
+        // Relaxation encodes at section offsets: found by fuzzing.
+        (".zero 0xfffffff8\nx: tst.l x\n", "larger than"),
         (
             ".section .rodata.str1.1,\"aMS\",@progbits,1\n.zero 0x4000000\n",
             "larger than",
@@ -386,7 +388,11 @@ fn hostile_input_is_an_error_not_a_crash() {
         e.iter().any(|m| m.contains("32-bit address space")),
         "{e:?}"
     );
-    assert!(at("68020", 0xFFFE_EFFC, "\tnop\n\tnop\n").is_ok());
+    // Near the top the fixups are still found.
+    for origin in [0xFFFE_EFF0, 0xFFFF_FEF0] {
+        let image = at("68020", origin, "\ttst.l %d0\nx:\t.long x\n").unwrap();
+        assert_eq!(image.fixups, [2]);
+    }
 }
 
 #[test]
