@@ -97,8 +97,12 @@ impl Expr {
                             }
                             BinOp::Div => x.wrapping_div(y),
                             BinOp::Rem => x.wrapping_rem(y),
-                            BinOp::Shl => x.wrapping_shl(y as u32),
-                            BinOp::Shr => x.wrapping_shr(y as u32),
+                            BinOp::Shl | BinOp::Shr if !(0..64).contains(&y) => {
+                                return Err(format!("shift count {y} out of range"));
+                            }
+                            BinOp::Shl => x << y,
+                            // GAS shifts the value as unsigned.
+                            BinOp::Shr => ((x as u64) >> y) as i64,
                             BinOp::And => x & y,
                             BinOp::Xor => x ^ y,
                             BinOp::Or => x | y,
@@ -155,9 +159,9 @@ impl<S: Copy + PartialEq> Linear<S> {
     fn add(mut self, other: Self, sign: i64) -> Result<Self, String> {
         self.k = self.k.wrapping_add(other.k.wrapping_mul(sign));
         for (s, c) in other.terms {
-            let c = c * sign;
+            let c = c.checked_mul(sign).ok_or("overflow")?;
             match self.terms.iter_mut().find(|t| t.0 == s) {
-                Some(t) => t.1 += c,
+                Some(t) => t.1 = t.1.checked_add(c).ok_or("overflow")?,
                 None => self.terms.push((s, c)),
             }
         }
@@ -173,6 +177,7 @@ pub fn parse_expr(text: &str, local_ref: &dyn Fn(u32, bool) -> String) -> Result
         s: text.as_bytes(),
         i: 0,
         local_ref,
+        nodes: 0,
     };
     let e = p.sum()?;
     p.ws();
@@ -192,10 +197,17 @@ pub fn is_sym_char(c: u8) -> bool {
     is_sym_start(c) || c.is_ascii_digit()
 }
 
+/// Most operators and parentheses one expression may hold. Evaluating
+/// and dropping the tree recurse once per level, so this bounds the stack
+/// they use; compiler output stays far below it.
+const MAX_NODES: u32 = 256;
+
 struct Parser<'a> {
     s: &'a [u8],
     i: usize,
     local_ref: &'a dyn Fn(u32, bool) -> String,
+    /// Operators and parentheses so far.
+    nodes: u32,
 }
 
 impl Parser<'_> {
@@ -208,6 +220,14 @@ impl Parser<'_> {
     fn peek(&mut self) -> Option<u8> {
         self.ws();
         self.s.get(self.i).copied()
+    }
+
+    fn node(&mut self) -> Result<(), String> {
+        self.nodes += 1;
+        if self.nodes > MAX_NODES {
+            return Err(format!("expression has more than {MAX_NODES} operators"));
+        }
+        Ok(())
     }
 
     fn eat(&mut self, tok: &str) -> bool {
@@ -229,6 +249,7 @@ impl Parser<'_> {
                 _ => return Ok(e),
             };
             self.i += 1;
+            self.node()?;
             e = Expr::Bin(op, Box::new(e), Box::new(self.bits()?));
         }
     }
@@ -243,6 +264,7 @@ impl Parser<'_> {
                 _ => return Ok(e),
             };
             self.i += 1;
+            self.node()?;
             e = Expr::Bin(op, Box::new(e), Box::new(self.product()?));
         }
     }
@@ -265,11 +287,15 @@ impl Parser<'_> {
             if matches!(op, BinOp::Mul | BinOp::Div | BinOp::Rem) {
                 self.i += 1;
             }
+            self.node()?;
             e = Expr::Bin(op, Box::new(e), Box::new(self.unary()?));
         }
     }
 
     fn unary(&mut self) -> Result<Expr, String> {
+        if matches!(self.peek(), Some(b'-' | b'+' | b'~' | b'(')) {
+            self.node()?;
+        }
         match self.peek() {
             Some(b'-') => {
                 self.i += 1;
@@ -416,6 +442,23 @@ mod tests {
         assert_eq!(val("~0&0xff"), 255);
         assert_eq!(val("'a"), 97);
         assert_eq!(val("'\\n"), 10);
+        assert_eq!(val("-1>>40"), 0xFF_FFFF);
+        assert_eq!(val("1<<63>>63"), 1);
+    }
+
+    #[test]
+    fn hostile_expressions_are_errors() {
+        let e = |s: &str| {
+            parse_expr(s, &|_, _| String::new())
+                .and_then(|e| e.eval(&mut |_: &str| Ok(0u8), None).map(|_| ()))
+        };
+        assert!(e("1<<64").is_err());
+        assert!(e("1>>-1").is_err());
+        assert!(e(&format!("{}1{}", "(".repeat(5000), ")".repeat(5000))).is_err());
+        assert!(e(&"-".repeat(5000)).is_err());
+        assert!(e(&vec!["1"; 5000].join("+")).is_err());
+        assert!(e("x*0x7fffffffffffffff+x").is_err());
+        assert!(e(&format!("{}1{}", "(".repeat(100), ")".repeat(100))).is_ok());
     }
 
     #[test]

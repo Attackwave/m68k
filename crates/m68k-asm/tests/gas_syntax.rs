@@ -322,3 +322,97 @@ fn fpu_code_is_checked() {
     let image = at("68020", "\tfjne .Lfar\n\t.zero 40000\n.Lfar:\n\trts\n").unwrap();
     assert_eq!(image.image[..6], [0xF2, 0xCE, 0, 0, 0x9C, 0x44]);
 }
+
+#[test]
+fn hostile_input_is_an_error_not_a_crash() {
+    let at = |cpu: &str, origin: u32, text: &str| {
+        assemble(
+            &[SourceFile {
+                name: "a.s".into(),
+                text: text.to_string(),
+            }],
+            cpu,
+            origin,
+        )
+        .map_err(|e| e.iter().map(ToString::to_string).collect::<Vec<_>>())
+    };
+    let deep = format!(".long {}1{}\n", "(".repeat(5000), ")".repeat(5000));
+    let bitfields = format!("\tbftst %d0{}\n", "{#1:#1}".repeat(1000));
+    for (text, message) in [
+        // Sizes and addresses beyond the image limit or 32 bits.
+        (".zero 0x80000000\n.zero 0x80000000\n", "larger than"),
+        ("\tnop\n.p2align 30\n", "larger than"),
+        (".skip 0xffffffff,1\n", "bytes of fill"),
+        // Relaxation encodes at section offsets: found by fuzzing.
+        (".zero 0xfffffff8\nx: tst.l x\n", "larger than"),
+        (
+            ".section .rodata.str1.1,\"aMS\",@progbits,1\n.zero 0x4000000\n",
+            "larger than",
+        ),
+        (
+            ".comm a,0xFFFFFFF0,4\n.comm b,0x100,4\n",
+            "32-bit address space",
+        ),
+        // Values that silently lost bits.
+        ("\tmovem.l #0x12345,-(%sp)\n", "does not fit 16 bits"),
+        ("\tfmovem.x #0x100,-(%sp)\n", "does not fit 8 bits"),
+        (".L2: bra.s .L2+1\n", "out of range"),
+        (".long 1<<64\n", "out of range"),
+        // Arithmetic overflow and unbounded nesting.
+        ("x: nop\n.long x*0x7fffffffffffffff+x\n", "overflow"),
+        (
+            "x: nop\n\tmove.l (0-x*(-0x7fffffffffffffff-1))(%a0),%d0\n",
+            "overflow",
+        ),
+        (&deep, "operators"),
+        (&bitfields, "bad bitfield"),
+        // Input the parser used to misread.
+        (".data\n.ascii \"x\"y\"\n", "quoted string"),
+        ("\tmove.l %d+1,%d01\n", "cannot parse"),
+        (
+            ".globl foo\n.data\nfoo: .long 1\n.comm foo,4,4\n",
+            "also .comm",
+        ),
+        (
+            "\tnop\n.section .note.GNU-stack,\"\",@progbits\n.previous\n\tnop\n",
+            "unsupported directive",
+        ),
+    ] {
+        let e = at("68020", 0, text).expect_err(text);
+        assert!(e.iter().any(|m| m.contains(message)), "{text:?}: {e:?}");
+    }
+    // An image that ends beyond 4 GiB; one whose moved copy for the
+    // fixup search wraps is fine.
+    let e = at("68020", 0xFFFF_FFFC, "\tnop\n\tnop\n").unwrap_err();
+    assert!(
+        e.iter().any(|m| m.contains("32-bit address space")),
+        "{e:?}"
+    );
+    // Near the top the fixups are still found.
+    for origin in [0xFFFE_EFF0, 0xFFFF_FEF0] {
+        let image = at("68020", origin, "\ttst.l %d0\nx:\t.long x\n").unwrap();
+        assert_eq!(image.fixups, [2]);
+    }
+}
+
+#[test]
+fn branch_chains_relax_however_long() {
+    // Each branch reaches past the next one only after that one grew, so
+    // every round of relaxation grows one more.
+    let mut src = String::from("\t.text\n");
+    for i in (1..=1100).rev() {
+        let target = if i > 1 {
+            format!(".LA{}", i - 1)
+        } else {
+            ".LT".into()
+        };
+        src += &format!(
+            "\tjra {target}\n.LA{i}:\n\t.zero {}\n",
+            if i > 1 { 124 } else { 128 }
+        );
+    }
+    src += ".LT:\tnop\n";
+    let image = ok(&[("a.s", &src)]);
+    // The first branch grew from a byte to a word.
+    assert_eq!(image.image[..4], [0x60, 0, 0, 0x82]);
+}

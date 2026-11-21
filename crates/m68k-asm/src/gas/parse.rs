@@ -197,7 +197,7 @@ fn split_top(text: &str, sep: u8) -> Vec<&str> {
 /// the special registers.
 fn register(text: &str) -> Option<Op> {
     let name = text.trim().strip_prefix('%')?.to_ascii_lowercase();
-    let n = |s: &str| s.parse::<u8>().ok().filter(|&n| n < 8);
+    let n = |s: &str| single_digit(s).filter(|&n| n < 8);
     Some(match name.as_str() {
         "sp" => Op::AReg(7),
         "fp" => Op::AReg(6),
@@ -217,10 +217,15 @@ fn register(text: &str) -> Option<Op> {
 /// An FPU data register `%fpn`.
 fn fp_register(text: &str) -> Option<u8> {
     let name = text.trim().strip_prefix('%')?.to_ascii_lowercase();
-    name.strip_prefix("fp")?
-        .parse::<u8>()
-        .ok()
-        .filter(|&n| n < 8)
+    single_digit(name.strip_prefix("fp")?).filter(|&n| n < 8)
+}
+
+/// A register number: one digit, no sign, no leading zero.
+fn single_digit(s: &str) -> Option<u8> {
+    match s.as_bytes() {
+        [d @ b'0'..=b'9'] => Some(d - b'0'),
+        _ => None,
+    }
 }
 
 /// An FPU control register's bit: FPIAR 1, FPSR 2, FPCR 4.
@@ -269,7 +274,8 @@ fn reg_number(op: &Op) -> Option<u8> {
 }
 
 /// An index register with its size and scale: `%d0`, `%d0.l`, `%a1.w*2`,
-/// MIT `%d0:l` or `%d0:w:2`.
+/// MIT `%d0:l` or `%d0:w:2`. Without a size the index is long, as in GNU
+/// as (its `--base-size-default-32`).
 fn index_register(text: &str) -> Option<(u8, bool, u8)> {
     let t = text.trim();
     let (t, scale) = match t.split_once('*') {
@@ -279,7 +285,7 @@ fn index_register(text: &str) -> Option<(u8, bool, u8)> {
     let mut parts = t.split([':', '.']);
     let reg = reg_number(&register(parts.next()?)?)?;
     let long = match parts.next().map(|s| s.trim().to_ascii_lowercase()) {
-        None => false,
+        None => true,
         Some(s) if s == "w" => false,
         Some(s) if s == "l" => true,
         Some(_) => return None,
@@ -334,6 +340,8 @@ struct FileParser {
     counts: Vec<usize>,
     /// `.local` + `.comm`: `(name, size, align, line)`.
     local_commons: Vec<(String, u32, u32, usize)>,
+    /// Bytes of non-zero `.skip` fill so far, which are held in memory.
+    filled: u64,
     errors: LineErrors,
 }
 
@@ -413,20 +421,16 @@ impl FileParser {
     /// difference it cannot know yet (a label further down, an item
     /// between) keeps the 16-bit form, as it does.
     fn disp(&self, e: Expr, n: u8) -> Op {
-        let here = self.place();
-        let key = |(s, k): (usize, usize)| (s as i64) << 32 | k as i64;
+        // Each place is a symbol of its own: the value is known to be 0
+        // only when the places cancel and the constant is 0.
         let known = e
             .eval(
-                &mut |name: &str| {
-                    self.places
-                        .get(name)
-                        .map(|&p| key(p))
-                        .ok_or_else(String::new)
-                },
-                Some(key(here)),
+                &mut |name: &str| self.places.get(name).copied().ok_or_else(String::new),
+                Some(self.place()),
             )
             .ok()
-            .map(|lin| lin.terms.iter().map(|&(v, c)| v * c).sum::<i64>() + lin.k);
+            .filter(|lin| lin.terms.is_empty())
+            .map(|lin| lin.k);
         if known == Some(0) {
             Op::Ind(n)
         } else {
@@ -492,9 +496,8 @@ impl FileParser {
             }
             let name = &rest[..i];
             rest = rest[i + 1..].trim_start();
-            if self.discarding {
-                continue;
-            }
+            // A numeric label counts even where it is dropped: `1b` after
+            // it refers to it, as in GNU as.
             let name = if numeric {
                 let n: u32 = name.parse().map_err(|_| format!("bad label '{name}'"))?;
                 *self.numeric.entry(n).or_insert(0) += 1;
@@ -502,7 +505,9 @@ impl FileParser {
             } else {
                 name.to_string()
             };
-            self.push(Item::Label(name), line)?;
+            if !self.discarding {
+                self.push(Item::Label(name), line)?;
+            }
         }
         if rest.is_empty() {
             return Ok(());
@@ -560,7 +565,14 @@ impl FileParser {
             _ => {}
         }
         if self.discarding {
-            return Ok(());
+            match name {
+                // Not tied to a section: they still count.
+                ".globl" | ".global" | ".local" | ".comm" => {}
+                // These would leave the dropped section; refused below as
+                // everywhere else rather than skipped with what follows.
+                ".previous" | ".pushsection" | ".popsection" => {}
+                _ => return Ok(()),
+            }
         }
         let a = self.args(args);
         match name {
@@ -670,6 +682,13 @@ impl FileParser {
                 } else if fill == 0 {
                     self.push(Item::Zero(n), line)?;
                 } else {
+                    self.filled += u64::from(n);
+                    if self.filled > u64::from(super::MAX_IMAGE) {
+                        return Err(format!(
+                            "{name}: more than {} bytes of fill",
+                            super::MAX_IMAGE
+                        ));
+                    }
                     self.push(Item::Bytes(vec![fill as u8; n as usize]), line)?;
                 }
             }
@@ -750,6 +769,9 @@ impl FileParser {
                     .map(BitfieldSpec::Immediate)
                     .ok_or_else(|| format!("bad bitfield '{t}'")),
             };
+            if ea.contains('{') {
+                return Err(format!("bad bitfield '{t}'"));
+            }
             let ea = self.operand(ea)?;
             return Ok(Op::Bitfield(Box::new(ea), field(offset)?, field(width)?));
         }
@@ -923,21 +945,37 @@ fn last_group(t: &str) -> Option<usize> {
     None
 }
 
-/// The bytes of a `"..."` literal.
+/// The bytes of a `"..."` literal; adjacent literals (`"ab" "cd"`) are
+/// joined, as GNU as does.
 fn string_literal(s: &str) -> Result<Vec<u8>, String> {
-    let body = s
-        .strip_prefix('"')
-        .and_then(|t| t.strip_suffix('"'))
-        .ok_or_else(|| format!("expected a quoted string, got {s}"))?;
-    let b = body.as_bytes();
+    let b = s.trim().as_bytes();
+    let bad = || format!("expected a quoted string, got {s}");
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
-    while i < b.len() {
-        let (c, used) = parse_escape(&b[i..]).ok_or("bad escape in string")?;
-        out.push(c);
-        i += used;
+    loop {
+        if b.get(i) != Some(&b'"') {
+            return Err(bad());
+        }
+        i += 1;
+        loop {
+            match b.get(i) {
+                None => return Err(bad()),
+                Some(b'"') => break,
+                Some(_) => {
+                    let (c, used) = parse_escape(&b[i..]).ok_or("bad escape in string")?;
+                    out.push(c);
+                    i += used;
+                }
+            }
+        }
+        i += 1;
+        while b.get(i).is_some_and(u8::is_ascii_whitespace) {
+            i += 1;
+        }
+        if i == b.len() {
+            return Ok(out);
+        }
     }
-    Ok(out)
 }
 
 /// Standard base64 with `=` padding.
@@ -982,6 +1020,7 @@ pub fn parse_file(name: &str, text: &str) -> (FileModel, LineErrors) {
         places: HashMap::new(),
         counts: Vec::new(),
         local_commons: Vec::new(),
+        filled: 0,
         errors: Vec::new(),
     };
     // GNU as creates these three in every object, in this order.

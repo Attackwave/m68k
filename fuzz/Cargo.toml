@@ -85,3 +85,10 @@ path = "fuzz_targets/atari_prg.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "gas_syntax"
+path = "fuzz_targets/gas_syntax.rs"
+test = false
+doc = false
+bench = false

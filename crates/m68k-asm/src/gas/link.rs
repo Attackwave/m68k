@@ -18,13 +18,18 @@ use m68k_core::operands::{MemoryIndirectOperand, Operand};
 
 use super::expr::{Expr, Linear};
 use super::parse::{Class, FileModel, Insn, Item, Op, SectionModel};
-use super::{GasError, GasImage, GasSection, GasSymbol};
+use super::{GasError, GasImage, GasSection, GasSymbol, MAX_IMAGE};
 use crate::encoder::encode_instruction;
 
 /// How far the probe encoding moves the image: a multiple of 4 KiB, so
 /// alignment padding stays the same, that changes both words of a
 /// longword.
 const PROBE: u32 = 0x0001_1000;
+
+/// The highest address a program may end at: the last 256 bytes of the
+/// address space stay free, since the encoder works with addresses past
+/// the instruction it encodes.
+const TOP: u64 = 0xFFFF_FF00;
 
 /// The symbols the link defines.
 const LINKER_SYMBOLS: [&str; 3] = ["__image_end", "__bss_start", "__bss_end"];
@@ -144,11 +149,14 @@ struct Linker {
     failed: std::collections::HashSet<(usize, usize)>,
 }
 
-/// Addresses of one layout.
+/// Addresses of one layout. They wrap at 4 GiB, which only the probe
+/// layout may reach: `top` says whether the real one fits.
 struct Layout {
     base: Vec<u32>,
     common: Vec<u32>,
     linker: [u32; 3],
+    /// The end of BSS without wrapping.
+    top: u64,
 }
 
 impl Linker {
@@ -253,6 +261,12 @@ impl Linker {
                         Some(Def::Linker(_)) => {
                             self.error(f, line, format!("symbol '{name}' is defined by the link"))
                         }
+                        Some(Def::Item { sec, .. }) if self.secs[sec].file == f => self.error(
+                            f,
+                            line,
+                            format!("'{name}' is defined in this file and also .comm"),
+                        ),
+                        // A definition in another file wins, as with ld.
                         _ => {}
                     },
                     None => {
@@ -418,7 +432,7 @@ impl Linker {
                     let target = i64::from(self.secs[si].offs[item]) + addend;
                     let disp = target - i64::from(off) - 2;
                     let needed = if (-128..=127).contains(&disp)
-                        && disp != 0
+                        && !matches!(disp, 0 | -1)
                         && !matches!(kind, BranchKind::Db(_) | BranchKind::FJ)
                     {
                         Reach::Byte
@@ -500,10 +514,11 @@ impl Linker {
         for (ii, form) in sec.forms.iter().enumerate() {
             sec.offs.push(off);
             if let (Form::Align, Item::Align { align, max, .. }) = (form, &sec.model.items[ii].0) {
-                let pad = off.next_multiple_of(*align) - off;
+                let pad = off.checked_next_multiple_of(*align).unwrap_or(u32::MAX) - off;
                 sec.sizes[ii] = if max.is_some_and(|m| pad > m) { 0 } else { pad };
             }
-            off += sec.sizes[ii];
+            // Saturates beyond 4 GiB; `check_size` refuses such a section.
+            off = off.saturating_add(sec.sizes[ii]);
         }
         sec.size = off;
     }
@@ -647,15 +662,31 @@ impl Linker {
         order
     }
 
+    /// Whether the image stays below [`MAX_IMAGE`] before strings are
+    /// merged (merging only shrinks it), which bounds what the link holds
+    /// in memory.
+    fn check_size(&mut self) -> Result<(), ()> {
+        let stored: u64 = self
+            .link_order()
+            .iter()
+            .map(|&si| u64::from(self.secs[si].size) + u64::from(self.secs[si].model.align))
+            .sum();
+        if stored > u64::from(MAX_IMAGE) {
+            self.error(0, 0, format!("the image is larger than {MAX_IMAGE} bytes"));
+            return Err(());
+        }
+        Ok(())
+    }
+
     fn layout(&self, origin: u32) -> Layout {
         let mut base = vec![0u32; self.secs.len()];
-        let mut dot = origin;
+        let mut dot = u64::from(origin);
         for si in self.link_order() {
-            dot = dot.next_multiple_of(self.secs[si].model.align);
-            base[si] = dot;
-            dot += self.stored_size(si);
+            dot = dot.next_multiple_of(u64::from(self.secs[si].model.align));
+            base[si] = dot as u32;
+            dot += u64::from(self.stored_size(si));
         }
-        let image_end = dot;
+        let image_end = dot as u32;
         let bss: Vec<usize> = (0..self.secs.len())
             .filter(|&s| self.secs[s].model.class == Class::Bss)
             .collect();
@@ -665,22 +696,23 @@ impl Linker {
             .chain(self.commons.iter().map(|c| c.2))
             .max()
             .unwrap_or(1);
-        dot = dot.next_multiple_of(align);
+        dot = dot.next_multiple_of(u64::from(align));
         for si in bss {
-            dot = dot.next_multiple_of(self.secs[si].model.align);
-            base[si] = dot;
-            dot += self.secs[si].size;
+            dot = dot.next_multiple_of(u64::from(self.secs[si].model.align));
+            base[si] = dot as u32;
+            dot += u64::from(self.secs[si].size);
         }
         let mut common = Vec::new();
         for &(_, size, align) in &self.commons {
-            dot = dot.next_multiple_of(align);
-            common.push(dot);
-            dot += size;
+            dot = dot.next_multiple_of(u64::from(align));
+            common.push(dot as u32);
+            dot += u64::from(size);
         }
         Layout {
             base,
             common,
-            linker: [image_end, image_end, dot],
+            linker: [image_end, image_end, dot as u32],
+            top: dot,
         }
     }
 
@@ -740,10 +772,10 @@ impl Linker {
 
     fn address(&self, layout: &Layout, def: Def) -> Result<u32, String> {
         Ok(match def {
-            Def::Item { sec, item } if self.secs[sec].model.merge_strings => {
-                layout.base[self.secs[sec].holder] + self.mapped(sec, self.secs[sec].offs[item])?
-            }
-            Def::Item { sec, item } => layout.base[sec] + self.secs[sec].offs[item],
+            Def::Item { sec, item } if self.secs[sec].model.merge_strings => layout.base
+                [self.secs[sec].holder]
+                .wrapping_add(self.mapped(sec, self.secs[sec].offs[item])?),
+            Def::Item { sec, item } => layout.base[sec].wrapping_add(self.secs[sec].offs[item]),
             Def::Common(c) => layout.common[c],
             Def::Linker(i) => layout.linker[i],
         })
@@ -757,22 +789,27 @@ impl Linker {
         let mut value = lin.k;
         let mut weight = 0;
         let def_of = |id: SymId| if id == DOT { Ok(dot) } else { self.sym_def(id) };
+        let overflow = || "overflow in expression".to_string();
         let mut by_sec: HashMap<usize, i64> = HashMap::new();
         for &(id, c) in &lin.terms {
             if let Def::Item { sec, .. } = def_of(id)? {
-                *by_sec.entry(sec).or_default() += c;
+                let sum = by_sec.entry(sec).or_default();
+                *sum = sum.checked_add(c).ok_or_else(overflow)?;
             }
         }
         for &(id, c) in &lin.terms {
             let def = def_of(id)?;
-            weight += c;
+            weight = c.checked_add(weight).ok_or_else(overflow)?;
             let addr = match def {
                 Def::Item { sec, item } if by_sec[&sec] == 0 => {
                     i64::from(self.secs[sec].offs[item])
                 }
                 _ => i64::from(self.address(layout, def)?),
             };
-            value += c * addr;
+            value = c
+                .checked_mul(addr)
+                .and_then(|v| v.checked_add(value))
+                .ok_or_else(overflow)?;
         }
         Ok(Val { value, weight })
     }
@@ -786,6 +823,38 @@ impl Linker {
         ev: &mut dyn FnMut(&Expr) -> Result<Val, String>,
         pcrel: Option<(usize, bool)>,
     ) -> Result<Vec<u16>, String> {
+        let (words, numeric_pc) = self.encode_insn_at(insn, pc, ev, pcrel, 0)?;
+        if !numeric_pc {
+            return Ok(words);
+        }
+        // A numeric `d(%pc)` counts from its extension word, which is not
+        // always the word after the opcode: `mulu.l`, FPU and bitfield
+        // instructions put one of their own before it. Moving the target
+        // by 2 changes only the word that holds the displacement.
+        let moved = match self.encode_insn_at(insn, pc, ev, pcrel, 2) {
+            Ok((w, _)) => w,
+            Err(_) => self.encode_insn_at(insn, pc, ev, pcrel, -2)?.0,
+        };
+        match words.iter().zip(&moved).position(|(a, b)| a != b) {
+            Some(k) if k > 1 => {
+                let shift = 2 * (k as i64 - 1);
+                Ok(self.encode_insn_at(insn, pc, ev, pcrel, shift)?.0)
+            }
+            _ => Ok(words),
+        }
+    }
+
+    /// [`Self::encode_insn`] with a numeric PC displacement counted from
+    /// `pc + 2 + shift`; also says whether there was one.
+    fn encode_insn_at(
+        &self,
+        insn: &Insn,
+        pc: u32,
+        ev: &mut dyn FnMut(&Expr) -> Result<Val, String>,
+        pcrel: Option<(usize, bool)>,
+        shift: i64,
+    ) -> Result<(Vec<u16>, bool), String> {
+        let numeric_pc = std::cell::Cell::new(false);
         let (mnemonic, size) = gas_choice(insn)?;
         let fpu = mnemonic.starts_with('F');
         // The size of an FPU operand in memory or an immediate that holds
@@ -829,7 +898,10 @@ impl Linker {
             let pc_target = |v: Val| -> Result<i32, String> {
                 match v.weight {
                     1 => Ok(v.value as i32),
-                    0 if i == 0 => Ok((i64::from(pc) + 2 + v.value) as i32),
+                    0 if i == 0 => {
+                        numeric_pc.set(true);
+                        Ok((i64::from(pc) + 2 + shift + v.value) as i32)
+                    }
                     0 => Err(
                         "a numeric PC displacement is supported in the first operand only".into(),
                     ),
@@ -934,13 +1006,15 @@ impl Linker {
                     if mnemonic == "FMOVEM" {
                         // As for MOVEM, the mask as it is encoded: the
                         // encoder reverses it for every mode but -(An).
-                        let raw = v as u8;
+                        let raw = u8::try_from(v)
+                            .map_err(|_| format!("register mask {v} does not fit 8 bits"))?;
                         let predec = matches!(insn.ops.get(1), Some(Op::PreDec(_)));
                         Operand::Immediate(i64::from(if predec { raw } else { raw.reverse_bits() }))
                     } else if mnemonic == "MOVEM" {
                         // GNU as takes the mask as it is encoded; the
                         // encoder wants bit 0 = %d0 in every mode.
-                        let raw = v as u16;
+                        let raw = u16::try_from(v)
+                            .map_err(|_| format!("register mask {v} does not fit 16 bits"))?;
                         Operand::Immediate(i64::from(if movem_predec {
                             raw.reverse_bits()
                         } else {
@@ -992,7 +1066,7 @@ impl Linker {
         {
             words[1] &= !7;
         }
-        Ok(words)
+        Ok((words, numeric_pc.get()))
     }
 
     /// The bytes of item `ii` of section `si`.
@@ -1005,7 +1079,7 @@ impl Linker {
     ) -> Result<Vec<u8>, String> {
         let sec = &self.secs[si];
         let file = sec.file;
-        let pc = layout.base[si] + sec.offs[ii];
+        let pc = layout.base[si].wrapping_add(sec.offs[ii]);
         let here = Def::Item { sec: si, item: ii };
         let mut ev = |e: &Expr| self.value(layout, file, here, e);
         let item = &sec.model.items[ii].0;
@@ -1084,11 +1158,11 @@ impl Linker {
     fn encode_image(&mut self, origin: u32, table: &[u8]) -> (Vec<u8>, Vec<(u32, usize, usize)>) {
         let layout = self.layout(origin);
         let end = layout.linker[0];
-        let mut image = vec![0u8; (end - origin) as usize];
+        let mut image = vec![0u8; end.wrapping_sub(origin) as usize];
         let mut locs = Vec::new();
         let mut errors = Vec::new();
         for si in self.link_order() {
-            let start = (layout.base[si] - origin) as usize;
+            let start = layout.base[si].wrapping_sub(origin) as usize;
             if let Some(block) = &self.secs[si].merged {
                 image[start..start + block.len()].copy_from_slice(block);
                 continue;
@@ -1180,7 +1254,11 @@ fn sizing_value(e: &Expr) -> Result<Val, String> {
     let lin: Linear<u8> = e.eval(&mut |_| Ok(0), Some(0))?;
     Ok(Val {
         value: lin.k,
-        weight: lin.terms.iter().map(|t| t.1).sum(),
+        weight: lin
+            .terms
+            .iter()
+            .try_fold(0i64, |w, t| w.checked_add(t.1))
+            .ok_or("overflow in expression")?,
     })
 }
 
@@ -1267,7 +1345,8 @@ fn branch_words(
     let abs = |op: u16| vec![op, (target >> 16) as u16, target as u16];
     Ok(match (reach, kind) {
         (Reach::Byte, _) => {
-            if !(-128..=127).contains(&disp) || disp == 0 {
+            // 0 and -1 ($00, $FF) mark the word and 32-bit forms.
+            if !(-128..=127).contains(&disp) || matches!(disp, 0 | -1) {
                 return Err(format!("short branch displacement {disp} out of range"));
             }
             vec![op(cc) | (disp as u8 as u16)]
@@ -1373,11 +1452,26 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
     };
     l.define_symbols();
     l.classify();
+    // Before relaxation as well: it encodes at section offsets, which must
+    // stay far from 4 GiB.
     for si in 0..l.secs.len() {
+        l.offsets(si);
+    }
+    if l.check_size().is_err() {
+        return Err(l.errors);
+    }
+    for si in 0..l.secs.len() {
+        // Forms only grow, a branch at most twice, so every round but the
+        // last grows one at least.
+        let relaxable = l.secs[si]
+            .forms
+            .iter()
+            .filter(|f| matches!(f, Form::Branch { fixed: false, .. } | Form::PcRel { .. }))
+            .count();
         let mut rounds = 0;
         while l.relax_pass(si) {
             rounds += 1;
-            if rounds > 1000 {
+            if rounds > 2 * relaxable + 1 {
                 let file = l.secs[si].file;
                 l.error(
                     file,
@@ -1388,7 +1482,20 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
             }
         }
     }
+    if l.check_size().is_err() {
+        return Err(l.errors);
+    }
     l.merge_strings();
+    let first = l.layout(origin);
+    let (top, image_end) = (first.top, u64::from(first.linker[0]));
+    if top > TOP {
+        l.error(
+            0,
+            0,
+            format!("the program ends at ${top:X}, beyond the 32-bit address space"),
+        );
+        return Err(l.errors);
+    }
 
     let table_item = l
         .secs
@@ -1423,7 +1530,14 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
                 .sort_by(|a, b| (&a.file, a.line).cmp(&(&b.file, b.line)));
             return Err(l.errors);
         }
-        let (moved, _) = l.encode_image(origin.wrapping_add(PROBE), &table);
+        // Moved down where moving up would pass `TOP` (only the stored
+        // part is encoded, at least `TOP - PROBE - MAX_IMAGE` up then).
+        let probe = if image_end + u64::from(PROBE) <= TOP {
+            PROBE
+        } else {
+            PROBE.wrapping_neg()
+        };
+        let (moved, _) = l.encode_image(origin.wrapping_add(probe), &table);
         if !l.errors.is_empty() {
             return Err(l.errors);
         }
@@ -1442,7 +1556,7 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
                     .map(|s| u32::from_be_bytes(s.try_into().unwrap()))
             };
             if let (Some(a), Some(b)) = (word(&image), word(&moved))
-                && b.wrapping_sub(a) == PROBE
+                && b.wrapping_sub(a) == probe
             {
                 if !k.is_multiple_of(2) {
                     let (f, line) = loc_of(k);

@@ -1,0 +1,3 @@
+__image_end 8b
+__bss_start 8b
+__bss_end 8c
