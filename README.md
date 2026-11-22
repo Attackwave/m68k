@@ -324,15 +324,19 @@ m68k-asm --syntax gas --cpu 68020 -o prog.bin crt0.s main.s crtend.s
 ```
 
 The image holds every text section (`.text`, `.text.*`), then every
-read-only data section (`.rodata*`), then every data section (`.data*`),
-each in command-line order. BSS (`.bss*`, `.comm`) follows and is not
-stored. Symbols are local to their file unless `.globl` or `.weak`; a
+read-only data section (`.rodata*`), the constructor and destructor
+arrays (`.init_array*`, `.fini_array*`, each sorted by priority as `ld`
+does: `.init_array.N` by `N`, the plain one last), then every data
+section (`.data*`), each in command-line order. BSS (`.bss*`, `.comm`)
+follows and is not stored. Of a COMDAT group (`"axG"`, C++ templates and
+inline functions) the first file's sections are kept and every later
+copy is dropped. Symbols are local to their file unless `.globl` or `.weak`; a
 weak definition yields to one that is not, and a weak symbol nothing
 defines is 0. `.set`, `.equ` and `name = expr` define a symbol as an
 expression (the aliases libc code uses, or constants). A switch table
 entry (`.word a-b`) that does not fit 16 bits is pointed at a long jump
 placed after the table, as GNU as does it; identical strings
-in `"aMS"` sections are stored once. The layout, the relaxation of
+in `"aMS"` sections (1-, 2- or 4-byte characters) are stored once. The layout, the relaxation of
 `jra`/`jbsr`/`jXX` (beyond 16-bit reach or to another file: absolute
 `jmp`/`jsr` on a 68000/68010, `bra.l`/`bsr.l`/`bcc.l` from the 68020 on;
 `fjXX` likewise to `fbcc.l`) and every encoding, including the 68020 full-format indices and the FPU
@@ -340,8 +344,17 @@ in `"aMS"` sections are stored once. The layout, the relaxation of
 `-m68040` on, floating-point constants as bit patterns), match GNU as
 with `ld`; `tests/gas/` holds the
 comparison scripts. The link defines `__image_end`, `__bss_start` (the
-same address) and `__bss_end`; a difference of any two symbols is a plain
-number.
+same address) and `__bss_end`, and `__init_array_start`/`_end` and
+`__fini_array_start`/`_end` around the arrays (start-up code calls the
+constructors in that order, the destructors in reverse); a difference of
+any two symbols is a plain number. A pointer to a weak symbol nothing
+defines stays 0 and gets no fixup.
+
+C++ works without exceptions: `g++ -fno-exceptions -fno-pic
+-fomit-frame-pointer -S`, with RTTI or without. Call-frame directives
+(`.cfi_*`) are read and dropped like debug sections, since a flat image
+has no unwinder; `.gcc_except_table` and `.uleb128`, which exceptions
+need, are refused.
 
 `.reloc_table`, which must end the image (the data section of the file
 given last), emits the offsets of every longword that holds an image

@@ -244,8 +244,8 @@ fn errors_name_file_and_line() {
 fn unsupported_input_is_refused() {
     for (src, what) in [
         (
-            "\t.section .init_array,\"aw\"\n",
-            "section '.init_array' is not supported",
+            "\t.section .ctors,\"aw\"\n",
+            "section '.ctors' is not supported",
         ),
         (
             "\t.section .rodata.cst4,\"aM\",@progbits,4\n",
@@ -421,6 +421,28 @@ fn branch_chains_relax_however_long() {
     let image = ok(&[("a.s", &src)]);
     // The first branch grew from a byte to a word.
     assert_eq!(image.image[..4], [0x60, 0, 0, 0x82]);
+}
+
+#[test]
+fn later_comdat_copies_are_dropped() {
+    let group = |body: &str| format!("\t.section .text.g,\"axG\",@progbits,g,comdat\n{body}");
+    let a = group("\t.weak g\ng:\n\trts\n");
+    // A switch table in the copy that goes, its long-jump place in a
+    // section that stays: found while adding groups.
+    let b = group("\t.weak g\ng:\n\tnop\n\tnop\nx:\n\t.word y-x\ny:\n\t.text\nz:\n\tjbsr g\n");
+    let image = ok(&[("a.s", &a), ("b.s", &b)]);
+    // a's g at 0, b's `jbsr g` (`jsr g.l`, another file) at 4; b's copy
+    // with its `nop`s is gone.
+    assert_eq!(
+        image.image,
+        [0x4e, 0x75, 0, 0, 0x4e, 0xb9, 0, 0, 0, 0, 0, 0]
+    );
+    assert_eq!(image.fixups, [6]);
+    assert!(
+        errors(&[("a.s", "\t.section .text.g,\"axG\",@progbits\n")])
+            .iter()
+            .any(|m| m.contains("needs a name"))
+    );
 }
 
 #[test]

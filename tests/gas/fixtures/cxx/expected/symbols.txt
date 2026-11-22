@@ -1,0 +1,3 @@
+__image_end 8c
+__bss_start 8c
+__bss_end 90
