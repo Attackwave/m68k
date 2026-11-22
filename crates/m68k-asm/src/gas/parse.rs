@@ -16,6 +16,10 @@ use super::expr::{Expr, is_sym_char, is_sym_start, parse_escape, parse_expr};
 pub enum Class {
     Text,
     Rodata,
+    /// `.init_array`, `.init_array.N`: constructor pointers.
+    InitArray,
+    /// `.fini_array`, `.fini_array.N`: destructor pointers.
+    FiniArray,
     Data,
     Bss,
 }
@@ -24,9 +28,13 @@ pub enum Class {
 pub struct SectionModel {
     pub name: String,
     pub class: Class,
-    /// `"aMS"` with entity size 1: NUL-terminated strings the link may
-    /// share between files.
-    pub merge_strings: bool,
+    /// `"aMS"`: strings of 1-, 2- or 4-byte characters, ended by a zero
+    /// character, which the link may share between files. The entity
+    /// size.
+    pub merge_strings: Option<u8>,
+    /// The signature of the COMDAT group (`"G"`): the link keeps the
+    /// group's sections of the first file that has it.
+    pub group: Option<String>,
     pub align: u32,
     pub items: Vec<(Item, usize)>,
 }
@@ -138,6 +146,10 @@ fn class_of(name: &str) -> Option<Class> {
         Some(Class::Text)
     } else if is(".rodata") {
         Some(Class::Rodata)
+    } else if is(".init_array") {
+        Some(Class::InitArray)
+    } else if is(".fini_array") {
+        Some(Class::FiniArray)
     } else if is(".data") {
         Some(Class::Data)
     } else if is(".bss") {
@@ -373,6 +385,7 @@ impl FileParser {
         name: &str,
         flags: Option<&str>,
         entsize: Option<&str>,
+        group: Option<&str>,
     ) -> Result<(), String> {
         if is_discarded(name) {
             self.discarding = true;
@@ -380,21 +393,43 @@ impl FileParser {
         }
         self.discarding = false;
         let class = class_of(name).ok_or_else(|| {
-            format!("section '{name}' is not supported (only .text*, .rodata*, .data*, .bss*)")
+            format!(
+                "section '{name}' is not supported (only .text*, .rodata*, .data*, .bss*, \
+                 .init_array*, .fini_array*)"
+            )
         })?;
-        if let Some(i) = self.model.sections.iter().position(|s| s.name == name) {
+        let flags = flags.unwrap_or("");
+        let group = match (flags.contains('G'), group.map(str::trim)) {
+            (false, _) => None,
+            (true, Some(g)) if !g.is_empty() => Some(g.to_string()),
+            (true, _) => return Err(format!("section '{name}': a group (\"G\") needs a name")),
+        };
+        // The same name in another group is another section, as in GNU as.
+        if let Some(i) = self
+            .model
+            .sections
+            .iter()
+            .position(|s| s.name == name && s.group == group)
+        {
             self.current = Some(i);
             return Ok(());
         }
-        let flags = flags.unwrap_or("");
-        let merge = flags.contains('M');
-        if merge && !(flags.contains('S') && entsize.map(str::trim) == Some("1")) {
-            return Err(format!(
-                "section '{name}': only string merging with entity size 1 (\"aMS\",@progbits,1) \
-                 is supported"
-            ));
-        }
-        if merge && class == Class::Bss {
+        let merge = if flags.contains('M') {
+            match (flags.contains('S'), entsize.map(str::trim)) {
+                (true, Some("1")) => Some(1),
+                (true, Some("2")) => Some(2),
+                (true, Some("4")) => Some(4),
+                _ => {
+                    return Err(format!(
+                        "section '{name}': only string merging (\"aMS\",@progbits,N with N 1, 2 \
+                         or 4) is supported"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        if merge.is_some() && class == Class::Bss {
             return Err(format!("section '{name}': a BSS section cannot be merged"));
         }
         // GNU as gives the three standard sections a 4-byte alignment;
@@ -408,6 +443,7 @@ impl FileParser {
             name: name.to_string(),
             class,
             merge_strings: merge,
+            group,
             align,
             items: Vec::new(),
         });
@@ -585,7 +621,7 @@ impl FileParser {
     fn directive(&mut self, name: &str, args: &str, line: usize) -> Result<(), String> {
         match name {
             ".text" | ".data" | ".bss" if args.is_empty() => {
-                return self.switch_section(name, None, None);
+                return self.switch_section(name, None, None, None);
             }
             ".text" | ".data" | ".bss" => {
                 return Err(format!("subsections ({name} {args}) are not supported"));
@@ -593,11 +629,15 @@ impl FileParser {
             ".section" => {
                 let a = self.args(args);
                 let name = a.first().map(|s| s.trim_matches('"')).unwrap_or("");
-                return self.switch_section(
-                    name,
-                    a.get(1).map(|f| f.trim_matches('"')),
-                    a.get(3).copied(),
-                );
+                let flags = a.get(1).map(|f| f.trim_matches('"'));
+                // `name,"flags",@type[,entsize][,group,comdat]`: the entity
+                // size comes first when the section is mergeable.
+                let (entsize, group) = if flags.is_some_and(|f| f.contains('M')) {
+                    (a.get(3).copied(), a.get(4).copied())
+                } else {
+                    (None, a.get(3).copied())
+                };
+                return self.switch_section(name, flags, entsize, group);
             }
             // Information for tools that read object files: no bytes.
             ".type" | ".size" | ".ident" | ".file" | ".loc" | ".hidden" | ".internal"
@@ -1110,7 +1150,7 @@ pub fn parse_file(name: &str, text: &str) -> (FileModel, LineErrors) {
     };
     // GNU as creates these three in every object, in this order.
     for s in [".text", ".data", ".bss"] {
-        let _ = p.switch_section(s, None, None);
+        let _ = p.switch_section(s, None, None, None);
     }
     p.current = Some(0);
     for (i, raw) in text.lines().enumerate() {
@@ -1121,7 +1161,7 @@ pub fn parse_file(name: &str, text: &str) -> (FileModel, LineErrors) {
             }
         }
     }
-    let _ = p.switch_section(".bss", None, None);
+    let _ = p.switch_section(".bss", None, None, None);
     for (name, size, align, line) in std::mem::take(&mut p.local_commons) {
         let items = [
             Item::Align {

@@ -4,9 +4,11 @@
 Every file is assembled on its own with `m68k-linux-gnu-as -m68000`
 (`-m$M68K_CPU` when that is set),
 the objects are linked with a script that gives the layout m68k-asm
-produces (text, read-only data, data in one stored section at 0, BSS
-behind it), and `objcopy -O binary` writes the image. The fixups are the
-R_68K_32 relocations `ld --emit-relocs` keeps for that section.
+produces (text, read-only data, constructor and destructor arrays and
+data stored from 0, BSS behind it), and `objcopy -O binary` writes the
+image. The fixups are the R_68K_32 relocations `ld --emit-relocs` keeps
+for the stored sections, except those against a weak symbol nothing
+defines: it stays 0, which a loader must not move.
 
     gnu_reference.py OUT_DIR FILE.s...
 
@@ -37,13 +39,28 @@ SECTIONS {
   .image : {
     *(.text .text.*)
     *(.rodata .rodata.*)
+  }
+  .init_array : {
+    __init_array_start = .;
+    KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+    KEEP(*(.init_array))
+    __init_array_end = .;
+  }
+  .fini_array : {
+    __fini_array_start = .;
+    KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*)))
+    KEEP(*(.fini_array))
+    __fini_array_end = .;
+  }
+  /* At `.` itself: the data sections align one by one. */
+  .data . : {
     *(.data .data.*)
     __image_end = .;
   }
   __bss_start = .;
   .bss : { *(.bss .bss.*) *(COMMON) }
   __bss_end = .;
-  /DISCARD/ : { *(.comment) *(.note.*) }
+  /DISCARD/ : { *(.comment) *(.note.*) *(.eh_frame) }
 }
 """
 
@@ -70,8 +87,16 @@ def reference(out_dir, sources, cpu=CPU):
         elf = os.path.join(work, "image.elf")
         run(PREFIX + "ld", "-T", script, "--emit-relocs", "--no-warn-rwx-segments",
             "-e", "0", "-o", elf, *objects)
-        run(PREFIX + "objcopy", "-O", "binary", "-j", ".image",
+        stored = (".image", ".init_array", ".fini_array", ".data")
+        run(PREFIX + "objcopy", "-O", "binary",
+            *(x for name in stored for x in ("-j", name)),
             elf, os.path.join(out_dir, "image.bin"))
+
+        undefined_weak = set()
+        for line in output(PREFIX + "nm", elf).splitlines():
+            fields = line.split()
+            if len(fields) == 2 and fields[0] in ("w", "v"):
+                undefined_weak.add(fields[1])
 
         fixups = []
         section = None
@@ -80,9 +105,12 @@ def reference(out_dir, sources, cpu=CPU):
                 section = line.split("'")[1]
                 continue
             fields = line.split()
-            if section != ".rela.image" or len(fields) < 3 or not fields[2].startswith("R_68K"):
+            if (section not in tuple(".rela" + name for name in stored)
+                    or len(fields) < 3 or not fields[2].startswith("R_68K")):
                 continue
             kind = fields[2]
+            if len(fields) > 4 and fields[4] in undefined_weak:
+                continue
             if kind == "R_68K_32":
                 fixups.append(int(fields[0], 16))
             elif not kind.startswith("R_68K_PC"):

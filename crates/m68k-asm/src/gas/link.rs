@@ -32,7 +32,15 @@ const PROBE: u32 = 0x0001_1000;
 const TOP: u64 = 0xFFFF_FF00;
 
 /// The symbols the link defines.
-const LINKER_SYMBOLS: [&str; 3] = ["__image_end", "__bss_start", "__bss_end"];
+const LINKER_SYMBOLS: [&str; 7] = [
+    "__image_end",
+    "__bss_start",
+    "__bss_end",
+    "__init_array_start",
+    "__init_array_end",
+    "__fini_array_start",
+    "__fini_array_end",
+];
 
 /// `.` in an expression: the location of the item being encoded.
 const DOT: usize = usize::MAX;
@@ -192,7 +200,7 @@ struct Linker {
 struct Layout {
     base: Vec<u32>,
     common: Vec<u32>,
-    linker: [u32; 3],
+    linker: [u32; 7],
     /// The end of BSS without wrapping.
     top: u64,
 }
@@ -628,7 +636,8 @@ impl Linker {
 
     /// `a-b+n` of a word, when `a` and `b` are labels of one section.
     fn word_parts(&self, (si, ii): (usize, usize)) -> Option<(usize, usize, usize, i64)> {
-        let Item::Data { expr, .. } = &self.secs[si].model.items[ii].0 else {
+        // A dropped COMDAT copy has no items left.
+        let Some((Item::Data { expr, .. }, _)) = self.secs[si].model.items.get(ii) else {
             return None;
         };
         let file = self.secs[si].file;
@@ -721,16 +730,17 @@ impl Linker {
     /// each distinct string once, a string that ends another one inside
     /// it, the block in the first such section.
     fn merge_strings(&mut self) {
-        let mut groups: HashMap<u32, Vec<usize>> = HashMap::new();
+        let mut groups: HashMap<(u8, u32), Vec<usize>> = HashMap::new();
         for &si in &self.link_order() {
-            if self.secs[si].model.merge_strings {
+            if let Some(size) = self.secs[si].model.merge_strings {
                 groups
-                    .entry(self.secs[si].model.align)
+                    .entry((size, self.secs[si].model.align))
                     .or_default()
                     .push(si);
             }
         }
-        for (_, members) in groups {
+        for ((size, _), members) in groups {
+            let size = usize::from(size);
             let mut unique: Vec<Vec<u8>> = Vec::new();
             let mut index: HashMap<Vec<u8>, usize> = HashMap::new();
             let mut per_sec: Vec<(usize, Strings)> = Vec::new();
@@ -753,7 +763,12 @@ impl Linker {
                         }
                     }
                 }
-                if bytes.last().is_some_and(|&b| b != 0) {
+                if bytes.len() % size != 0
+                    || bytes
+                        .rchunks(size)
+                        .next()
+                        .is_some_and(|c| c.iter().any(|&b| b != 0))
+                {
                     let file = self.secs[si].file;
                     self.error(
                         file,
@@ -767,16 +782,17 @@ impl Linker {
                 }
                 let mut strings = Vec::new();
                 let mut start = 0usize;
-                for (i, &b) in bytes.iter().enumerate() {
-                    if b == 0 {
+                for (k, c) in bytes.chunks_exact(size).enumerate() {
+                    if c.iter().all(|&b| b == 0) {
+                        let i = k * size;
                         let s = bytes[start..i].to_vec();
                         let n = unique.len();
                         let e = *index.entry(s.clone()).or_insert_with(|| {
                             unique.push(s);
                             n
                         });
-                        strings.push((start as u32, (i + 1 - start) as u32, e));
-                        start = i + 1;
+                        strings.push((start as u32, (i + size - start) as u32, e));
+                        start = i + size;
                     }
                 }
                 per_sec.push((si, strings));
@@ -803,7 +819,7 @@ impl Linker {
                 if inside[i].is_none() {
                     pos[i] = block.len() as u32;
                     block.extend_from_slice(s);
-                    block.push(0);
+                    block.resize(block.len() + size, 0);
                 }
             }
             for i in 0..unique.len() {
@@ -827,7 +843,7 @@ impl Linker {
     /// The section's offset of input offset `off`, after merging.
     fn mapped(&self, si: usize, off: u32) -> Result<u32, String> {
         let sec = &self.secs[si];
-        if !sec.model.merge_strings {
+        if sec.model.merge_strings.is_none() {
             return Ok(off);
         }
         sec.strings
@@ -839,20 +855,33 @@ impl Linker {
 
     fn stored_size(&self, si: usize) -> u32 {
         let sec = &self.secs[si];
-        if sec.model.merge_strings {
+        if sec.model.merge_strings.is_some() {
             sec.merged.as_ref().map_or(0, |b| b.len() as u32)
         } else {
             sec.size
         }
     }
 
-    /// Text, read-only data and data sections in image order: by class,
-    /// then file, then the order of the sections in the file.
+    /// Stored sections in image order: by class, then file, then the order
+    /// of the sections in the file. Constructor and destructor arrays go
+    /// by priority first, as `ld` sorts them: `.init_array.N` by `N`, the
+    /// plain one last.
     fn link_order(&self) -> Vec<usize> {
         let mut order: Vec<usize> = (0..self.secs.len())
             .filter(|&s| self.secs[s].model.class != Class::Bss)
             .collect();
-        order.sort_by_key(|&s| (self.secs[s].model.class, self.secs[s].file));
+        order.sort_by_key(|&s| {
+            let m = &self.secs[s].model;
+            let prio = match m.class {
+                Class::InitArray | Class::FiniArray => m
+                    .name
+                    .rsplit_once('.')
+                    .and_then(|(_, n)| n.parse::<u32>().ok())
+                    .map_or(u64::MAX, u64::from),
+                _ => 0,
+            };
+            (m.class, prio, self.secs[s].file)
+        });
         order
     }
 
@@ -875,10 +904,42 @@ impl Linker {
     fn layout(&self, origin: u32) -> Layout {
         let mut base = vec![0u32; self.secs.len()];
         let mut dot = u64::from(origin);
-        for si in self.link_order() {
-            dot = dot.next_multiple_of(u64::from(self.secs[si].model.align));
-            base[si] = dot as u32;
-            dot += u64::from(self.stored_size(si));
+        let order = self.link_order();
+        // [init start, init end, fini start, fini end]
+        let mut arrays = [0u32; 4];
+        for class in [
+            Class::Text,
+            Class::Rodata,
+            Class::InitArray,
+            Class::FiniArray,
+            Class::Data,
+        ] {
+            let members: Vec<usize> = order
+                .iter()
+                .copied()
+                .filter(|&si| self.secs[si].model.class == class)
+                .collect();
+            let array = match class {
+                Class::InitArray => Some(0),
+                Class::FiniArray => Some(2),
+                _ => None,
+            };
+            if let Some(k) = array {
+                // As an output section of its own: it starts at the largest
+                // alignment of its sections, so the start symbol is never
+                // in front of padding.
+                let align = members.iter().map(|&si| self.secs[si].model.align).max();
+                dot = dot.next_multiple_of(u64::from(align.unwrap_or(1)));
+                arrays[k] = dot as u32;
+            }
+            for si in members {
+                dot = dot.next_multiple_of(u64::from(self.secs[si].model.align));
+                base[si] = dot as u32;
+                dot += u64::from(self.stored_size(si));
+            }
+            if let Some(k) = array {
+                arrays[k + 1] = dot as u32;
+            }
         }
         let image_end = dot as u32;
         let bss: Vec<usize> = (0..self.secs.len())
@@ -902,10 +963,11 @@ impl Linker {
             common.push(dot as u32);
             dot += u64::from(size);
         }
+        let [is, ie, fs, fe] = arrays;
         Layout {
             base,
             common,
-            linker: [image_end, image_end, dot as u32],
+            linker: [image_end, image_end, dot as u32, is, ie, fs, fe],
             top: dot,
         }
     }
@@ -919,10 +981,16 @@ impl Linker {
                 owner[id] = Some(f);
             }
         }
+        // The array bounds only for a program with such an array.
+        let arrays = self.secs.iter().any(|s| {
+            matches!(s.model.class, Class::InitArray | Class::FiniArray)
+                && !s.model.items.is_empty()
+        });
         self.syms
             .iter()
             .enumerate()
             .filter(|(_, sym)| !sym.name.starts_with(".L"))
+            .filter(|(_, sym)| arrays || !matches!(sym.def, Some(Def::Linker(3..))))
             .filter_map(|(id, sym)| {
                 let address = self.address(layout, sym.def?).ok()?;
                 Some(GasSymbol {
@@ -966,7 +1034,7 @@ impl Linker {
 
     fn address(&self, layout: &Layout, def: Def) -> Result<u32, String> {
         Ok(match def {
-            Def::Item { sec, item } if self.secs[sec].model.merge_strings => layout.base
+            Def::Item { sec, item } if self.secs[sec].model.merge_strings.is_some() => layout.base
                 [self.secs[sec].holder]
                 .wrapping_add(self.mapped(sec, self.secs[sec].offs[item])?),
             Def::Item { sec, item } => layout.base[sec].wrapping_add(self.secs[sec].offs[item]),
@@ -1508,7 +1576,7 @@ impl Linker {
                 image[start..start + block.len()].copy_from_slice(block);
                 continue;
             }
-            if self.secs[si].model.merge_strings {
+            if self.secs[si].model.merge_strings.is_some() {
                 continue;
             }
             for ii in 0..self.secs[si].model.items.len() {
@@ -1753,9 +1821,21 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
     let mut secs = Vec::new();
     let mut files = files;
     let mut sec_base = Vec::with_capacity(files.len());
+    // COMDAT groups already linked: a later file's copy is dropped, as
+    // `ld` drops it. The section stays, empty, so indices hold.
+    let mut groups = std::collections::HashSet::new();
     for (f, file) in files.iter_mut().enumerate() {
         sec_base.push(secs.len());
-        for model in std::mem::take(&mut file.sections) {
+        let mut new_groups = Vec::new();
+        for mut model in std::mem::take(&mut file.sections) {
+            if let Some(g) = &model.group {
+                if groups.contains(g) {
+                    model.items.clear();
+                    model.align = 1;
+                } else {
+                    new_groups.push(g.clone());
+                }
+            }
             secs.push(Sec {
                 file: f,
                 model,
@@ -1768,6 +1848,7 @@ pub fn link(files: Vec<FileModel>, cpu: &str, origin: u32) -> Result<GasImage, V
                 holder: 0,
             });
         }
+        groups.extend(new_groups);
     }
     let mut l = Linker {
         locals: vec![HashMap::new(); files.len()],
